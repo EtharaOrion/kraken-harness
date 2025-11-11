@@ -1,0 +1,240 @@
+[
+  {
+    "system": "Human Expert",
+    "speedup_ratio": 1.000,
+    "correctness": 100.0,
+    "model": {
+      "logo": "assets/logos/organizations/human.png",
+      "name": "Human Expert",
+      "url": "https://swefficiency.com"
+    },
+    "org": {
+      "name": "SWE-fficiency",
+      "logo": "assets/logos/swefficiency_icon.png"
+    }
+  },
+  {
+    "system": "GPT-5 (OpenHands)",
+    "speedup_ratio": 0.1498448156668666,
+    "correctness": 81.72690763052208,
+    "model": {
+      "logo": "assets/logos/organizations/openai.png",
+      "name": "OpenAI",
+      "url": "https://www.openai.com"
+    },
+    "org": {
+      "name": "SWE-fficiency",
+      "logo": "assets/logos/swefficiency_icon.png"
+    }
+  },
+  {
+    "system": "GPT-5.2 (OpenHands)",
+    "speedup_ratio": 0.1389202708005365,
+    "correctness": 88.95582329317268,
+    "model": {
+      "logo": "assets/logos/organizations/openai.png",
+      "name": "OpenAI",
+      "url": "https://www.openai.com"
+    },
+    "org": {
+      "name": "SWE-fficiency",
+      "logo": "assets/logos/swefficiency_icon.png"
+    }
+  },
+  {
+    "system": "Claude 4.5 Opus (OpenHands)",
+    "speedup_ratio": 0.22496678168151352,
+    "correctness": 90.76305220883533,
+    "model": {
+      "logo": "assets/logos/organizations/anthropic.svg",
+      "name": "Anthropic",
+      "url": "https://www.anthropic.com"
+    },
+    "org": {
+      "name": "SWE-fficiency",
+      "logo": "assets/logos/swefficiency_icon.png"
+    }
+  },
+  {
+    "system": "Claude 4.1 Opus (OpenHands)",
+    "speedup_ratio": 0.09837671420293653,
+    "correctness": 84.73895582329317,
+    "model": {
+      "logo": "assets/logos/organizations/anthropic.svg",
+      "name": "Anthropic",
+      "url": "https://www.anthropic.com"
+    },
+    "org": {
+      "name": "SWE-fficiency",
+      "logo": "assets/logos/swefficiency_icon.png"
+    }
+  },
+  {
+    "system": "Claude 3.7 Sonnet (OpenHands)",
+    "speedup_ratio": 0.04684165342773373,
+    "correctness": 65.26104417670683,
+    "model": {
+      "logo": "assets/logos/organizations/anthropic.svg",
+      "name": "Anthropic",
+      "url": "https://www.anthropic.com"
+    },
+    "org": {
+      "name": "SWE-fficiency",
+      "logo": "assets/logos/swefficiency_icon.png"
+    }
+  },
+  {
+    "system": "Claude 4.5 Sonnet (OpenHands)",
+    "speedup_ratio": 0.04125931377595956,
+    "correctness": 81.32530120481928,
+    "model": {
+      "logo": "assets/logos/organizations/anthropic.svg",
+      "name": "Anthropic",
+      "url": "https://www.anthropic.com"
+    },
+    "org": {
+      "name": "SWE-fficiency",
+      "logo": "assets/logos/swefficiency_icon.png"
+    }
+  },
+  {
+    "system": "Qwen3 Coder Plus 20250923 (OpenHands)",
+    "speedup_ratio": 0.06400066078567208,
+    "correctness": 82.1285140562249,
+    "model": {
+      "logo": "assets/logos/organizations/qwen.svg",
+      "name": "Alibaba Qwen",
+      "url": "https://www.qwen.ai/"
+    },
+    "org": {
+      "name": "SWE-fficiency",
+      "logo": "assets/logos/swefficiency_icon.png"
+    }
+  },
+  {
+    "system": "GLM-4.6 (OpenHands)",
+    "speedup_ratio": 0.025691570439857345,
+    "correctness": 67.26907630522089,
+    "model": {
+      "logo": "assets/logos/organizations/zai.png",
+      "name": "Z.ai",
+      "url": "https://chat.z.ai/"
+    },
+    "org": {
+      "name": "SWE-fficiency",
+      "logo": "assets/logos/swefficiency_icon.png"
+    }
+  },
+  {
+    "system": "GPT-5 Mini (OpenHands)",
+    "speedup_ratio": 0.019329852045002885,
+    "correctness": 54.81927710843374,
+    "model": {
+      "logo": "assets/logos/organizations/openai.png",
+      "name": "OpenAI",
+      "url": "https://www.openai.com"
+    },
+    "org": {
+      "name": "SWE-fficiency",
+      "logo": "assets/logos/swefficiency_icon.png"
+    }
+  },
+  {
+    "system": "Gemini 2.5 Flash (OpenHands)",
+    "speedup_ratio": 0.0077862869299929055,
+    "correctness": 60.8433734939759,
+    "model": {
+      "logo": "assets/logos/organizations/gemini.png",
+      "name": "Google",
+      "url": "https://gemini.google.com"
+    },
+    "org": {
+      "name": "SWE-fficiency",
+      "logo": "assets/logos/swefficiency_icon.png"
+    }
+  },
+  {
+    "system": "Gemini 2.5 Pro (OpenHands)",
+    "speedup_ratio": 0.006778784854498067,
+    "correctness": 59.63855421686747,
+    "model": {
+      "logo": "assets/logos/organizations/gemini.png",
+      "name": "Google",
+      "url": "https://gemini.google.com"
+    },
+    "org": {
+      "name": "SWE-fficiency",
+      "logo": "assets/logos/swefficiency_icon.png"
+    }
+  },
+  {
+    "system": "DeepSeek V3.1 (OpenHands)",
+    "speedup_ratio": 0.006877345488698071,
+    "correctness": 80.92369477911646,
+    "model": {
+      "logo": "assets/logos/organizations/deepseek.png",
+      "name": "DeepSeek",
+      "url": "https://www.deepseek.com"
+    },
+    "org": {
+      "name": "SWE-fficiency",
+      "logo": "assets/logos/swefficiency_icon.png"
+    }
+  },
+  {
+    "system": "Kimi K2-0905 (OpenHands)",
+    "speedup_ratio": 0.008085235983912673,
+    "correctness": 73.89558232931726,
+    "model": {
+      "logo": "assets/logos/organizations/moonshot.jpeg",
+      "name": "Moonshot AI",
+      "url": "https://www.kimi.com"
+    },
+    "org": {
+      "name": "SWE-fficiency",
+      "logo": "assets/logos/swefficiency_icon.png"
+    }
+  },
+  {
+    "system": "Composer-1 (Cursor CLI)",
+    "speedup_ratio": 0.031394449782945894,
+    "correctness": 83.73493975903614,
+    "model": {
+      "logo": "assets/logos/organizations/cursor.png",
+      "name": "Cursor",
+      "url": "https://www.cursor.com"
+    },
+    "org": {
+      "name": "SWE-fficiency",
+      "logo": "assets/logos/swefficiency_icon.png"
+    }
+  },
+  {
+    "system": "Gemini 3 Pro (OpenHands)",
+    "speedup_ratio": 0.09688597930980665,
+    "correctness": 85.94377510040161,
+    "model": {
+      "logo": "assets/logos/organizations/gemini.png",
+      "name": "Google",
+      "url": "https://gemini.google.com"
+    },
+    "org": {
+      "name": "SWE-fficiency",
+      "logo": "assets/logos/swefficiency_icon.png"
+    }
+  },
+  {
+    "system": "Gemini 3 Flash (OpenHands)",
+    "speedup_ratio": 0.10079875586851614,
+    "correctness": 74.8995983935743,
+    "model": {
+      "logo": "assets/logos/organizations/gemini.png",
+      "name": "Google",
+      "url": "https://gemini.google.com"
+    },
+    "org": {
+      "name": "SWE-fficiency",
+      "logo": "assets/logos/swefficiency_icon.png"
+    }
+  }
+]

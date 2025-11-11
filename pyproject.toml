@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "swefficiency"
+version = "1.0.0"
+description = "The official SWE-fficiency package - a benchmark for evaluating LMs on automated performance engineering"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "SWEfficiency Team", email = "swefficiencyperf@gmail.com"}
+]
+keywords = ["nlp", "benchmark", "code", "performance", "optimization"]
+classifiers = [
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3 :: Only",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "beautifulsoup4",
+    "chardet",
+    "datasets",
+    "docker",
+    "fastcore",
+    "ghapi",
+    "GitPython",
+    "pandas",
+    "pre-commit",
+    "python-dotenv",
+    "requests",
+    "rich",
+    "tqdm",
+    "unidiff",
+]
+
+[project.optional-dependencies]
+inference = [
+    "jedi",
+    "jinja2",
+]
+
+[project.scripts]
+swefficiency = "swefficiency.cli:main"
+
+[project.urls]
+Homepage = "https://swefficiency.com"
+Repository = "https://github.com/swefficiency/swefficiency"
+Documentation = "https://github.com/swefficiency/swefficiency"
+"Bug Tracker" = "https://github.com/swefficiency/swefficiency/issues"
+Paper = "https://arxiv.org/abs/2511.06090"
+
+[tool.setuptools.packages.find]
+include = ["swefficiency*"]

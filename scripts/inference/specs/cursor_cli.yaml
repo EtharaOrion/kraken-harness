@@ -1,0 +1,59 @@
+name: cursor-cli
+description: |
+  Example inference spec that installs Cursor CLI inside each SWE-fficiency
+  container, executes a workflow, and extracts the resulting git patch.
+
+docker:
+  workdir: /testbed
+  user: root
+  image_template: ghcr.io/swefficiency/swefficiency-images:{instance_id}
+
+variables:
+  patch_path: /tmp/model.patch
+  instruction_path: /tmp/cursor_instruction.txt
+  cursor_model: composer-1
+  cursor_agent_bin: cursor-agent
+  cursor_cli_args: ""
+
+prework:
+  scripts:
+    - name: cursor_install_cli
+      template: ../templates/cursor_install_cli.sh.j2
+      destination: /tmp/install_cursor_cli.sh
+      execute: true
+      chmod_x: true
+      shell: /bin/bash
+    - name: render_instruction_prompt
+      template: ../templates/cursor_instruction_prompt.txt.j2
+      destination: /tmp/cursor_instruction.txt
+      execute: false
+      chmod_x: false
+
+inference:
+  log_name: cursor_cli.log
+  shell: /bin/bash
+  workdir: /testbed
+  command: |
+    set -euo pipefail
+    CURSOR_AGENT={{ vars.cursor_agent_bin | default('cursor-agent') }}
+    INSTRUCTION_PATH={{ vars.instruction_path | default('/tmp/cursor_instruction.txt') }}
+    "$CURSOR_AGENT" -p --force --output-format stream-json "$(cat "$INSTRUCTION_PATH")" --model "{{ vars.cursor_model | default('composer-1') }}" {{ vars.cursor_cli_args | default('') }}
+  env:
+    CURSOR_API_KEY: "{{ vars.cursor_api_key | default('') }}"
+
+patch:
+  shell: /bin/bash
+  command: |
+    set -euo pipefail
+    cd {{ spec.docker_workdir }}
+    git status --short
+    git diff --binary HEAD > {{ vars.patch_path | default('/tmp/model.patch') }}
+  container_path: "{{ vars.patch_path | default('/tmp/model.patch') }}"
+  host_filename: patch.diff
+
+artifacts:
+  - container_path: /tmp/install_cursor_cli.sh
+    host_filename: install_cursor_cli.sh
+  - container_path: /tmp/cursor_instruction.txt
+    host_filename: cursor_instruction.txt
+

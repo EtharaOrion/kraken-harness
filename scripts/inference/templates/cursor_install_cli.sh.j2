@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+INSTALL_PATH="${CURSOR_CLI_BIN:-{{ vars.cursor_cli_path | default('/usr/local/bin/cursor') }}}"
+INSTALL_STAGE="${CURSOR_CLI_STAGE:-/tmp/cursor-cli-install}"
+
+if ! command -v curl >/dev/null 2>&1; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y curl ca-certificates bash coreutils
+fi
+
+mkdir -p "$INSTALL_STAGE"
+cd "$INSTALL_STAGE"
+
+printf 'Running official Cursor CLI installer...\n'
+curl https://cursor.com/install -fsS | bash
+
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+if [[ -f ~/.bashrc ]]; then
+  # Temporarily disable nounset to avoid errors from activation scripts referencing unset vars.
+  set +u
+  # shellcheck disable=SC1090
+  source ~/.bashrc
+  set -u
+fi
+
+echo "Cursor CLI installed at $INSTALL_PATH"
