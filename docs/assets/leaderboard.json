@@ -1,7 +1,7 @@
 [
   {
     "system": "Human Expert",
-    "speedup_ratio": 1.000,
+    "speedup_ratio": 1.0,
     "correctness": 100.0,
     "model": {
       "logo": "assets/logos/organizations/human.png",
@@ -15,8 +15,8 @@
   },
   {
     "system": "GPT-5 (OpenHands)",
-    "speedup_ratio": 0.1498448156668666,
-    "correctness": 81.72690763052208,
+    "speedup_ratio": 0.1571,
+    "correctness": 81.73,
     "model": {
       "logo": "assets/logos/organizations/openai.png",
       "name": "OpenAI",
@@ -29,8 +29,8 @@
   },
   {
     "system": "GPT-5.2 (OpenHands)",
-    "speedup_ratio": 0.1389202708005365,
-    "correctness": 88.95582329317268,
+    "speedup_ratio": 0.1482,
+    "correctness": 88.96,
     "model": {
       "logo": "assets/logos/organizations/openai.png",
       "name": "OpenAI",
@@ -43,8 +43,8 @@
   },
   {
     "system": "Claude 4.5 Opus (OpenHands)",
-    "speedup_ratio": 0.22496678168151352,
-    "correctness": 90.76305220883533,
+    "speedup_ratio": 0.225,
+    "correctness": 90.75999999999999,
     "model": {
       "logo": "assets/logos/organizations/anthropic.svg",
       "name": "Anthropic",
@@ -57,8 +57,8 @@
   },
   {
     "system": "Claude 4.1 Opus (OpenHands)",
-    "speedup_ratio": 0.09837671420293653,
-    "correctness": 84.73895582329317,
+    "speedup_ratio": 0.0984,
+    "correctness": 84.74,
     "model": {
       "logo": "assets/logos/organizations/anthropic.svg",
       "name": "Anthropic",
@@ -71,8 +71,8 @@
   },
   {
     "system": "Claude 3.7 Sonnet (OpenHands)",
-    "speedup_ratio": 0.04684165342773373,
-    "correctness": 65.26104417670683,
+    "speedup_ratio": 0.0244,
+    "correctness": 1.200000000000001,
     "model": {
       "logo": "assets/logos/organizations/anthropic.svg",
       "name": "Anthropic",
@@ -85,8 +85,8 @@
   },
   {
     "system": "Claude 4.5 Sonnet (OpenHands)",
-    "speedup_ratio": 0.04125931377595956,
-    "correctness": 81.32530120481928,
+    "speedup_ratio": 0.1162,
+    "correctness": 81.33,
     "model": {
       "logo": "assets/logos/organizations/anthropic.svg",
       "name": "Anthropic",
@@ -99,8 +99,8 @@
   },
   {
     "system": "Qwen3 Coder Plus 20250923 (OpenHands)",
-    "speedup_ratio": 0.06400066078567208,
-    "correctness": 82.1285140562249,
+    "speedup_ratio": 0.0676,
+    "correctness": 82.13000000000001,
     "model": {
       "logo": "assets/logos/organizations/qwen.svg",
       "name": "Alibaba Qwen",
@@ -113,8 +113,8 @@
   },
   {
     "system": "GLM-4.6 (OpenHands)",
-    "speedup_ratio": 0.025691570439857345,
-    "correctness": 67.26907630522089,
+    "speedup_ratio": 0.042,
+    "correctness": 67.27000000000001,
     "model": {
       "logo": "assets/logos/organizations/zai.png",
       "name": "Z.ai",
@@ -127,8 +127,8 @@
   },
   {
     "system": "GPT-5 Mini (OpenHands)",
-    "speedup_ratio": 0.019329852045002885,
-    "correctness": 54.81927710843374,
+    "speedup_ratio": 0.0389,
+    "correctness": 54.82,
     "model": {
       "logo": "assets/logos/organizations/openai.png",
       "name": "OpenAI",
@@ -141,8 +141,8 @@
   },
   {
     "system": "Gemini 2.5 Flash (OpenHands)",
-    "speedup_ratio": 0.0077862869299929055,
-    "correctness": 60.8433734939759,
+    "speedup_ratio": 0.0406,
+    "correctness": 60.84,
     "model": {
       "logo": "assets/logos/organizations/gemini.png",
       "name": "Google",
@@ -155,8 +155,8 @@
   },
   {
     "system": "Gemini 2.5 Pro (OpenHands)",
-    "speedup_ratio": 0.006778784854498067,
-    "correctness": 59.63855421686747,
+    "speedup_ratio": 0.0313,
+    "correctness": 59.64,
     "model": {
       "logo": "assets/logos/organizations/gemini.png",
       "name": "Google",
@@ -169,8 +169,8 @@
   },
   {
     "system": "DeepSeek V3.1 (OpenHands)",
-    "speedup_ratio": 0.006877345488698071,
-    "correctness": 80.92369477911646,
+    "speedup_ratio": 0.0432,
+    "correctness": 80.92,
     "model": {
       "logo": "assets/logos/organizations/deepseek.png",
       "name": "DeepSeek",
@@ -183,8 +183,8 @@
   },
   {
     "system": "Kimi K2-0905 (OpenHands)",
-    "speedup_ratio": 0.008085235983912673,
-    "correctness": 73.89558232931726,
+    "speedup_ratio": 0.0537,
+    "correctness": 73.9,
     "model": {
       "logo": "assets/logos/organizations/moonshot.jpeg",
       "name": "Moonshot AI",
@@ -197,8 +197,8 @@
   },
   {
     "system": "Composer-1 (Cursor CLI)",
-    "speedup_ratio": 0.031394449782945894,
-    "correctness": 83.73493975903614,
+    "speedup_ratio": 0.0634,
+    "correctness": 83.72999999999999,
     "model": {
       "logo": "assets/logos/organizations/cursor.png",
       "name": "Cursor",
@@ -211,8 +211,8 @@
   },
   {
     "system": "Gemini 3 Pro (OpenHands)",
-    "speedup_ratio": 0.09688597930980665,
-    "correctness": 85.94377510040161,
+    "speedup_ratio": 0.1024,
+    "correctness": 85.94,
     "model": {
       "logo": "assets/logos/organizations/gemini.png",
       "name": "Google",
@@ -225,12 +225,26 @@
   },
   {
     "system": "Gemini 3 Flash (OpenHands)",
-    "speedup_ratio": 0.10079875586851614,
-    "correctness": 74.8995983935743,
+    "speedup_ratio": 0.1056,
+    "correctness": 74.9,
     "model": {
       "logo": "assets/logos/organizations/gemini.png",
       "name": "Google",
       "url": "https://gemini.google.com"
+    },
+    "org": {
+      "name": "SWE-fficiency",
+      "logo": "assets/logos/swefficiency_icon.png"
+    }
+  },
+  {
+    "system": "Claude 4.6 Opus (OpenHands)",
+    "speedup_ratio": 0.1553,
+    "correctness": 79.72,
+    "model": {
+      "logo": "assets/logos/organizations/anthropic.svg",
+      "name": "Anthropic",
+      "url": "https://www.anthropic.com"
     },
     "org": {
       "name": "SWE-fficiency",

@@ -1,0 +1,9 @@
+{
+  "total_instances": 498,
+  "overall_score": 0.0411,
+  "proportion_incorrect": 0.5562,
+  "proportion_correct_but_no_speedup": 0.0402,
+  "proportion_correct_with_speedup_but_human_no_speedup": 0.2831,
+  "proportion_human_speedup_or_better": 0.1205,
+  "report": "eval_report_MiniMax-M2_maxiter_100_N_v0.51.1-no-hint-run_1.csv"
+}

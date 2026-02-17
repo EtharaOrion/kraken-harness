@@ -1,0 +1,9 @@
+{
+  "total_instances": 498,
+  "overall_score": 0.026,
+  "proportion_incorrect": 0.9257,
+  "proportion_correct_but_no_speedup": 0.01,
+  "proportion_correct_with_speedup_but_human_no_speedup": 0.0382,
+  "proportion_human_speedup_or_better": 0.0261,
+  "report": "eval_report_default_sweperf_claude__anthropic--claude-3-7-sonnet-20250219__t-0.00__p-1.00__c-1.00___swefficiency_full_test.csv"
+}

@@ -178,7 +178,10 @@ def compute_performance_breakdown(df: pd.DataFrame) -> Dict:
         }
 
     # Compute harmonic mean of human speedup ratios (overall score)
-    overall_score = total_instances / (1 / df["human_speedup_ratio"]).sum()
+    # Floor human_speedup_ratio at 0.001 (capping effective gold speedup at
+    # 1000x) to prevent extreme outliers from dominating the benchmark score.
+    floored_human_speedup = df["human_speedup_ratio"].clip(lower=0.001)
+    overall_score = total_instances / (1 / floored_human_speedup).sum()
 
     # Proportion incorrect (correctness < 1.0)
     incorrect_instances = (df["correctness"] < 1.0).sum()

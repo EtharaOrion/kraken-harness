@@ -1,0 +1,9 @@
+{
+  "total_instances": 498,
+  "overall_score": 0.0676,
+  "proportion_incorrect": 0.1787,
+  "proportion_correct_but_no_speedup": 0.1285,
+  "proportion_correct_with_speedup_but_human_no_speedup": 0.4438,
+  "proportion_human_speedup_or_better": 0.249,
+  "report": "eval_report_qwen3-coder-plus-2025-09-23_maxiter_100_N_v0.51.1-no-hint-run_1.csv"
+}

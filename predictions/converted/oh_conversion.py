@@ -41,8 +41,10 @@ for model_name in [
     # "gpt52",
     # "gpt51",
     # "gpt52",
-    "gemini3flash",
-    "gemini3pro",
+    # "gemini3flash",
+    # "gemini3pro",
+    # "claude46opus",
+    "glm5",
 ]:
     INPUT_FILE = f"predictions/openhands/{model_name}_raw.jsonl"
     OUTPUT_FILE = OUTPUT_DIR / f"oh_{model_name}.jsonl"
