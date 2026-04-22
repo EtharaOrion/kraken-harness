@@ -1,0 +1,47 @@
+# YAML spec for OpenHands agent mode.
+#
+# This spec is used by ``custom.py --mode openhands`` as the effective
+# spec when the user doesn't supply a custom --spec file.
+# It configures the Docker image template and working directory
+# but the actual agent loop is handled by openhands_mode.py, not by
+# the standard exec_run-based inference command.
+#
+# You can override this by passing --spec with your own YAML.
+
+name: openhands
+description: "OpenHands Agent SDK inference mode"
+
+docker:
+  workdir: /testbed
+  user: root
+  image_template: "ghcr.io/swefficiency/swefficiency-images:{instance_id}"
+
+variables:
+  max_iterations: 500
+  max_fake_responses: 10
+  conversation_timeout: 3600
+  enable_browser: false
+
+# Prework / inference / patch are NOT used in openhands mode —
+# the agent-server handles execution.  These are kept as no-ops
+# for YAML schema compatibility.
+prework:
+  scripts: []
+
+inference:
+  command: "echo 'OpenHands mode — inference handled by agent-server'"
+
+patch:
+  command: |
+    cd /workspace && git add -N . >/dev/null 2>&1 || true;
+    BASE_COMMIT="{{ instance.base_commit | default('', true) }}";
+    if [ -n "$BASE_COMMIT" ]; then
+      git diff --binary "$BASE_COMMIT" > /tmp/model.patch;
+    else
+      git diff --binary HEAD > /tmp/model.patch;
+    fi
+  container_path: /tmp/model.patch
+  host_filename: patch.diff
+  shell: /bin/bash
+
+artifacts: []

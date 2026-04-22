@@ -48,6 +48,17 @@ class SWEfficiencyInstance(TypedDict):
     notes: NotRequired[str]
     single_thread_tests: NotRequired[list[str]]
 
+    # Dynamic repo support — auto-detected fields for repos not in MAP_REPO_VERSION_TO_SPECS
+    python_version: NotRequired[str]  # e.g. "3.9" — conda Python version
+    install_cmd: NotRequired[str]  # e.g. "pip install -e ." — install command
+    test_cmd_override: NotRequired[str]  # e.g. "pytest {test_files}" — test runner
+    packages_source: NotRequired[str]  # "requirements.txt" | "environment.yml" | ""
+    pip_packages: NotRequired[list[str]]  # extra pip packages to install
+    pre_install_cmds: NotRequired[list[str]]  # system-level apt-get commands
+    reqs_paths: NotRequired[list[str]]  # paths to requirements.txt files
+    env_yml_paths: NotRequired[list[str]]  # paths to environment.yml files
+    log_parser_type: NotRequired[str]  # "pytest" | "pytest_v2" | "django" | "sympy"
+
 
 # Constants - Test Types, Statuses, Commands
 FAIL_TO_PASS = "FAIL_TO_PASS"

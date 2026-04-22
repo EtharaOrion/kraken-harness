@@ -440,19 +440,21 @@ def make_env_script_list(
 
 
 def make_test_command(instance, without_directives=False, prefer_distributed=False):
+    from swefficiency.harness.dynamic_specs import get_or_create_specs
+
     if instance["repo"] == "python/mypy":
         pattern = r"\[case ([^\]]+)\]"
         test_keys = re.findall(pattern, instance["test_patch"])
         test_keys_or = " or ".join(test_keys)
         test_command = (
-            MAP_REPO_VERSION_TO_SPECS[instance["repo"]][instance["version"]]["test_cmd"]
+            get_or_create_specs(instance, instance["repo"], instance["version"])["test_cmd"]
             + " "
             + f'"{test_keys_or}"'
         )
         return test_command
     else:
         test_directives = [] if without_directives else get_test_directives(instance)
-        specs = MAP_REPO_VERSION_TO_SPECS[instance["repo"].lower()][instance["version"]]
+        specs = get_or_create_specs(instance, instance["repo"].lower(), instance["version"])
 
         # NOTE: Prefer distributed test command in the eval only setting, since tests can take a while.
         test_cmd = (
@@ -1398,15 +1400,14 @@ def make_test_spec(instance: SWEfficiencyInstance, observed_versions=None) -> Te
     treesitter_env_name = "treesitter"
     repo_directory = f"/{env_name}"
 
-    if version not in MAP_REPO_VERSION_TO_SPECS[repo]:
-        raise NotImplementedError(f"Version {version} not implemented for repo {repo}")
+    from swefficiency.harness.dynamic_specs import get_or_create_specs
+
+    specs = get_or_create_specs(instance, repo, version)
 
     if observed_versions is not None:
         if version in observed_versions:
             raise RuntimeError(f"Version has already been observed: {version}")
         observed_versions.add(version)
-
-    specs = MAP_REPO_VERSION_TO_SPECS[repo][version]
 
     repo_script_list = make_repo_script_list(
         specs,

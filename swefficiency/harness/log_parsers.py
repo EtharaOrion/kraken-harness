@@ -505,4 +505,11 @@ MAP_REPO_TO_PARSER.update({"scipy/scipy": parse_log_scipy})
 
 # All keys should be in lower case
 LOWER_MAP_REPO_TO_PARSER = {k.lower(): v for k, v in MAP_REPO_TO_PARSER.items()}
-MAP_REPO_TO_PARSER = LOWER_MAP_REPO_TO_PARSER
+
+
+class _ParserMapWithFallback(dict):
+    def __missing__(self, key):
+        return parse_log_pytest
+
+
+MAP_REPO_TO_PARSER = _ParserMapWithFallback(LOWER_MAP_REPO_TO_PARSER)

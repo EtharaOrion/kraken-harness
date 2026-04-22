@@ -804,10 +804,7 @@ def create_container_from_image(
     """
     container = None
     try:
-        # Get configurations for how container should be created
-        config = MAP_REPO_VERSION_TO_SPECS[test_spec.repo][test_spec.version]
-        user = "root" if not config.get("execute_test_as_nonroot", False) else "nonroot"
-        # nano_cpus = config.get("nano_cpus")
+        user = "root"
 
         extra_args = {}
         if cpu_groups:

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import platform
 from collections import defaultdict, deque
 from typing import Dict, List, Tuple
 
@@ -42,11 +43,25 @@ def _cpu_to_node(cpu: int) -> int:
         return 0
 
 
+def _discover_physical_cores_fallback() -> List[Tuple[List[int], int]]:
+    """Fallback for non-Linux systems (macOS, etc.) that lack /sys/devices/system/cpu."""
+    try:
+        ncpus = len(os.sched_getaffinity(0))
+    except AttributeError:
+        import multiprocessing
+        ncpus = multiprocessing.cpu_count()
+    # Treat each CPU as its own physical core on NUMA node 0
+    return [([i], 0) for i in range(ncpus)]
+
+
 def discover_physical_cores() -> List[Tuple[List[int], int]]:
     """
     Returns a list of (siblings, numa_node) for each physical core.
     `siblings` is a sorted list of all logical CPUs that share that core (SMT threads).
+    Falls back to a simple enumeration on non-Linux systems.
     """
+    if platform.system() != "Linux" or not os.path.isdir(SYS_CPU):
+        return _discover_physical_cores_fallback()
     seen = set()
     cores = []
     for entry in os.listdir(SYS_CPU):

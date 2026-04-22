@@ -143,8 +143,12 @@ def worker_function(
 
     while True:
         try:
+            model_name = os.environ.get(
+                "WORKLOAD_MODEL",
+                "bedrock/converse/arn:aws:bedrock:us-east-1:426628337772:application-inference-profile/4w7tmk1iplxi",
+            )
             response = completion(
-                model="gemini/gemini-2.5-flash",
+                model=model_name,
                 messages=[
                     {"role": "system", "content": SYSTEM_MSG},
                     {

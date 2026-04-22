@@ -786,9 +786,70 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--max-instances", type=int, help="Optional cap on number of instances"
     )
     parser.add_argument(
-        "--spec", type=Path, required=True, help="Path to YAML spec file"
+        "--spec", type=Path, default=None, help="Path to YAML spec file (required for default mode)"
     )
     parser.add_argument("--run-id", required=True, help="Run identifier (used in logs)")
+    parser.add_argument(
+        "--mode",
+        choices=["default", "openhands"],
+        default="default",
+        help="Inference mode: 'default' (YAML spec + docker exec) or 'openhands' (Agent SDK)",
+    )
+    parser.add_argument(
+        "--llm-config",
+        type=Path,
+        help="Path to LLM config JSON (required for --mode openhands)",
+    )
+    parser.add_argument(
+        "--max-iterations",
+        type=int,
+        default=500,
+        help="Max agent iterations per conversation.run() (openhands mode)",
+    )
+    parser.add_argument(
+        "--max-fake-responses",
+        type=int,
+        default=10,
+        help="Max fake user responses in multi-turn loop (openhands mode)",
+    )
+    parser.add_argument(
+        "--build-target",
+        default="source-minimal",
+        help="Docker image build target (openhands mode)",
+    )
+    parser.add_argument(
+        "--force-build",
+        action="store_true",
+        help="Force rebuild of agent-server images (openhands mode)",
+    )
+    parser.add_argument(
+        "--cleanup-images",
+        action="store_true",
+        default=True,
+        help="Remove agent-server images after completion (openhands mode)",
+    )
+    parser.add_argument(
+        "--no-cleanup-images",
+        dest="cleanup_images",
+        action="store_false",
+        help="Keep agent-server images after completion (openhands mode)",
+    )
+    parser.add_argument(
+        "--model-name",
+        default="openhands-agent",
+        help="Model name for prediction JSONL output (openhands mode)",
+    )
+    parser.add_argument(
+        "--prompt-template",
+        type=Path,
+        help="Custom Jinja2 prompt template (openhands mode)",
+    )
+    parser.add_argument(
+        "--cpus-to-skip",
+        type=int,
+        default=4,
+        help="Host CPUs to reserve (openhands mode CPU division)",
+    )
     parser.add_argument(
         "--output-dir", type=Path, default=DEFAULT_LOG_DIR, help="Where to store logs"
     )
@@ -863,17 +924,11 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 
-    spec = load_spec(args.spec)
+    if args.mode == "default" and args.spec is None:
+        parser.error("--spec is required for default mode")
 
-    debug_mode = os.environ.get("DEBUG") == "1"
-
-    user_vars = spec.variables.copy()
-    user_vars.update(load_vars_file(args.vars_file))
-    user_vars.update(parse_kv_pairs(args.var))
-    if "cursor_api_key" not in user_vars:
-        env_cursor_key = os.environ.get("CURSOR_API_KEY")
-        if env_cursor_key:
-            user_vars["cursor_api_key"] = env_cursor_key
+    if args.mode == "openhands" and args.llm_config is None:
+        parser.error("--llm-config is required for openhands mode")
 
     regex = re.compile(args.instance_regex) if args.instance_regex else None
     id_filter = set(args.instance_ids) if args.instance_ids else None
@@ -893,6 +948,41 @@ def main(argv: Optional[List[str]] = None) -> None:
         for inst in instances:
             print(inst["instance_id"])
         return
+
+    if args.mode == "openhands":
+        from openhands_mode import run_openhands_inference
+
+        run_openhands_inference(
+            instances=instances,
+            llm_config_path=args.llm_config,
+            run_id=args.run_id,
+            output_dir=args.output_dir,
+            num_workers=args.num_workers,
+            cpus_per_worker=args.cpus_per_worker,
+            cpus_to_skip=args.cpus_to_skip,
+            mem_limit=args.mem_limit,
+            max_iterations=args.max_iterations,
+            max_fake_responses=args.max_fake_responses,
+            build_target=args.build_target,
+            force_build=args.force_build,
+            cleanup_images=args.cleanup_images,
+            prompt_template=args.prompt_template,
+            model_name=args.model_name,
+            disable_cpu_pinning=args.disable_cpu_pinning,
+        )
+        return
+
+    spec = load_spec(args.spec)
+
+    debug_mode = os.environ.get("DEBUG") == "1"
+
+    user_vars = spec.variables.copy()
+    user_vars.update(load_vars_file(args.vars_file))
+    user_vars.update(parse_kv_pairs(args.var))
+    if "cursor_api_key" not in user_vars:
+        env_cursor_key = os.environ.get("CURSOR_API_KEY")
+        if env_cursor_key:
+            user_vars["cursor_api_key"] = env_cursor_key
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     run_log_dir = args.output_dir / args.run_id / spec.name

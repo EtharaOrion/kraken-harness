@@ -1,0 +1,39 @@
+You are a software performance engineer. Your task is to optimize the performance of a Python repository.
+
+## Repository
+The repository is located at `/workspace/{{ repo_dir }}/`.
+The conda environment for this repository is already activated.
+
+## Performance Workload
+The following workload script measures the performance of the code you need to optimize.
+You MUST NOT modify the workload() function itself — it is the benchmark.
+
+```python
+{{ workload }}
+```
+
+## Your Task
+1. First, activate the conda environment: `conda activate {{ conda_env | default('testbed', true) }}`
+2. Explore the repository structure and understand the codebase.
+3. Create the workload script at `/workspace/{{ repo_dir }}/workload.py` and run it to get the baseline performance.
+4. Identify performance bottlenecks in the source code that the workload exercises.
+5. Edit the repository source code to improve performance.
+6. Re-run the workload script to verify your optimization improved runtime.
+7. Run the test suite to ensure correctness is maintained:
+   ```
+   {{ test_cmd }}
+   ```
+{% if rebuild_cmd %}8. If you changed any non-Python files (C extensions, Cython, etc.), rebuild first:
+   ```
+   {{ rebuild_cmd }}
+   ```
+{% endif %}
+
+## Rules
+- Do NOT modify the workload() function.
+- Do NOT modify the test suite.
+- Ensure all tests still pass after your changes.
+- Focus on real algorithmic or implementation improvements, not micro-optimizations.
+- If you need to rebuild after changes to C/Cython code, do so before re-running the workload.
+
+When you are done, use the finish tool to indicate completion.

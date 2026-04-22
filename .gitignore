@@ -186,3 +186,10 @@ predictions/openhands
 predictions/sweagent
 
 analysis/adhoc/patch_analysis/interesting_patches
+
+# SDK vendor (large, install separately)
+vendor/
+
+# Pipeline artifacts
+.specs_cache.json
+.sisyphus/

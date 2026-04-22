@@ -1127,12 +1127,21 @@ def run_instances(
 
     # HACK: If we are running on SLURM, we need to allocate whole cores, should use something else in non VM setting.
     # For n2-standard-64, we have 64 vCPUs (2 threads per core), so we can allocate 16 workers with 4 vCPUs each.
-    global_cpu_groups = allocate_whole_cores(
-        max_workers,
-        vcpus_per_worker=4,
-        threads_per_core=2,
-        reserve_cores=4,
-    )
+    try:
+        global_cpu_groups = allocate_whole_cores(
+            max_workers,
+            vcpus_per_worker=4,
+            threads_per_core=2,
+            reserve_cores=4,
+        )
+    except (FileNotFoundError, RuntimeError, OSError):
+        print("WARNING: NUMA-aware CPU pinning unavailable (non-Linux or insufficient cores). Using simple CPU division.")
+        from swefficiency.harness.cpu_assignment import divide_cpus_among_workers
+        simple_groups = divide_cpus_among_workers(max_workers, cpus_per_worker=4)
+        global_cpu_groups = [
+            {"cpuset_cpus": ",".join(map(str, g)), "cpuset_mems": "0", "nano_cpus": int(1e9 * len(g))}
+            for g in simple_groups
+        ]
 
     # run instances in parallel
     print(f"Running {len(instances)} instances...")
