@@ -52,6 +52,8 @@ MAP_REPO_TO_VERSION_PATHS = {
     "sympy/sympy": ["sympy/release.py", "sympy/__init__.py"],
     "explosion/spaCy": ["spacy/about.py"],
     "scikit-image/scikit-image": ["skimage/__init__.py"],
+    "encode/httpx": ["httpx/__version__.py", "httpx/_config.py", "httpx/__init__.py"],
+    "pallets/click": ["src/click/__init__.py", "click/__init__.py"],
 }
 
 # Cosntants - Task Instance Version Regex Pattern
@@ -88,6 +90,8 @@ MAP_REPO_TO_VERSION_PATTERNS = {
         "facebookresearch/hydra",
         "explosion/spaCy",
         "scikit-image/scikit-image",
+        "encode/httpx",
+        "pallets/click",
     ]
 }
 MAP_REPO_TO_VERSION_PATTERNS.update(

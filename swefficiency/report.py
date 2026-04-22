@@ -243,7 +243,14 @@ def generate_report(
     Returns:
         DataFrame with evaluation results
     """
-    ds = datasets.load_dataset(dataset_name, split="test")
+    # Support local JSONL files as dataset source
+    dataset_path = Path(dataset_name)
+    if dataset_path.exists() and dataset_path.suffix == ".jsonl":
+        import json as _json
+        with open(dataset_path) as _f:
+            ds = [_json.loads(line) for line in _f if line.strip()]
+    else:
+        ds = datasets.load_dataset(dataset_name, split="test")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     report_name = pred_run.name

@@ -1,0 +1,9 @@
+{
+  "total_instances": 3,
+  "overall_score": 0.835,
+  "proportion_incorrect": 1.0,
+  "proportion_correct_but_no_speedup": 0.0,
+  "proportion_correct_with_speedup_but_human_no_speedup": 0.0,
+  "proportion_human_speedup_or_better": 0.6667,
+  "report": "eval_report_gold_as_pred.csv"
+}

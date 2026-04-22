@@ -1,0 +1,4 @@
+instance_id,raw_pred_speedup_ratio,pred_speedup_ratio,gold_speedup_ratio,human_speedup_ratio,correctness,correctness_pct,pre_edit_runtime,patch_length
+psf__requests-7342,1.0,1.0,1.658861494030741,0.6028230829387548,0.0,0.0,0.009602395899992188,10
+psf__requests-7245,1.0,1.0,0.9461923037430812,1.0568676114190094,0.0,0.0,0.009379385500074023,5
+psf__requests-7236,1.0,1.0,0.9877213422438347,1.012431297402435,0.0,0.0,0.03709968893332795,50

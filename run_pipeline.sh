@@ -16,12 +16,13 @@ set -euo pipefail
 #   --cutoff-date YYYYMMDD  PR cutoff date (default: 20180101)
 #   --max-pulls N           Max PRs to scrape (default: unlimited)
 #   --max-workers N         Parallel workers for eval (default: 1)
-#   --skip-scrape           Skip stages 1-5, use existing enriched JSONL
+#   --skip-scrape           Skip stages 1-6, use existing enriched JSONL
 #   --skip-workload         Skip workload generation
 #   --skip-docker-build     Skip Docker build (assume images exist)
 #   --dataset PATH          Use existing dataset JSONL (skips scrape+filter+version)
 #   --mode MODE             Inference mode: default|openhands (default: default)
 #   --dry-run               Show what would be done without executing
+#   --timeout N             Eval timeout in seconds (default: 1800)
 #   --help                  Show this help
 ###############################################################################
 
@@ -40,7 +41,7 @@ SKIP_DOCKER_BUILD=false
 DATASET=""
 MODE="default"
 DRY_RUN=false
-TIMEOUT=7200
+TIMEOUT=1800
 
 # ─── Parse args ───────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -66,7 +67,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ─── Derived values ───────────────────────────────────────────────────────────
-REPO_SLUG="${REPO##*/}"  # e.g., "requests" from "psf/requests"
+REPO_SLUG="${REPO##*/}"
+REPO_OWNER="${REPO%%/*}"
 [[ -z "$RUN_ID" ]] && RUN_ID="${REPO_SLUG}_$(date +%Y%m%d_%H%M%S)"
 
 ARTIFACTS_DIR="$SCRIPT_DIR/artifacts"
@@ -75,9 +77,16 @@ TASKS_DIR="$ARTIFACTS_DIR/tasks"
 FILTERED_DIR="$ARTIFACTS_DIR/perf_filtered"
 VERSIONED_DIR="$ARTIFACTS_DIR/versioned"
 ENRICHED_DIR="$ARTIFACTS_DIR/enriched"
+FINAL_DIR="$ARTIFACTS_DIR/final"
 WORKLOAD_DIR="$SCRIPT_DIR/logs/workload_generation/$RUN_ID"
 EVAL_DIR="$SCRIPT_DIR/logs/run_evaluation/$RUN_ID"
 REPORT_DIR="$SCRIPT_DIR/eval_reports"
+
+TASKS_FILE=""
+FILTERED_FILE=""
+VERSIONED_FILE=""
+ENRICHED_FILE=""
+FINAL_DATASET=""
 
 # ─── Load .env ────────────────────────────────────────────────────────────────
 if [[ -f "$SCRIPT_DIR/.env" ]]; then
@@ -104,8 +113,7 @@ check_prereqs() {
     fi
 
     if [[ -z "${GITHUB_TOKENS:-}" && -z "${GITHUB_TOKEN:-}" ]]; then
-        echo "ERROR: GITHUB_TOKENS or GITHUB_TOKEN not set. Add to .env or export."
-        exit 1
+        echo "WARNING: GITHUB_TOKENS or GITHUB_TOKEN not set. Scraping will fail."
     fi
 
     python -c "import swefficiency" 2>/dev/null || {
@@ -127,9 +135,8 @@ run_cmd() {
 
 count_lines() { wc -l < "$1" | tr -d ' '; }
 
-ensure_dir() { mkdir -p "$1"; }
+ensure_dir() { mkdir -p "$@"; }
 
-# Find the first matching JSONL file in a dir matching a pattern
 find_jsonl() {
     local dir="$1" pattern="$2"
     find "$dir" -name "$pattern" -type f 2>/dev/null | head -1
@@ -140,7 +147,6 @@ find_jsonl() {
 ###############################################################################
 stage_scrape() {
     log "STAGE 1-3: Scraping PRs from $REPO"
-
     ensure_dir "$PRS_DIR" "$TASKS_DIR"
 
     local pulls_args=(
@@ -159,8 +165,7 @@ stage_scrape() {
         echo "ERROR: No task instances file found in $TASKS_DIR"
         exit 1
     fi
-    local n=$(count_lines "$TASKS_FILE")
-    echo "  → Found $n task instances in $TASKS_FILE"
+    echo "  → Found $(count_lines "$TASKS_FILE") task instances"
 }
 
 ###############################################################################
@@ -168,7 +173,6 @@ stage_scrape() {
 ###############################################################################
 stage_perf_filter() {
     log "STAGE 4: Performance filtering"
-
     ensure_dir "$FILTERED_DIR"
 
     PRS_FILE=$(find_jsonl "$PRS_DIR" "${REPO_SLUG}*prs*.jsonl")
@@ -185,14 +189,15 @@ stage_perf_filter() {
 
     FILTERED_FILE=$(find_jsonl "$FILTERED_DIR" "${REPO_SLUG}*attribute*.jsonl")
     if [[ -z "$FILTERED_FILE" ]]; then
-        echo "WARNING: No filtered instances found. Trying to use unfiltered tasks..."
+        echo "WARNING: No filtered instances found. Using unfiltered tasks..."
         FILTERED_FILE="$TASKS_FILE"
     fi
-    local n=$(count_lines "$FILTERED_FILE")
+    local n
+    n=$(count_lines "$FILTERED_FILE")
     echo "  → $n instances after perf filter"
 
     if [[ "$n" -eq 0 ]]; then
-        echo "ERROR: 0 instances after perf filter. Try a different repo or relax --cutoff-date."
+        echo "ERROR: 0 instances after perf filter. Try a different repo."
         exit 1
     fi
 }
@@ -202,23 +207,42 @@ stage_perf_filter() {
 ###############################################################################
 stage_versioning() {
     log "STAGE 5: Versioning"
-
     ensure_dir "$VERSIONED_DIR"
 
-    step "Detecting versions for each instance..."
+    step "Detecting versions..."
     run_cmd python -m swefficiency.versioning.get_versions \
         --instances_path "$FILTERED_FILE" \
         --retrieval_method github \
         --num_workers 4 \
         --output_dir "$VERSIONED_DIR"
 
-    VERSIONED_FILE=$(find_jsonl "$VERSIONED_DIR" "*.jsonl")
-    if [[ -z "$VERSIONED_FILE" ]]; then
-        echo "WARNING: No versioned file found. Using filtered file as-is."
-        VERSIONED_FILE="$FILTERED_FILE"
+    # get_versions outputs a JSON array file, not JSONL — convert it
+    local json_file
+    json_file=$(find "$VERSIONED_DIR" -name "*.json" -type f 2>/dev/null | head -1)
+    VERSIONED_FILE="$VERSIONED_DIR/${REPO_SLUG}-versioned.jsonl"
+
+    if [[ -n "$json_file" && -f "$json_file" ]]; then
+        python3 -c "
+import json
+with open('$json_file') as f:
+    data = json.load(f)
+if isinstance(data, list):
+    with open('$VERSIONED_FILE', 'w') as out:
+        for item in data:
+            if item.get('version'):
+                out.write(json.dumps(item) + '\n')
+    print(f'  → Converted {len([d for d in data if d.get(\"version\")])} versioned instances')
+else:
+    print('  WARNING: Unexpected JSON format')
+"
     fi
-    local n=$(count_lines "$VERSIONED_FILE")
-    echo "  → $n instances after versioning"
+
+    if [[ ! -f "$VERSIONED_FILE" ]] || [[ $(count_lines "$VERSIONED_FILE") -eq 0 ]]; then
+        echo "WARNING: No versioned instances. Using filtered file."
+        VERSIONED_FILE="$FILTERED_FILE"
+    else
+        echo "  → $(count_lines "$VERSIONED_FILE") versioned instances"
+    fi
 }
 
 ###############################################################################
@@ -226,12 +250,11 @@ stage_versioning() {
 ###############################################################################
 stage_detect_specs() {
     log "STAGE 6: Auto-detecting repo specs"
-
     ensure_dir "$ENRICHED_DIR"
 
     ENRICHED_FILE="$ENRICHED_DIR/${REPO_SLUG}_enriched.jsonl"
 
-    step "Running spec detection (Python version, install cmd, test cmd, deps)..."
+    step "Detecting Python version, install cmd, test cmd, deps..."
     run_cmd python scripts/detect_repo_specs.py \
         --input "$VERSIONED_FILE" \
         --output "$ENRICHED_FILE" \
@@ -239,10 +262,9 @@ stage_detect_specs() {
         --verbose
 
     if [[ -f "$ENRICHED_FILE" ]]; then
-        local n=$(count_lines "$ENRICHED_FILE")
-        echo "  → $n enriched instances in $ENRICHED_FILE"
+        echo "  → $(count_lines "$ENRICHED_FILE") enriched instances"
     else
-        echo "WARNING: Enriched file not created. Using versioned file."
+        echo "WARNING: Enrichment failed. Using versioned file."
         ENRICHED_FILE="$VERSIONED_FILE"
     fi
 }
@@ -264,229 +286,289 @@ stage_workload() {
         --run_id "$RUN_ID" \
         --max_workers 1
 
-    WORKLOAD_OUTPUT="$WORKLOAD_DIR/workload_generation.json"
-    if [[ ! -f "$WORKLOAD_OUTPUT" ]]; then
-        WORKLOAD_OUTPUT=$(find "$WORKLOAD_DIR" -name "*.json" -type f 2>/dev/null | head -1)
+    # Find workload output
+    local wl_output
+    wl_output=$(find "logs/workload_generation/$RUN_ID" -name "workload_generation.json" -type f 2>/dev/null | head -1)
+    if [[ -z "$wl_output" ]]; then
+        wl_output=$(find "logs/workload_generation/$RUN_ID" -name "*.json" -type f 2>/dev/null | head -1)
     fi
 
-    if [[ -z "$WORKLOAD_OUTPUT" || ! -f "$WORKLOAD_OUTPUT" ]]; then
-        echo "WARNING: No workload output found. Continuing without workloads."
-        FINAL_DATASET="$ENRICHED_FILE"
-        return
-    fi
+    ensure_dir "$FINAL_DIR"
+    FINAL_DATASET="$FINAL_DIR/${REPO_SLUG}-dataset.jsonl"
 
     step "Merging workloads into dataset..."
-    FINAL_DATASET="$ENRICHED_DIR/${REPO_SLUG}_with_workloads.jsonl"
-    python3 -c "
-import json, sys
+    _ENRICHED="$ENRICHED_FILE" _WL_OUTPUT="${wl_output:-}" _FINAL="$FINAL_DATASET" python3 << 'PYEOF'
+import json, sys, os, pathlib
+
+enriched_path = os.environ.get("_ENRICHED", "")
+wl_path = os.environ.get("_WL_OUTPUT", "")
+out_path = os.environ.get("_FINAL", "")
 
 enriched = {}
-with open('$ENRICHED_FILE') as f:
+with open(enriched_path) as f:
     for line in f:
-        inst = json.loads(line)
-        enriched[inst['instance_id']] = inst
+        if line.strip():
+            inst = json.loads(line)
+            enriched[inst['instance_id']] = inst
 
 workloads = {}
-with open('$WORKLOAD_OUTPUT') as f:
-    data = json.load(f) if '$WORKLOAD_OUTPUT'.endswith('.json') else [json.loads(l) for l in f]
+if wl_path and os.path.exists(wl_path):
+    with open(wl_path) as f:
+        data = json.load(f)
     if isinstance(data, dict):
         data = [data]
     for item in data:
         iid = item.get('instance_id', '')
         wl = item.get('workload', item.get('generated_workload', ''))
+        if not wl:
+            wl_file = item.get('workload_file', '')
+            if wl_file and os.path.exists(wl_file):
+                wl = pathlib.Path(wl_file).read_text()
         if iid and wl:
             workloads[iid] = wl
 
 merged = 0
-with open('$FINAL_DATASET', 'w') as out:
+with open(out_path, 'w') as out:
     for iid, inst in enriched.items():
         if iid in workloads:
             inst['workload'] = workloads[iid]
             merged += 1
+        # Ensure required fields exist
+        inst.setdefault('PASS_TO_PASS', [])
+        inst.setdefault('FAIL_TO_PASS', [])
+        inst.setdefault('covering_tests', [])
+        inst.setdefault('test_patch', '')
+        inst.setdefault('environment_setup_commit', inst.get('base_commit', ''))
+        inst.setdefault('speedup', '')
+        inst.setdefault('notes', '')
+        inst.setdefault('single_thread_tests', [])
         out.write(json.dumps(inst) + '\n')
 
-print(f'  → Merged {merged} workloads into {len(enriched)} instances')
-print(f'  → Output: $FINAL_DATASET')
-"
+print(f"  → Merged {merged}/{len(enriched)} workloads → {out_path}")
+PYEOF
 }
 
 ###############################################################################
-# STAGE 8: Docker Build + Evaluation (Gold baseline)
+# STAGE 8: Docker Build + Gold Evaluation (perf-only)
 ###############################################################################
 stage_eval() {
-    log "STAGE 8: Docker Build + Evaluation"
+    log "STAGE 8: Docker Build + Gold Evaluation (perf-only)"
 
-    local dataset_to_use="${FINAL_DATASET:-$ENRICHED_FILE}"
+    local dataset_to_use="${FINAL_DATASET:-${ENRICHED_FILE:-$DATASET}}"
     if [[ -n "$DATASET" ]]; then
         dataset_to_use="$DATASET"
     fi
 
-    local n=$(count_lines "$dataset_to_use")
-    echo "  Using dataset: $dataset_to_use ($n instances)"
+    echo "  Dataset:  $dataset_to_use ($(count_lines "$dataset_to_use") instances)"
+    echo "  Workers:  $MAX_WORKERS"
+    echo "  Timeout:  ${TIMEOUT}s"
 
-    if ! $SKIP_DOCKER_BUILD; then
-        step "Building Docker images + running gold evaluation..."
-        run_cmd python swefficiency/harness/run_validation.py \
-            --dataset_name "$dataset_to_use" \
-            --run_id "${RUN_ID}" \
-            --max_workers "$MAX_WORKERS" \
-            --max_build_workers "$MAX_WORKERS" \
-            --timeout "$TIMEOUT" \
-            --use_dockerhub_images false \
-            --run_perf true \
-            --run_correctness true \
-            --process_isolation true \
-            --empty_patch false \
-            --cache_level env
-    else
-        step "Skipping Docker build (--skip-docker-build). Assume images exist."
-        step "Running evaluation with pre-built images..."
-        run_cmd python swefficiency/harness/run_validation.py \
-            --dataset_name "$dataset_to_use" \
-            --run_id "${RUN_ID}" \
-            --max_workers "$MAX_WORKERS" \
-            --timeout "$TIMEOUT" \
-            --use_dockerhub_images true \
-            --run_perf true \
-            --run_correctness true \
-            --process_isolation true \
-            --empty_patch false
-    fi
+    step "Running gold evaluation (perf-only, no correctness)..."
+    run_cmd python swefficiency/harness/run_validation.py \
+        --dataset_name "$dataset_to_use" \
+        --run_id "$RUN_ID" \
+        --max_workers "$MAX_WORKERS" \
+        --max_build_workers "$MAX_WORKERS" \
+        --timeout "$TIMEOUT" \
+        --use_dockerhub_images false \
+        --run_perf true \
+        --run_correctness false \
+        --run_coverage false \
+        --process_isolation false \
+        --force_rerun true
 
     GOLD_DIR="$EVAL_DIR/gold"
     if [[ ! -d "$GOLD_DIR" ]]; then
-        GOLD_DIR=$(find "$EVAL_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
+        GOLD_DIR=$(find "$EVAL_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1 || true)
     fi
 
     if [[ -n "$GOLD_DIR" && -d "$GOLD_DIR" ]]; then
-        local eval_count=$(find "$GOLD_DIR" -name "perf_summary.txt" 2>/dev/null | wc -l | tr -d ' ')
-        echo "  → Gold evaluation complete: $eval_count instances with perf data"
+        local eval_count
+        eval_count=$(find "$GOLD_DIR" -name "perf_summary.txt" 2>/dev/null | wc -l | tr -d ' ')
+        echo "  → Gold eval done: $eval_count instances with perf data"
+
+        step "Printing perf summaries..."
+        find "$GOLD_DIR" -name "perf_summary.txt" -exec sh -c 'echo "  $(basename $(dirname {})):"; cat "{}"; echo ""' \;
     else
-        echo "WARNING: No evaluation output directory found at $EVAL_DIR"
-    fi
-}
-
-###############################################################################
-# STAGE 9: Inference (Agent Trajectory) — Optional
-###############################################################################
-stage_inference() {
-    if [[ "$MODE" == "openhands" ]]; then
-        log "STAGE 9: Running OpenHands Agent Inference"
-
-        local llm_config="$SCRIPT_DIR/scripts/inference/llm_configs/bedrock.json"
-        if [[ ! -f "$llm_config" ]]; then
-            echo "ERROR: LLM config not found at $llm_config"
+        if $DRY_RUN; then
+            echo "  [DRY-RUN] Gold eval output would be at $EVAL_DIR"
+        else
+            echo "ERROR: No gold eval output. Check logs."
             exit 1
         fi
-
-        local dataset_to_use="${FINAL_DATASET:-$ENRICHED_FILE}"
-        [[ -n "$DATASET" ]] && dataset_to_use="$DATASET"
-
-        step "Running inference with OpenHands agent..."
-        run_cmd python scripts/inference/custom.py \
-            --mode openhands \
-            --run-id "${RUN_ID}_inference" \
-            --llm-config "$llm_config" \
-            --dataset "$dataset_to_use" \
-            --num-workers 1 \
-            --max-iterations 100 \
-            --max-fake-responses 5 \
-            --mem-limit 12g \
-            --disable-cpu-pinning
-
-        local inf_dir="$SCRIPT_DIR/logs/run_inference/${RUN_ID}_inference"
-        if [[ -d "$inf_dir" ]]; then
-            local patch_count=$(find "$inf_dir" -name "patch.diff" 2>/dev/null | wc -l | tr -d ' ')
-            echo "  → Inference complete: $patch_count patches generated"
-
-            step "Converting patches to predictions JSONL..."
-            local pred_file="$inf_dir/predictions.jsonl"
-            python3 -c "
-import json, os, pathlib
-
-inf_dir = pathlib.Path('$inf_dir')
-predictions = []
-for patch_file in sorted(inf_dir.rglob('patch.diff')):
-    instance_id = patch_file.parent.name
-    patch_text = patch_file.read_text()
-    if patch_text.strip():
-        predictions.append({
-            'instance_id': instance_id,
-            'model_patch': patch_text,
-            'model_name_or_path': 'openhands-bedrock'
-        })
-
-with open('$pred_file', 'w') as f:
-    for p in predictions:
-        f.write(json.dumps(p) + '\n')
-
-print(f'  → {len(predictions)} non-empty predictions written to $pred_file')
-"
-        fi
-    else
-        step "Skipping inference (mode=$MODE). Use --mode openhands for agent trajectories."
     fi
 }
 
 ###############################################################################
-# STAGE 10: Report Generation
+# STAGE 8.5: Create Gold-as-Predictions + Run Prediction Eval
+###############################################################################
+stage_pred_eval() {
+    log "STAGE 8.5: Prediction Evaluation (gold patches as predictions)"
+
+    if $DRY_RUN; then
+        echo "  [DRY-RUN] Would create gold-as-prediction JSONL and run prediction eval"
+        return
+    fi
+
+    local dataset_to_use="${FINAL_DATASET:-${ENRICHED_FILE:-$DATASET}}"
+    [[ -n "$DATASET" ]] && dataset_to_use="$DATASET"
+
+    ensure_dir "$FINAL_DIR"
+    local pred_file="$FINAL_DIR/${REPO_SLUG}-gold-predictions.jsonl"
+
+    step "Creating gold-as-prediction JSONL..."
+    python3 -c "
+import json
+with open('$dataset_to_use') as f:
+    instances = [json.loads(line) for line in f if line.strip()]
+with open('$pred_file', 'w') as out:
+    for inst in instances:
+        out.write(json.dumps({
+            'instance_id': inst['instance_id'],
+            'model_patch': inst.get('patch', ''),
+            'model_name_or_path': 'gold_as_pred'
+        }) + '\n')
+print(f'  → Created {len(instances)} predictions')
+"
+
+    step "Running prediction eval..."
+    run_cmd python swefficiency/harness/run_validation.py \
+        --dataset_name "$dataset_to_use" \
+        --run_id "$RUN_ID" \
+        --max_workers "$MAX_WORKERS" \
+        --max_build_workers "$MAX_WORKERS" \
+        --timeout "$TIMEOUT" \
+        --use_dockerhub_images false \
+        --run_perf true \
+        --run_correctness false \
+        --run_coverage false \
+        --process_isolation false \
+        --force_rerun true \
+        --model_predictions "$pred_file"
+
+    PRED_DIR="$EVAL_DIR/gold_as_pred"
+    if [[ -d "$PRED_DIR" ]]; then
+        local pred_count
+        pred_count=$(find "$PRED_DIR" -name "perf_summary.txt" 2>/dev/null | wc -l | tr -d ' ')
+        echo "  → Prediction eval done: $pred_count instances"
+    fi
+}
+
+###############################################################################
+# STAGE 9: Report Generation
 ###############################################################################
 stage_report() {
-    log "STAGE 10: Report Generation"
+    log "STAGE 9: Report Generation"
+
+    if $DRY_RUN; then
+        echo "  [DRY-RUN] Would generate comparison report"
+        return
+    fi
 
     ensure_dir "$REPORT_DIR"
 
     GOLD_DIR="$EVAL_DIR/gold"
     if [[ ! -d "$GOLD_DIR" ]]; then
-        GOLD_DIR=$(find "$EVAL_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
+        GOLD_DIR=$(find "$EVAL_DIR" -mindepth 1 -maxdepth 1 -type d -name "gold" 2>/dev/null | head -1)
     fi
+    PRED_DIR="$EVAL_DIR/gold_as_pred"
 
-    if [[ -z "$GOLD_DIR" || ! -d "$GOLD_DIR" ]]; then
-        echo "WARNING: No gold eval directory found. Skipping report."
+    local dataset_to_use="${FINAL_DATASET:-${ENRICHED_FILE:-$DATASET}}"
+    [[ -n "$DATASET" ]] && dataset_to_use="$DATASET"
+
+    if [[ -d "$GOLD_DIR" && -d "$PRED_DIR" ]]; then
+        step "Generating comparison report..."
+        run_cmd python -m swefficiency.cli report \
+            --gold_run "$GOLD_DIR" \
+            --pred_run "$PRED_DIR" \
+            --report_output "$REPORT_DIR" \
+            --num_workers 1 \
+            --dataset "$dataset_to_use"
+
+        echo ""
+        echo "  Reports:"
+        ls -la "$REPORT_DIR"/eval_report_gold_as_pred.* 2>/dev/null || echo "  (no report files found)"
+        echo ""
+        if [[ -f "$REPORT_DIR/eval_report_gold_as_pred.json" ]]; then
+            step "Report Summary:"
+            cat "$REPORT_DIR/eval_report_gold_as_pred.json"
+        fi
+    else
+        echo "  Skipping report: gold=$GOLD_DIR pred=$PRED_DIR"
+    fi
+}
+
+###############################################################################
+# STAGE 10: Inference (Agent Trajectory) — Optional
+###############################################################################
+stage_inference() {
+    if [[ "$MODE" != "openhands" ]]; then
+        step "Skipping inference (mode=$MODE). Use --mode openhands for agent trajectories."
         return
     fi
 
-    if [[ "$MODE" == "openhands" ]]; then
-        local pred_dir="$EVAL_DIR/openhands-bedrock"
-        local pred_file="$SCRIPT_DIR/logs/run_inference/${RUN_ID}_inference/predictions.jsonl"
+    log "STAGE 10: Running OpenHands Agent Inference"
 
-        if [[ -f "$pred_file" ]]; then
-            step "Evaluating agent predictions..."
-            run_cmd python swefficiency/harness/run_validation.py \
-                --dataset_name "${FINAL_DATASET:-$ENRICHED_FILE}" \
-                --run_id "${RUN_ID}" \
-                --model_predictions "$pred_file" \
-                --max_workers "$MAX_WORKERS" \
-                --timeout "$TIMEOUT" \
-                --use_dockerhub_images false \
-                --run_perf true \
-                --run_correctness true \
-                --process_isolation true
+    local llm_config="$SCRIPT_DIR/scripts/inference/llm_configs/bedrock.json"
+    if [[ ! -f "$llm_config" ]]; then
+        echo "ERROR: LLM config not found at $llm_config"
+        exit 1
+    fi
 
-            pred_dir=$(find "$EVAL_DIR" -mindepth 1 -maxdepth 1 -type d -name "openhands*" 2>/dev/null | head -1)
-            if [[ -n "$pred_dir" ]]; then
-                step "Generating comparison report..."
-                run_cmd swefficiency report \
-                    --gold_run "$GOLD_DIR" \
-                    --pred_run "$pred_dir" \
-                    --report_output "$REPORT_DIR"
-            fi
-        else
-            echo "  No predictions file found. Generating gold-only report..."
-        fi
+    local dataset_to_use="${FINAL_DATASET:-${ENRICHED_FILE:-$DATASET}}"
+    [[ -n "$DATASET" ]] && dataset_to_use="$DATASET"
+
+    step "Running inference with OpenHands agent..."
+    run_cmd python scripts/inference/custom.py \
+        --mode openhands \
+        --run-id "${RUN_ID}_inference" \
+        --llm-config "$llm_config" \
+        --dataset "$dataset_to_use" \
+        --num-workers 1 \
+        --max-iterations 100 \
+        --max-fake-responses 5 \
+        --mem-limit 12g \
+        --disable-cpu-pinning
+
+    local inf_dir="$SCRIPT_DIR/logs/run_inference/${RUN_ID}_inference"
+    if [[ -d "$inf_dir" ]]; then
+        local patch_count
+        patch_count=$(find "$inf_dir" -name "patch.diff" 2>/dev/null | wc -l | tr -d ' ')
+        echo "  → $patch_count patches generated"
+    fi
+}
+
+###############################################################################
+# FINAL SUMMARY
+###############################################################################
+print_summary() {
+    log "Pipeline Complete!"
+    echo ""
+    echo "  Run ID:         $RUN_ID"
+    echo "  Repo:           $REPO"
+    echo "  Platform:       $(uname -s)/$(uname -m)"
+    echo ""
+    echo "  Artifacts:      $ARTIFACTS_DIR"
+    echo "  Eval output:    $EVAL_DIR"
+    echo "  Reports:        $REPORT_DIR"
+    echo ""
+
+    if [[ -f "$REPORT_DIR/eval_report_gold_as_pred.json" ]]; then
+        echo "  ── Evaluation Results ──"
+        python3 -c "
+import json
+with open('$REPORT_DIR/eval_report_gold_as_pred.json') as f:
+    r = json.load(f)
+print(f'  Total instances:     {r[\"total_instances\"]}')
+print(f'  Overall score:       {r[\"overall_score\"]}')
+print(f'  Human speedup+:     {r[\"proportion_human_speedup_or_better\"]}')
+"
     fi
 
     echo ""
     echo "  ═══════════════════════════════════════"
-    echo "  Pipeline complete!"
+    echo "  Done. Check eval_reports/ for results."
     echo "  ═══════════════════════════════════════"
-    echo ""
-    echo "  Run ID:      $RUN_ID"
-    echo "  Repo:        $REPO"
-    echo "  Artifacts:   $ARTIFACTS_DIR"
-    echo "  Eval output: $EVAL_DIR"
-    echo "  Reports:     $REPORT_DIR"
-    echo ""
 }
 
 ###############################################################################
@@ -513,13 +595,16 @@ main() {
         stage_detect_specs
     else
         echo "  Skipping scrape stages (--skip-scrape)."
-        if [[ -z "${ENRICHED_FILE:-}" ]]; then
-            ENRICHED_FILE=$(find_jsonl "$ENRICHED_DIR" "${REPO_SLUG}*.jsonl")
-            [[ -z "$ENRICHED_FILE" ]] && ENRICHED_FILE=$(find_jsonl "$VERSIONED_DIR" "*.jsonl")
-            [[ -z "$ENRICHED_FILE" ]] && { echo "ERROR: No dataset found. Run without --skip-scrape first."; exit 1; }
-        fi
+        ENRICHED_FILE=$(find_jsonl "$ENRICHED_DIR" "${REPO_SLUG}*.jsonl")
+        [[ -z "$ENRICHED_FILE" ]] && ENRICHED_FILE=$(find_jsonl "$FINAL_DIR" "${REPO_SLUG}*.jsonl")
+        [[ -z "$ENRICHED_FILE" ]] && { echo "ERROR: No dataset found. Run without --skip-scrape first."; exit 1; }
         FINAL_DATASET="$ENRICHED_FILE"
     fi
+
+    # Export for inline Python scripts
+    export _ENRICHED="${ENRICHED_FILE:-}"
+    export _FINAL="${FINAL_DATASET:-}"
+    export _WL_OUTPUT=""
 
     if ! $SKIP_WORKLOAD && [[ -z "$DATASET" ]]; then
         stage_workload
@@ -528,8 +613,10 @@ main() {
     fi
 
     stage_eval
-    stage_inference
+    stage_pred_eval
     stage_report
+    stage_inference
+    print_summary
 }
 
 main

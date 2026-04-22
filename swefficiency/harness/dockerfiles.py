@@ -43,9 +43,8 @@ libblas-dev \
 liblapack-dev \
 && rm -rf /var/lib/apt/lists/*
 
-# Download and install conda
-# RUN wget 'https://repo.anaconda.com/miniconda/Miniconda3-py311_25.3.1-1-Linux-x86_64.sh
-RUN wget 'https://repo.anaconda.com/miniconda/Miniconda3-py311_24.7.1-0-Linux-x86_64.sh' -O miniconda.sh \
+# Download and install conda (arch-aware)
+RUN wget 'https://repo.anaconda.com/miniconda/Miniconda3-py311_24.7.1-0-Linux-{conda_arch}.sh' -O miniconda.sh \
     && bash miniconda.sh -b -p /opt/miniconda3
 # Add conda to PATH
 ENV PATH=/opt/miniconda3/bin:$PATH

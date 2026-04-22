@@ -162,6 +162,7 @@ def report_command(args):
             pred_run=pred_run_path,
             output_dir=output_dir,
             num_workers=args.num_workers,
+            dataset_name=args.dataset,
         )
 
         print(f"\nCSV report: {csv_path}")
@@ -265,6 +266,12 @@ def main():
         type=int,
         default=4,
         help="Number of parallel workers for report generation (default: 4)",
+    )
+    report_parser.add_argument(
+        "--dataset",
+        type=str,
+        default="swefficiency/swefficiency",
+        help="HuggingFace dataset name or path to local JSONL file (default: swefficiency/swefficiency)",
     )
 
     # Parse arguments
