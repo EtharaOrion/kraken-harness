@@ -172,6 +172,18 @@ def _iter_dataset(
     dataset_name: str,
     split: str,
 ) -> Iterable[dict]:
+    # Support local JSONL files directly
+    from pathlib import Path
+    p = Path(dataset_name)
+    if p.exists() and p.suffix == ".jsonl":
+        import json
+        with open(p) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    yield json.loads(line)
+        return
+
     hf_kwargs = {}
     ds = datasets.load_dataset(dataset_name, split=split, **hf_kwargs)
     for row in ds:

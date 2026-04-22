@@ -22,13 +22,16 @@ Usage (via custom.py):
 
 from __future__ import annotations
 
+import base64
 import concurrent.futures
 import json
 import logging
 import multiprocessing
 import os
+import platform as platform_mod
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -184,9 +187,9 @@ def _extract_patch(workspace, instance: dict, working_dir: str) -> str:
     )
 
     if base_commit:
-        diff_cmd = f"cd {working_dir} && git --no-pager diff --no-color {base_commit} HEAD"
+        diff_cmd = f"cd {working_dir} && git --no-pager diff --binary {base_commit} HEAD"
     else:
-        diff_cmd = f"cd {working_dir} && git --no-pager diff --no-color HEAD~1 HEAD"
+        diff_cmd = f"cd {working_dir} && git --no-pager diff --binary HEAD~1 HEAD"
     commands.append(diff_cmd)
 
     for cmd in commands[:-1]:
@@ -204,6 +207,38 @@ def _extract_patch(workspace, instance: dict, working_dir: str) -> str:
     except Exception:
         logger.exception("Failed to extract patch")
         return ""
+
+
+def _capture_conversation_archive(
+    workspace, instance_id: str, log_dir: Path
+) -> None:
+    """Capture /workspace/conversations/ from runtime as tar.gz.
+
+    Mirrors openhands-benchmarks' _capture_conversation_archive() logic:
+    runs tar+base64 inside container, decodes on host.
+    """
+    try:
+        conv_cmd = (
+            "cd / && "
+            "if [ -d workspace/conversations ]; then "
+            "tar -czf - workspace/conversations | base64; "
+            "else echo ''; fi"
+        )
+        result = workspace.execute_command(conv_cmd)
+
+        stdout = result.stdout if hasattr(result, "stdout") else str(result)
+        exit_code = result.exit_code if hasattr(result, "exit_code") else 0
+
+        if exit_code == 0 and stdout.strip():
+            conv_dir = log_dir.parent / "conversations"
+            conv_dir.mkdir(parents=True, exist_ok=True)
+            conv_tar = conv_dir / f"{instance_id}.tar.gz"
+            conv_tar.write_bytes(base64.b64decode(stdout.strip()))
+            logger.info("Saved conversation archive: %s", conv_tar)
+        else:
+            logger.debug("No conversation archive for %s", instance_id)
+    except Exception as e:
+        logger.warning("Failed to capture conversation archive for %s: %s", instance_id, e)
 
 
 def process_instance_openhands(
@@ -234,6 +269,12 @@ def process_instance_openhands(
     log_dir = log_root / instance_id
     log_dir.mkdir(parents=True, exist_ok=True)
 
+    instance_log_file = log_dir / "instance.log"
+    file_handler = logging.FileHandler(instance_log_file)
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logging.getLogger().addHandler(file_handler)
+
     patch_path = log_dir / "patch.diff"
     if patch_path.exists():
         logger.info("[SKIP] %s: patch already exists", instance_id)
@@ -256,12 +297,24 @@ def process_instance_openhands(
         workspace = ResourceLimitedDockerWorkspace(
             server_image=agent_server_image,
             working_dir="/workspace",
-            forward_env=["DEBUG"],
+            forward_env=[
+                "DEBUG",
+                "AWS_BEARER_TOKEN_BEDROCK",
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+                "AWS_SESSION_TOKEN",
+                "AWS_DEFAULT_REGION",
+                "AWS_REGION",
+                "OPENAI_API_KEY",
+                "ANTHROPIC_API_KEY",
+                "GEMINI_API_KEY",
+            ],
             cleanup_image=cleanup_images,
-            platform="linux/amd64",
+            platform=f"linux/{'arm64' if __import__('platform').machine() in ('aarch64', 'arm64') else 'amd64'}",
             cpuset_cpus=cpuset_str,
             nano_cpus=nano_cpus,
             mem_limit_override=mem_limit,
+            health_check_timeout=300.0,
         )
         workspace._cpu_group = cpu_group
         workspace._cpu_groups_queue = cpu_groups_queue
@@ -311,7 +364,12 @@ def process_instance_openhands(
         (log_dir / "openhands_prompt.txt").write_text(instruction)
 
         conversation.send_message(instruction)
-        _run_conversation_loop(conversation, max_fake_responses)
+        conversation_error = None
+        try:
+            _run_conversation_loop(conversation, max_fake_responses)
+        except Exception as conv_exc:
+            conversation_error = str(conv_exc)
+            logger.warning("[WARN] %s: conversation ended with: %s", instance_id, conversation_error)
 
         git_patch = _extract_patch(workspace, instance, working_dir)
 
@@ -339,9 +397,10 @@ def process_instance_openhands(
             except Exception:
                 history_serialized.append(str(evt))
 
+        status = "success" if not conversation_error else "max_iterations"
         result = OpenHandsResult(
             instance_id=instance_id,
-            status="success",
+            status=status,
             patch_path=str(patch_path),
             git_patch=git_patch,
             instruction=instruction,
@@ -360,9 +419,11 @@ def process_instance_openhands(
         except Exception:
             pass
 
+        _capture_conversation_archive(workspace, instance_id, log_dir)
+
         return {
             "instance_id": instance_id,
-            "status": "success",
+            "status": status,
             "patch": str(patch_path),
             "cost": cost,
             "elapsed_seconds": elapsed,
@@ -374,6 +435,8 @@ def process_instance_openhands(
         return {"instance_id": instance_id, "status": "error", "error": str(exc)}
 
     finally:
+        logging.getLogger().removeHandler(file_handler)
+        file_handler.close()
         if workspace is not None:
             try:
                 workspace.cleanup()
@@ -430,6 +493,27 @@ def run_openhands_inference(
     output_jsonl = run_log_dir / "output.jsonl"
     output_errors_jsonl = run_log_dir / "output_errors.jsonl"
     predictions_jsonl = run_log_dir / "predictions.jsonl"
+
+    metadata = {
+        "run_id": run_id,
+        "model_name": model_name,
+        "llm_config": str(llm_config_path),
+        "max_iterations": max_iterations,
+        "max_fake_responses": max_fake_responses,
+        "num_workers": num_workers,
+        "cpus_per_worker": cpus_per_worker,
+        "mem_limit": mem_limit,
+        "build_target": build_target,
+        "num_instances": len(instances),
+        "instance_ids": [inst["instance_id"] for inst in instances],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        llm_cfg = json.loads(llm_config_path.read_text())
+        metadata["llm_model"] = llm_cfg.get("model", "")
+    except Exception:
+        pass
+    (run_log_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
 
     if prompt_template is None:
         prompt_template = SCRIPTS_DIR / "templates" / "openhands_prompt.j2"

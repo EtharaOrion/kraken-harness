@@ -1,4 +1,8 @@
 {
-    "model": "bedrock/converse/arn:aws:bedrock:us-east-1:426628337772:application-inference-profile/4w7tmk1iplxi",
-    "aws_region_name": "us-east-1"
+    "model": "bedrock/converse/arn:aws:bedrock:us-east-1:426628337772:application-inference-profile/cddwmu6axlfp",
+    "aws_region_name": "us-east-1",
+    "extended_thinking_budget": null,
+    "reasoning_effort": null,
+    "drop_params": true,
+    "max_output_tokens": 4096
 }

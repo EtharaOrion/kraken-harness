@@ -808,11 +808,21 @@ def create_container_from_image(
 
         extra_args = {}
         if cpu_groups:
-            # print(f"Using CPU groups: {cpu_groups}")
             extra_args.update(cpu_groups)
-            # print(f"Creating container with args: {extra_args}")
 
-        # Create the container
+        import platform as platform_mod
+        is_macos = platform_mod.system() == "Darwin"
+
+        mem_kwargs = {}
+        if not is_macos:
+            mem_kwargs = {
+                "mem_limit": "32g",
+                "mem_reservation": "16g",
+                "memswap_limit": "32g",
+                "oom_kill_disable": True,
+                "oom_score_adj": 1000,
+            }
+
         logger.info(f"Creating container for {test_spec.instance_id}...")
         container = client.containers.create(
             image=image_name,
@@ -820,15 +830,9 @@ def create_container_from_image(
             user=user,
             detach=True,
             command="tail -f /dev/null",
-            # nano_cpus=nano_cpus,
             platform=test_spec.platform,
             network_mode="host" if USE_HOST_NETWORK else None,
-            # Memory limits.
-            mem_limit="32g",
-            mem_reservation="16g",
-            memswap_limit="32g",
-            oom_kill_disable=True,  # TODO: Revisit this.
-            oom_score_adj=1000,
+            **mem_kwargs,
             **extra_args,
         )
         logger.info(f"Container for {test_spec.instance_id} created: {container.id}")

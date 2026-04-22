@@ -12,11 +12,21 @@ from __future__ import annotations
 
 import logging
 import os
+import platform
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
+
+
+def _get_docker_arch() -> str:
+    machine = platform.machine().lower()
+    if machine in ("x86_64", "amd64"):
+        return "amd64"
+    if machine in ("aarch64", "arm64"):
+        return "arm64"
+    return "amd64"
 
 from openhands_config import (
     DEFAULT_BUILD_TARGET,
@@ -162,9 +172,6 @@ def build_agent_server_image(
         logger.info("Image already exists locally: %s", image_tag)
         return image_tag
 
-    # Pre-build sdist for reuse
-    sdist_path = _pre_build_sdist()
-
     logger.info("Building agent-server image: %s", image_tag)
     logger.info("  Base image: %s", base_image)
     logger.info("  SDK SHA: %s", short_sha)
@@ -175,11 +182,11 @@ def build_agent_server_image(
         custom_tags=custom_tag,
         image=EVAL_AGENT_SERVER_IMAGE,
         target=target,
-        platforms=["linux/amd64"],
+        platforms=[f"linux/{_get_docker_arch()}"],
         push=False,
         git_ref=sdk_info["git_ref"],
         git_sha=sdk_info["git_sha"],
-        prebuilt_sdist=sdist_path,
+        prebuilt_sdist=None,
         sdk_version=sdk_info["sdk_version"],
         sdk_project_root=SDK_ROOT,
     )

@@ -302,20 +302,21 @@ def run_instance(
         if use_dockerhub_images:
             logger.info(f"Using DockerHub image: {dockerhub_image_key}")
 
-            # We need to pull the image first for it to show up in local registry.
-            # Include fully qualified name for easier resolving.
-            while True:
-                try:
-                    if use_podman:
-                        # For some reason, podman does not support pulling images with the fully qualified name automatically.
-                        subprocess.run(
-                            f"podman pull {dockerhub_image_key}", shell=True, check=True
-                        )
-                    else:
-                        client.images.pull(dockerhub_image_key)
-                    break
-                except Exception as e:
-                    time.sleep(5)
+            try:
+                client.images.get(dockerhub_image_key)
+                logger.info(f"Image {dockerhub_image_key} already available locally, skipping pull")
+            except Exception:
+                while True:
+                    try:
+                        if use_podman:
+                            subprocess.run(
+                                f"podman pull {dockerhub_image_key}", shell=True, check=True
+                            )
+                        else:
+                            client.images.pull(dockerhub_image_key)
+                        break
+                    except Exception as e:
+                        time.sleep(5)
 
             # Create container from image
             container = create_container_from_image(
