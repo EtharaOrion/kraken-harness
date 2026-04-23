@@ -32,6 +32,6 @@ python swefficiency/harness/run_validation.py \
     --timeout 7_200 \
     --run_perf true \
     --run_correctness false \
-    --use_dockerhub_images true \
+    --use_ecr_images true \
     --workload_predictions predictions/workload_generation/workload_generation.jsonl \
     $ADDITIONAL_ARGS

@@ -398,7 +398,7 @@ logs/run_inference/{run_id}/openhands/
   "num_instances": 1,
   "instance_ids": ["psf__requests-7342"],
   "timestamp": "2026-04-23T14:30:00Z",
-  "llm_model": "bedrock/converse/arn:aws:bedrock:us-east-1:426628337772:application-inference-profile/cddwmu6axlfp"
+  "llm_model": "bedrock/converse/global.anthropic.claude-opus-4-6-v1"
 }
 ```
 

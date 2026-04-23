@@ -63,6 +63,8 @@ from openhands_output import (
     write_eval_output,
 )
 
+from swefficiency.observability import setup_helicone
+
 
 def _load_llm(config_path: Path):
     """Load LLM from a JSON config file using Pydantic validation."""
@@ -106,9 +108,10 @@ def _agent_finished_with_finish_action(events) -> bool:
     for event in reversed(list(events)):
         event_cls = type(event).__name__
         if "ActionEvent" in event_cls or "Action" in event_cls:
-            return "FinishAction" in event_cls or "finish" in str(
-                getattr(event, "action", "")
-            ).lower()
+            return (
+                "FinishAction" in event_cls
+                or "finish" in str(getattr(event, "action", "")).lower()
+            )
         if "ObservationEvent" in event_cls or "Observation" in event_cls:
             continue
         break
@@ -187,7 +190,9 @@ def _extract_patch(workspace, instance: dict, working_dir: str) -> str:
     )
 
     if base_commit:
-        diff_cmd = f"cd {working_dir} && git --no-pager diff --binary {base_commit} HEAD"
+        diff_cmd = (
+            f"cd {working_dir} && git --no-pager diff --binary {base_commit} HEAD"
+        )
     else:
         diff_cmd = f"cd {working_dir} && git --no-pager diff --binary HEAD~1 HEAD"
     commands.append(diff_cmd)
@@ -209,9 +214,7 @@ def _extract_patch(workspace, instance: dict, working_dir: str) -> str:
         return ""
 
 
-def _capture_conversation_archive(
-    workspace, instance_id: str, log_dir: Path
-) -> None:
+def _capture_conversation_archive(workspace, instance_id: str, log_dir: Path) -> None:
     """Capture /workspace/conversations/ from runtime as tar.gz.
 
     Mirrors openhands-benchmarks' _capture_conversation_archive() logic:
@@ -238,7 +241,9 @@ def _capture_conversation_archive(
         else:
             logger.debug("No conversation archive for %s", instance_id)
     except Exception as e:
-        logger.warning("Failed to capture conversation archive for %s: %s", instance_id, e)
+        logger.warning(
+            "Failed to capture conversation archive for %s: %s", instance_id, e
+        )
 
 
 def process_instance_openhands(
@@ -272,13 +277,19 @@ def process_instance_openhands(
     instance_log_file = log_dir / "instance.log"
     file_handler = logging.FileHandler(instance_log_file)
     file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
     logging.getLogger().addHandler(file_handler)
 
     patch_path = log_dir / "patch.diff"
     if patch_path.exists():
         logger.info("[SKIP] %s: patch already exists", instance_id)
-        return {"instance_id": instance_id, "status": "skipped", "patch": str(patch_path)}
+        return {
+            "instance_id": instance_id,
+            "status": "skipped",
+            "patch": str(patch_path),
+        }
 
     logger.info("[START] %s", instance_id)
     start_time = time.time()
@@ -300,6 +311,7 @@ def process_instance_openhands(
             forward_env=[
                 "DEBUG",
                 "AWS_BEARER_TOKEN_BEDROCK",
+                "AWS_BEDROCK_RUNTIME_ENDPOINT",
                 "AWS_ACCESS_KEY_ID",
                 "AWS_SECRET_ACCESS_KEY",
                 "AWS_SESSION_TOKEN",
@@ -308,6 +320,9 @@ def process_instance_openhands(
                 "OPENAI_API_KEY",
                 "ANTHROPIC_API_KEY",
                 "GEMINI_API_KEY",
+                "HELICONE_API_KEY",
+                "HELICONE_API_BASE",
+                "HELICONE_USER",
             ],
             cleanup_image=cleanup_images,
             platform=f"linux/{'arm64' if __import__('platform').machine() in ('aarch64', 'arm64') else 'amd64'}",
@@ -369,7 +384,11 @@ def process_instance_openhands(
             _run_conversation_loop(conversation, max_fake_responses)
         except Exception as conv_exc:
             conversation_error = str(conv_exc)
-            logger.warning("[WARN] %s: conversation ended with: %s", instance_id, conversation_error)
+            logger.warning(
+                "[WARN] %s: conversation ended with: %s",
+                instance_id,
+                conversation_error,
+            )
 
         git_patch = _extract_patch(workspace, instance, working_dir)
 
@@ -412,7 +431,9 @@ def process_instance_openhands(
         write_eval_output(result, output_jsonl)
 
         elapsed = time.time() - start_time
-        logger.info("[OK] %s: %.1fs, patch=%d bytes", instance_id, elapsed, len(git_patch))
+        logger.info(
+            "[OK] %s: %.1fs, patch=%d bytes", instance_id, elapsed, len(git_patch)
+        )
 
         try:
             conversation.close()
@@ -444,7 +465,9 @@ def process_instance_openhands(
                 logger.debug("Workspace cleanup failed for %s", instance_id)
 
 
-def _divide_cpus(num_workers: int, cpus_per_worker: int, cpus_to_skip: int) -> list[list[int]]:
+def _divide_cpus(
+    num_workers: int, cpus_per_worker: int, cpus_to_skip: int
+) -> list[list[int]]:
     """Divide available CPUs among workers (simple linear, not NUMA-aware)."""
     try:
         available = sorted(os.sched_getaffinity(0))
@@ -487,6 +510,8 @@ def run_openhands_inference(
     disable_cpu_pinning: bool = False,
 ) -> list[dict]:
     """Run OpenHands agent inference on a list of SWE-fficiency instances."""
+    setup_helicone()
+
     run_log_dir = output_dir / run_id / "openhands"
     run_log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -583,10 +608,15 @@ def run_openhands_inference(
                 elif status == "skipped":
                     print(f"[SKIP] {iid}")
                 else:
-                    print(f"[ERR] {iid}: {result.get('error', 'unknown')}", file=sys.stderr)
+                    print(
+                        f"[ERR] {iid}: {result.get('error', 'unknown')}",
+                        file=sys.stderr,
+                    )
             except Exception as exc:
                 print(f"[ERR] {iid}: {exc}", file=sys.stderr)
-                results.append({"instance_id": iid, "status": "error", "error": str(exc)})
+                results.append(
+                    {"instance_id": iid, "status": "error", "error": str(exc)}
+                )
 
     cleanup_sdist()
 
@@ -594,7 +624,9 @@ def run_openhands_inference(
     summary_path.write_text(json.dumps(results, indent=2))
 
     if output_jsonl.exists():
-        count = convert_to_predictions_jsonl(output_jsonl, predictions_jsonl, model_name)
+        count = convert_to_predictions_jsonl(
+            output_jsonl, predictions_jsonl, model_name
+        )
         print(f"Predictions JSONL: {predictions_jsonl} ({count} entries)")
 
     print(f"Summary: {summary_path}")

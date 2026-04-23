@@ -77,7 +77,7 @@ GITHUB_TOKEN=ghp_single_token                      # Single GitHub PAT (for vers
 
 # REQUIRED for Stage 5 (workload generation) — Opus 4.6 via AWS Bedrock
 AWS_BEARER_TOKEN_BEDROCK=your_bedrock_bearer_token
-WORKLOAD_MODEL=bedrock/converse/arn:aws:bedrock:us-east-1:426628337772:application-inference-profile/4w7tmk1iplxi
+WORKLOAD_MODEL=bedrock/converse/global.anthropic.claude-opus-4-6-v1
 
 # OPTIONAL
 DEBUG=1                                            # Enable debug logging
@@ -435,8 +435,8 @@ python -m swefficiency.workload.run_synthetic_generation \
 
 ### Environment Variables Required
 
-- `AWS_BEARER_TOKEN_BEDROCK` — Bearer token for Bedrock. The script uses `litellm` with the model set by `WORKLOAD_MODEL` env var (default: Opus 4.6 ARN `bedrock/converse/arn:aws:bedrock:us-east-1:...4w7tmk1iplxi`).
-- `WORKLOAD_MODEL` — (Optional) Override the LLM model. If not set, defaults to the Opus 4.6 ARN.
+- `AWS_BEARER_TOKEN_BEDROCK` — Bearer token for Bedrock. The script uses `litellm` with the model set by `WORKLOAD_MODEL` env var (default: Opus 4.6 `bedrock/converse/global.anthropic.claude-opus-4-6-v1`).
+- `WORKLOAD_MODEL` — (Optional) Override the LLM model. If not set, defaults to Opus 4.6.
 
 ### Input
 
@@ -715,7 +715,7 @@ python scripts/inference/custom.py \
 
 ```json
 {
-  "model": "bedrock/arn:aws:bedrock:ap-south-1:426628337772:application-inference-profile/f0v1auqubh66",
+  "model": "bedrock/converse/global.anthropic.claude-opus-4-6-v1",
   "aws_region_name": "ap-south-1",
   "temperature": 0.0,
   "max_output_tokens": 16384

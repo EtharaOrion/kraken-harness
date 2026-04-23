@@ -43,6 +43,14 @@ INSTALL_CMD = {
 }
 
 
+_GENERIC_VERSION_PATTERNS = [
+    r'__version__\s*=\s*[\'"]([^\'"]+)[\'"]',
+    r'__version__\s*=\s*version\s*=\s*[\'"]([^\'"]+)[\'"]',
+    r'version\s*=\s*[\'"](\d+\.\d+[^\'"]*)[\'"]',
+    r"VERSION\s*=\s*\(([^)]+)\)",
+]
+
+
 def _find_version_in_text(text: str, instance: dict) -> str:
     """
     Helper function for applying regex patterns to look for versions in text
@@ -56,8 +64,11 @@ def _find_version_in_text(text: str, instance: dict) -> str:
     # Remove comments
     pattern = r'""".*?"""'
     text = re.sub(pattern, "", text, flags=re.DOTALL)
+    patterns = MAP_REPO_TO_VERSION_PATTERNS.get(
+        instance["repo"], _GENERIC_VERSION_PATTERNS
+    )
     # Search through all patterns
-    for pattern in MAP_REPO_TO_VERSION_PATTERNS[instance["repo"]]:
+    for pattern in patterns:
         matches = re.search(pattern, text)
         if matches is not None:
             print(instance["repo"])
@@ -96,7 +107,18 @@ def get_version(instance, is_build=False, path_repo=None):
         str: Version text, if found
     """
     keep_major_minor = lambda x, sep: ".".join(x.strip().split(sep)[:2])
-    paths_to_version = MAP_REPO_TO_VERSION_PATHS[instance["repo"]]
+    paths_to_version = MAP_REPO_TO_VERSION_PATHS.get(instance["repo"])
+    if paths_to_version is None:
+        repo_name = instance["repo"].split("/")[-1].lower().replace("-", "_")
+        paths_to_version = [
+            f"{repo_name}/__init__.py",
+            f"{repo_name}/_version.py",
+            f"{repo_name}/version.py",
+            f"src/{repo_name}/__init__.py",
+            f"src/{repo_name}/_version.py",
+            "setup.cfg",
+            "pyproject.toml",
+        ]
     version = None
     for path_to_version in paths_to_version:
         init_text = None
@@ -169,7 +191,7 @@ def get_versions_from_build(data: dict):
     # Activate conda environment and set installation command
     cmd_activate = f"source {os.path.join(path_conda, 'bin/activate')}"
     cmd_source = f"source {os.path.join(path_conda, 'etc/profile.d/conda.sh')}"
-    cmd_install = INSTALL_CMD[data_tasks[0]["repo"]]
+    cmd_install = INSTALL_CMD.get(data_tasks[0]["repo"], "pip install -e .")
 
     # Change directory to repo testbed
     cwd = os.getcwd()

@@ -147,6 +147,8 @@ import time
 import datasets
 from litellm import completion
 
+from swefficiency.observability import helicone_metadata, setup_helicone_for_pool
+
 ds = datasets.load_dataset("swefficiency/swefficiency", split="test")
 
 
@@ -172,6 +174,14 @@ def worker(instance):
                     },
                 ],
                 temperature=0.0,
+                metadata=helicone_metadata(
+                    call_type="analysis",
+                    model_id="gemini-2.5-flash",
+                    extra={
+                        "Script": "diff_classification",
+                        "InstanceId": instance["instance_id"],
+                    },
+                ),
             )
             text = response.choices[0].message.content
 
@@ -201,7 +211,7 @@ def worker(instance):
 
 import tqdm
 
-with multiprocessing.Pool(processes=8) as pool:
+with multiprocessing.Pool(processes=8, initializer=setup_helicone_for_pool) as pool:
     results = []
     for r in tqdm.tqdm(pool.imap(worker, ds), total=len(ds), desc="Classifying diffs"):
         results.append(r)

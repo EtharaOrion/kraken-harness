@@ -133,3 +133,100 @@ def get_log_parser_by_type(parser_type: str | None) -> Callable:
         "scipy": log_parsers.parse_log_numpy,
     }
     return _PARSER_TYPE_MAP.get(parser_type, log_parsers.parse_log_pytest)
+
+
+def can_build_spec(instance: SWEfficiencyInstance) -> tuple[bool, str]:
+    """Check whether an instance has enough information to create a TestSpec and Docker image.
+
+    Returns (ok, reason) — ok is True when get_or_create_specs() will succeed
+    and make_env_script_list() will not crash due to missing paths.
+
+    This is a *cheap* pre-filter: no network calls, no cloning.
+    """
+    repo = instance.get("repo", "").lower()
+    version = instance.get("version", "")
+
+    if not repo:
+        return False, "missing 'repo' field"
+    if not version:
+        return False, "missing 'version' field"
+    if not instance.get("base_commit"):
+        return False, "missing 'base_commit' field"
+    if not instance.get("test_patch"):
+        return False, "missing 'test_patch' field"
+
+    # Tier 1: hardcoded specs — always buildable
+    if repo in MAP_REPO_VERSION_TO_SPECS:
+        repo_specs = MAP_REPO_VERSION_TO_SPECS[repo]
+        if version in repo_specs:
+            specs = repo_specs[version]
+            pkgs = specs.get("packages", "")
+            # Verify that required paths exist for packages source
+            if pkgs == "requirements.txt" and repo not in MAP_REPO_TO_REQS_PATHS:
+                return (
+                    False,
+                    f"specs require requirements.txt but no paths in MAP_REPO_TO_REQS_PATHS for {repo}",
+                )
+            if pkgs == "environment.yml" and repo not in MAP_REPO_TO_ENV_YML_PATHS:
+                return (
+                    False,
+                    f"specs require environment.yml but no paths in MAP_REPO_TO_ENV_YML_PATHS for {repo}",
+                )
+            return True, "hardcoded specs"
+        # repo known but version unknown — fall through to tier 2
+
+    # Tier 2: dynamic specs from enriched instance fields
+    has_python = "python_version" in instance
+    has_install = "install_cmd" in instance
+    if not has_python and not has_install:
+        return False, (
+            f"repo {repo}@{version} not in hardcoded specs and instance lacks "
+            f"python_version/install_cmd — run detect_repo_specs.py first"
+        )
+
+    # Check packages_source consistency
+    packages_source = instance.get("packages_source", "")
+    if packages_source == "requirements.txt":
+        reqs_paths = instance.get("reqs_paths")
+        if not reqs_paths and repo not in MAP_REPO_TO_REQS_PATHS:
+            return (
+                False,
+                f"packages_source=requirements.txt but no reqs_paths and repo not in MAP_REPO_TO_REQS_PATHS",
+            )
+    elif packages_source == "environment.yml":
+        env_yml_paths = instance.get("env_yml_paths")
+        if not env_yml_paths and repo not in MAP_REPO_TO_ENV_YML_PATHS:
+            return (
+                False,
+                f"packages_source=environment.yml but no env_yml_paths and repo not in MAP_REPO_TO_ENV_YML_PATHS",
+            )
+
+    return True, "dynamic specs (enriched instance)"
+
+
+def filter_buildable_instances(
+    instances: list[SWEfficiencyInstance],
+) -> tuple[list[SWEfficiencyInstance], list[tuple[str, str]]]:
+    """Partition instances into buildable and non-buildable.
+
+    Returns:
+        (buildable, skipped) where skipped is list of (instance_id, reason).
+    """
+    buildable = []
+    skipped = []
+    for inst in instances:
+        ok, reason = can_build_spec(inst)
+        if ok:
+            buildable.append(inst)
+        else:
+            iid = inst.get("instance_id", "<unknown>")
+            logger.warning("Skipping %s: %s", iid, reason)
+            skipped.append((iid, reason))
+    if skipped:
+        logger.info(
+            "Pre-filter: %d buildable, %d skipped out of %d total",
+            len(buildable),
+            len(skipped),
+            len(instances),
+        )
+    return buildable, skipped

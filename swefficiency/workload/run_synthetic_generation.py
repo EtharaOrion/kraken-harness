@@ -27,6 +27,7 @@ from tqdm import tqdm
 
 from swefficiency.harness.constants import SWEfficiencyInstance
 from swefficiency.harness.utils import load_swefficiency_dataset
+from swefficiency.observability import helicone_metadata, setup_helicone
 
 WORKLOAD_GENERATION_DIR = Path("logs/workload_generation")
 
@@ -145,8 +146,9 @@ def worker_function(
         try:
             model_name = os.environ.get(
                 "WORKLOAD_MODEL",
-                "bedrock/converse/arn:aws:bedrock:us-east-1:426628337772:application-inference-profile/4w7tmk1iplxi",
+                "bedrock/converse/global.anthropic.claude-opus-4-6-v1",
             )
+            api_base = os.environ.get("AWS_BEDROCK_RUNTIME_ENDPOINT")
             response = completion(
                 model=model_name,
                 messages=[
@@ -165,6 +167,12 @@ def worker_function(
                     },
                 ],
                 temperature=0.0,
+                api_base=api_base,
+                metadata=helicone_metadata(
+                    call_type="synthetic",
+                    model_id=model_name,
+                    extra={"InstanceId": datum["instance_id"]},
+                ),
             )
             break
         except Exception as e:
@@ -192,6 +200,7 @@ def main(
     max_workers: int,
     run_id: str,
 ):
+    setup_helicone()
     dataset = load_swefficiency_dataset(dataset_name, split)
     random.shuffle(dataset)  # Shuffle dataset for randomness
 

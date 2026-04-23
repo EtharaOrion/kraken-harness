@@ -101,7 +101,7 @@ Create a JSON config file at `scripts/inference/llm_configs/`:
 **AWS Bedrock (Bearer Token)**:
 ```json
 {
-    "model": "bedrock/arn:aws:bedrock:REGION:ACCOUNT:application-inference-profile/PROFILE_ID",
+    "model": "bedrock/converse/global.anthropic.claude-opus-4-6-v1",
     "aws_region_name": "ap-south-1"
 }
 ```
@@ -110,7 +110,7 @@ Then set: `export AWS_BEARER_TOKEN_BEDROCK="your-token"`
 **AWS Bedrock (IAM)**:
 ```json
 {
-    "model": "bedrock/arn:aws:bedrock:REGION:ACCOUNT:application-inference-profile/PROFILE_ID",
+    "model": "bedrock/converse/global.anthropic.claude-opus-4-6-v1",
     "aws_access_key_id": "AKIA...",
     "aws_secret_access_key": "...",
     "aws_region_name": "ap-south-1"

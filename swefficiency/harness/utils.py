@@ -200,14 +200,20 @@ def has_attribute_or_import_error(log_before):
 
 @cache
 def get_environment_yml_by_commit(repo: str, commit: str, env_name: str) -> str:
-    for req_path in MAP_REPO_TO_ENV_YML_PATHS[repo]:
+    env_yml_paths = MAP_REPO_TO_ENV_YML_PATHS.get(repo)
+    if not env_yml_paths:
+        raise ValueError(
+            f"No environment.yml paths configured for repo {repo}. "
+            f"Either add paths to MAP_REPO_TO_ENV_YML_PATHS or run detect_repo_specs.py first."
+        )
+    for req_path in env_yml_paths:
         reqs_url = os.path.join(SWE_BENCH_URL_RAW, repo, commit, req_path)
         reqs = requests.get(reqs_url)
         if reqs.status_code == 200:
             break
     else:
         raise ValueError(
-            f"Could not find environment.yml at paths {MAP_REPO_TO_ENV_YML_PATHS[repo]} for repo {repo} at commit {commit}"
+            f"Could not find environment.yml at paths {env_yml_paths} for repo {repo} at commit {commit}"
         )
 
     lines = reqs.text.split("\n")
@@ -247,14 +253,20 @@ def get_environment_yml(instance: SWEfficiencyInstance, env_name: str) -> str:
 
 @cache
 def get_requirements_by_commit(repo: str, commit: str) -> str:
-    for req_path in MAP_REPO_TO_REQS_PATHS[repo]:
+    reqs_paths = MAP_REPO_TO_REQS_PATHS.get(repo)
+    if not reqs_paths:
+        raise ValueError(
+            f"No requirements.txt paths configured for repo {repo}. "
+            f"Either add paths to MAP_REPO_TO_REQS_PATHS or run detect_repo_specs.py first."
+        )
+    for req_path in reqs_paths:
         reqs_url = os.path.join(SWE_BENCH_URL_RAW, repo, commit, req_path)
         reqs = requests.get(reqs_url)
         if reqs.status_code == 200:
             break
     else:
         raise ValueError(
-            f"Could not find requirements.txt at paths {MAP_REPO_TO_REQS_PATHS[repo]} for repo {repo} at commit {commit}"
+            f"Could not find requirements.txt at paths {reqs_paths} for repo {repo} at commit {commit}"
         )
 
     lines = reqs.text

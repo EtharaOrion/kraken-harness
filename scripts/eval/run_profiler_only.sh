@@ -33,7 +33,7 @@ python swefficiency/harness/run_validation.py \
     --run_perf true \
     --run_perf_profiling true \
     --run_correctness false \
-    --use_dockerhub_images true \
+    --use_ecr_images true \
     $ADDITIONAL_ARGS
 
 #     --run_perf_profiling true \

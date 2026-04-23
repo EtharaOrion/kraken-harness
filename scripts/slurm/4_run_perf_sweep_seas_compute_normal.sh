@@ -85,7 +85,7 @@ for i in "${!REPOS[@]}"; do
     ADDITIONAL_ARGS=""
     # if [[ "$repo" == "pandas" ]]; then
     #     # Pandas images take way too long to build, so we use the dockerhub image.
-    #     ADDITIONAL_ARGS="--use_dockerhub_images true"
+    #     ADDITIONAL_ARGS="--use_ecr_images true"
     # fi
 
     sbatch <<EOT
@@ -161,7 +161,7 @@ python swefficiency/harness/run_validation.py \
     --run_perf true \
     --run_correctness true \
     --gdrive_annotation_sheet global_sweperf_all_data_annotate \
-    --push_to_dockerhub true \
+    --push_to_ecr true \
     $ADDITIONAL_ARGS $INSTANCE_RUN_ARG \
 
 EOT

@@ -3218,6 +3218,9 @@ inference = [
     { name = "jedi" },
     { name = "jinja2" },
 ]
+openhands = [
+    { name = "jinja2" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -3230,6 +3233,7 @@ requires-dist = [
     { name = "gitpython" },
     { name = "jedi", marker = "extra == 'inference'" },
     { name = "jinja2", marker = "extra == 'inference'" },
+    { name = "jinja2", marker = "extra == 'openhands'" },
     { name = "pandas" },
     { name = "pre-commit" },
     { name = "python-dotenv" },
@@ -3238,7 +3242,7 @@ requires-dist = [
     { name = "tqdm" },
     { name = "unidiff" },
 ]
-provides-extras = ["inference"]
+provides-extras = ["inference", "openhands"]
 
 [[package]]
 name = "tqdm"

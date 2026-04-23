@@ -314,9 +314,13 @@ with open(enriched_path) as f:
 workloads = {}
 if wl_path and os.path.exists(wl_path):
     with open(wl_path) as f:
-        data = json.load(f)
-    if isinstance(data, dict):
-        data = [data]
+        content = f.read().strip()
+    try:
+        data = json.loads(content)
+        if isinstance(data, dict):
+            data = [data]
+    except json.JSONDecodeError:
+        data = [json.loads(line) for line in content.splitlines() if line.strip()]
     for item in data:
         iid = item.get('instance_id', '')
         wl = item.get('workload', item.get('generated_workload', ''))
@@ -370,7 +374,7 @@ stage_eval() {
         --max_workers "$MAX_WORKERS" \
         --max_build_workers "$MAX_WORKERS" \
         --timeout "$TIMEOUT" \
-        --use_dockerhub_images false \
+        --use_ecr_images false \
         --run_perf true \
         --run_correctness true \
         --run_coverage false \
@@ -438,7 +442,7 @@ print(f'  → Created {len(instances)} predictions')
         --max_workers "$MAX_WORKERS" \
         --max_build_workers "$MAX_WORKERS" \
         --timeout "$TIMEOUT" \
-        --use_dockerhub_images false \
+        --use_ecr_images false \
         --run_perf true \
         --run_correctness true \
         --run_coverage false \

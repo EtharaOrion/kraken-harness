@@ -741,7 +741,7 @@ pydantic                # Data models (implicit via SDK)
 For AWS Bedrock with bearer token:
 ```json
 {
-  "model": "bedrock/arn:aws:bedrock:ap-south-1:426628337772:application-inference-profile/f0v1auqubh66",
+  "model": "bedrock/converse/global.anthropic.claude-opus-4-6-v1",
   "aws_region_name": "ap-south-1"
 }
 ```
@@ -750,7 +750,7 @@ Plus: `export AWS_BEARER_TOKEN_BEDROCK="your-token"`
 For IAM auth:
 ```json
 {
-  "model": "bedrock/arn:aws:bedrock:ap-south-1:426628337772:application-inference-profile/f0v1auqubh66",
+  "model": "bedrock/converse/global.anthropic.claude-opus-4-6-v1",
   "aws_access_key_id": "AKIA...",
   "aws_secret_access_key": "...",
   "aws_region_name": "ap-south-1"

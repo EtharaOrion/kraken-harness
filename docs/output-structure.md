@@ -185,7 +185,7 @@ Run configuration metadata.
   "num_instances": 1,
   "instance_ids": ["psf__requests-7342"],
   "timestamp": "2026-04-23T09:29:21.733355+00:00",
-  "llm_model": "bedrock/converse/arn:aws:bedrock:us-east-1:..."
+  "llm_model": "bedrock/converse/global.anthropic.claude-opus-4-6-v1"
 }
 ```
 

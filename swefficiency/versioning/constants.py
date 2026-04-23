@@ -142,3 +142,9 @@ MAP_REPO_TO_VERSION_PATTERNS.update(
         ]
     }
 )
+
+# scikit-bio/scikit-bio
+MAP_REPO_TO_VERSION_PATHS.update({"scikit-bio/scikit-bio": ["skbio/__init__.py"]})
+MAP_REPO_TO_VERSION_PATTERNS.update(
+    {"scikit-bio/scikit-bio": [r'__version__ = [\'"](.*)[\'"]']}
+)

@@ -85,6 +85,7 @@ from swefficiency.harness.test_spec import (
     parse_perf_output,
 )
 from swefficiency.harness.utils import load_swefficiency_dataset, str2bool
+from swefficiency.harness.dynamic_specs import filter_buildable_instances
 
 
 class EvaluationError(Exception):
@@ -100,6 +101,25 @@ class EvaluationError(Exception):
             f"Evaluation error for {self.instance_id}: {self.super_str}\n"
             f"Check ({self.log_file}) for more information."
         )
+
+
+def ecr_login(region: str | None = None) -> bool:
+    """Authenticate Docker to ECR. Returns True on success."""
+    region = region or os.environ.get("AWS_DEFAULT_REGION", "ap-south-1")
+    registry = os.environ.get("ECR_REGISTRY", "")
+    if not registry:
+        print("ECR_REGISTRY not set, skipping ECR login")
+        return False
+    cmd = f"aws ecr get-login-password --region {region} | docker login --username AWS --password-stdin {registry}"
+    try:
+        result = subprocess.run(
+            cmd, shell=True, check=True, capture_output=True, text=True
+        )
+        print(f"ECR login successful for {registry}")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"ECR login failed: {e.stderr}")
+        return False
 
 
 def get_validation_report(
@@ -222,8 +242,8 @@ def run_instance(
     run_perf: bool = False,
     run_perf_profiling: bool = False,
     run_correctness: bool = False,
-    push_to_dockerhub: bool = False,
-    use_dockerhub_images: bool = False,
+    push_to_ecr: bool = False,
+    use_ecr_images: bool = False,
     use_podman: bool = False,  # Flip this to true if on SLURM or using podman without cgroups.
     force_rerun: bool = False,
     process_isolation: bool = True,
@@ -285,8 +305,12 @@ def run_instance(
     # dockerhub_image_key = (
     #     f"ghcr.io/swefficiency/swefficiency-images:{test_spec.instance_id}"
     # )
-    dockerhub_image_key = (
-        f"ghcr.io/swefficiency/swefficiency-images:{test_spec.instance_id}"
+    ecr_registry = os.environ.get("ECR_REGISTRY", "")
+    ecr_repo = os.environ.get("ECR_REPO", "")
+    ecr_image_key = (
+        f"{ecr_registry}/{ecr_repo}:{test_spec.instance_id}"
+        if ecr_registry and ecr_repo
+        else ""
     )
 
     additional_exec_args = {}
@@ -299,28 +323,30 @@ def run_instance(
         logger.info(f"Test spec version: {test_spec.version}")
 
         # Build + start instance container (instance image should already be built)
-        if use_dockerhub_images:
-            logger.info(f"Using DockerHub image: {dockerhub_image_key}")
+        if use_ecr_images:
+            logger.info(f"Using ECR image: {ecr_image_key}")
 
             try:
-                client.images.get(dockerhub_image_key)
-                logger.info(f"Image {dockerhub_image_key} already available locally, skipping pull")
+                client.images.get(ecr_image_key)
+                logger.info(
+                    f"Image {ecr_image_key} already available locally, skipping pull"
+                )
             except Exception:
                 while True:
                     try:
                         if use_podman:
                             subprocess.run(
-                                f"podman pull {dockerhub_image_key}", shell=True, check=True
+                                f"podman pull {ecr_image_key}", shell=True, check=True
                             )
                         else:
-                            client.images.pull(dockerhub_image_key)
+                            client.images.pull(ecr_image_key)
                         break
                     except Exception as e:
                         time.sleep(5)
 
             # Create container from image
             container = create_container_from_image(
-                dockerhub_image_key,
+                ecr_image_key,
                 test_spec,
                 run_id,
                 client,
@@ -841,7 +867,12 @@ def run_instance(
 
                 if not perf_patch_applied:
                     # Check if the patch has been applied, if not, apply it now.
-                    try_to_apply_patch(container, instance_id, logger, base_commit=test_spec.base_commit)  # type: ignore
+                    try_to_apply_patch(
+                        container,
+                        instance_id,
+                        logger,
+                        base_commit=test_spec.base_commit,
+                    )  # type: ignore
 
                 paths = correctness_tests
                 base = test_spec.base_commit
@@ -1022,29 +1053,26 @@ def run_instance(
         logger.error(error_msg)
         print(error_msg)
     finally:
-        if push_to_dockerhub and not use_dockerhub_images:
-            logger.info(
-                f"Pushing image {test_spec.instance_image_key} to DockerHub since we rebuilt and marked it..."
-            )
-
-            # Run subprocess to push the image to DockerHub.
+        if push_to_ecr and not use_ecr_images:
+            logger.info(f"Pushing image {test_spec.instance_image_key} to ECR...")
             base_docker_image = test_spec.instance_image_key
-            base_dockerhub_image = f"ghcr.io/{dockerhub_image_key}"
+            ecr_target = ecr_image_key
 
-            base_command = f"docker tag {base_docker_image} {base_dockerhub_image} && docker push {base_dockerhub_image}"
+            base_command = f"docker tag {base_docker_image} {ecr_target} && docker push {ecr_target}"
             try:
                 subprocess.run(base_command, shell=True, check=True)
-                logger.info(f"Successfully pushed {base_dockerhub_image} to DockerHub.")
+                logger.info(f"Successfully pushed {ecr_target} to ECR.")
+                instance_report["ecr_image"] = ecr_target
             except subprocess.CalledProcessError as e:
-                logger.error(f"Failed to push {base_dockerhub_image} to DockerHub: {e}")
-                print(f"Failed to push {base_dockerhub_image} to DockerHub: {e}")
+                logger.error(f"Failed to push {ecr_target} to ECR: {e}")
+                print(f"Failed to push {ecr_target} to ECR: {e}")
 
         # Remove instance container + image, close logger
         cleanup_container(client, container, logger)
         if rm_image:
             image_key = test_spec.instance_image_key
-            if use_dockerhub_images:
-                image_key = dockerhub_image_key
+            if use_ecr_images:
+                image_key = ecr_image_key
 
             remove_image(client, image_key, logger)
         close_logger(logger)
@@ -1064,8 +1092,8 @@ def run_instances(
     run_perf=False,
     run_perf_profiling=False,
     run_correctness=False,
-    push_to_dockerhub=False,
-    use_dockerhub_images=False,
+    push_to_ecr=False,
+    use_ecr_images=False,
     one_per_version_debug=False,
     use_podman=False,  # Set to True if running on SLURM or using podman without cgroups.
     force_rerun=True,
@@ -1136,11 +1164,18 @@ def run_instances(
             reserve_cores=4,
         )
     except (FileNotFoundError, RuntimeError, OSError):
-        print("WARNING: NUMA-aware CPU pinning unavailable (non-Linux or insufficient cores). Using simple CPU division.")
+        print(
+            "WARNING: NUMA-aware CPU pinning unavailable (non-Linux or insufficient cores). Using simple CPU division."
+        )
         from swefficiency.harness.cpu_assignment import divide_cpus_among_workers
+
         simple_groups = divide_cpus_among_workers(max_workers, cpus_per_worker=4)
         global_cpu_groups = [
-            {"cpuset_cpus": ",".join(map(str, g)), "cpuset_mems": "0", "nano_cpus": int(1e9 * len(g))}
+            {
+                "cpuset_cpus": ",".join(map(str, g)),
+                "cpuset_mems": "0",
+                "nano_cpus": int(1e9 * len(g)),
+            }
             for g in simple_groups
         ]
 
@@ -1170,8 +1205,8 @@ def run_instances(
                     run_perf,
                     run_perf_profiling,
                     run_correctness,
-                    push_to_dockerhub,
-                    use_dockerhub_images,
+                    push_to_ecr,
+                    use_ecr_images,
                     use_podman,
                     force_rerun,
                     process_isolation,
@@ -1206,6 +1241,8 @@ def run_instances(
     with open(report_path, "w") as f:
         json.dump(per_instance_results, f, indent=4)
     print(f"Results saved to {report_path}")
+
+    return per_instance_results
 
 
 def get_dataset_from_preds(
@@ -1430,8 +1467,8 @@ def main(
     empty_patch: bool,
     model_predictions: str,
     gdrive_annotation_sheet: str,
-    push_to_dockerhub: bool,
-    use_dockerhub_images: bool,
+    push_to_ecr: bool,
+    use_ecr_images: bool,
     use_podman: bool,
     workload_predictions: str,
     force_rerun: bool,
@@ -1623,6 +1660,15 @@ def main(
         predictions = filtered_predictions
         print(f"Filtered dataset to {len(dataset)} instances with predictions.")
 
+    # Pre-filter: remove instances that will 100% fail spec/Docker creation
+    dataset, skipped = filter_buildable_instances(dataset)
+    if skipped:
+        print(f"Pre-filter removed {len(skipped)} unbuildable instances:")
+        for iid, reason in skipped[:10]:
+            print(f"  {iid}: {reason}")
+        if len(skipped) > 10:
+            print(f"  ... and {len(skipped) - 10} more")
+
     # Sort dataset by instance ID for reproducibility.
     dataset.sort(key=lambda x: x[KEY_INSTANCE_ID])
     random.seed(42)
@@ -1631,11 +1677,15 @@ def main(
     existing_images = list_images(client)
     delete_instance_container(client, dataset)
     print(f"Running {len(dataset)} unevaluated instances...")
+    per_instance_results = {}
     if not dataset:
         print("No instances to run.")
-    elif use_dockerhub_images:
-        # run instances using dockerhub images
-        run_instances(
+    elif use_ecr_images:
+        # ECR login if pulling
+        if not ecr_login():
+            raise RuntimeError("ECR login failed — cannot pull images")
+        # run instances using ECR images
+        per_instance_results = run_instances(
             predictions,
             dataset,
             cache_level,
@@ -1648,16 +1698,20 @@ def main(
             run_perf,
             run_perf_profiling,
             run_correctness,
-            use_dockerhub_images=use_dockerhub_images,
+            use_ecr_images=use_ecr_images,
             use_podman=use_podman,
             force_rerun=force_rerun,
             process_isolation=process_isolation,
         )
     else:
+        # ECR login if pushing
+        if push_to_ecr:
+            if not ecr_login():
+                raise RuntimeError("ECR login failed — cannot push images")
         # build environment images + run instances
         build_env_images(client, dataset, force_rebuild, max_build_workers)
         # this time w/ golden predictions (patch)
-        run_instances(
+        per_instance_results = run_instances(
             predictions,
             dataset,
             cache_level,
@@ -1670,11 +1724,22 @@ def main(
             run_perf,
             run_perf_profiling,
             run_correctness,
-            push_to_dockerhub=push_to_dockerhub,
+            push_to_ecr=push_to_ecr,
             use_podman=use_podman,
             force_rerun=force_rerun,
             process_isolation=process_isolation,
         )
+
+    # Write ECR image mapping to JSONL
+    if push_to_ecr and dataset and not use_ecr_images:
+        image_mapping_path = RUN_EVALUATION_LOG_DIR / run_id / "ecr_images.jsonl"
+        image_mapping_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(image_mapping_path, "w") as f:
+            for iid, report in per_instance_results.items():
+                ecr_img = report.get("ecr_image")
+                if ecr_img:
+                    f.write(json.dumps({"instance_id": iid, "image": ecr_img}) + "\n")
+        print(f"ECR image mapping written to {image_mapping_path}")
 
     # this will remove the container in the gloden run
     delete_instance_container(client, dataset)
@@ -1756,16 +1821,16 @@ if __name__ == "__main__":
         help="Google Drive annotation sheet.",
     )
     parser.add_argument(
-        "--push_to_dockerhub",
+        "--push_to_ecr",
         type=str2bool,
         default=False,
-        help="Push images to DockerHub.",
+        help="Push images to ECR after building.",
     )
     parser.add_argument(
-        "--use_dockerhub_images",
+        "--use_ecr_images",
         type=str2bool,
         default=False,
-        help="Use DockerHub images instead of building them.",
+        help="Pull and use ECR images instead of building locally.",
     )
     parser.add_argument(
         "--use_podman",

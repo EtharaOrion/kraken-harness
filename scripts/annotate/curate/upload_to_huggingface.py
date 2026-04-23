@@ -120,7 +120,11 @@ def get_sweperf_data(annotate_spreadsheet_name="global_sweperf_all_data_annotate
         version = instance_row.get("version", None)
         repo = instance_row["repo"]
 
-        specs = MAP_REPO_VERSION_TO_SPECS[repo][version]
+        repo_specs = MAP_REPO_VERSION_TO_SPECS.get(repo, {})
+        specs = repo_specs.get(version)
+        if specs is None:
+            print(f"WARNING: No specs for {repo}@{version}, skipping {instance_id}")
+            continue
         test_cmd = specs["test_cmd"]
         rebuild_cmd = specs["install"]
 

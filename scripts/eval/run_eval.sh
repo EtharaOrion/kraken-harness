@@ -39,5 +39,5 @@ python swefficiency/harness/run_validation.py \
     --timeout 7_200 \
     --run_perf true \
     --run_correctness true \
-    --use_dockerhub_images true \
+    --use_ecr_images true \
     $ADDITIONAL_ARGS
