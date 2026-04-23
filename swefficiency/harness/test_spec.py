@@ -1203,6 +1203,16 @@ def get_correctness_script_list(
         instance, without_directives=True, prefer_distributed=False
     )
 
+    # The log parser (parse_log_pytest_options) expects lines starting with
+    # PASSED/FAILED/SKIPPED/ERROR, which requires the -rA flag. Auto-inject
+    # the flags used by TEST_PYTEST when the test_cmd looks like a bare pytest
+    # invocation from a dynamic spec.
+    _REQUIRED_CORRECTNESS_FLAGS = "--no-header -rA --tb=no -p no:cacheprovider --continue-on-collection-errors"
+    if test_command.strip().startswith("pytest") and "-rA" not in test_command:
+        parts = test_command.strip().split(None, 1)
+        rest = parts[1] if len(parts) > 1 else ""
+        test_command = f"pytest {_REQUIRED_CORRECTNESS_FLAGS} {rest}".strip()
+
     test_directive_symbol = "$line"
     if instance["repo"] == "django/django":
         # Django requires as modeule.

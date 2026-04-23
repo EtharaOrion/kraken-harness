@@ -76,6 +76,8 @@ def evaluate_instance(
     """
     instance_id = instance["instance_id"]
     pass_to_pass = instance["PASS_TO_PASS"]
+    if isinstance(pass_to_pass, str):
+        pass_to_pass = json.loads(pass_to_pass)
 
     gold_run_entry = gold_run / instance_id / "perf_summary.txt"
     pred_run_entry = pred_run / instance_id / "perf_summary.txt"

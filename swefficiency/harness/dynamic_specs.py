@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_DYNAMIC_SPECS_CACHE: dict[tuple[str, str], dict] = {}
+_DYNAMIC_SPECS_CACHE: dict[tuple[str, str, str], dict] = {}
 _CACHE_LOCK = threading.Lock()
 
 
@@ -38,7 +38,10 @@ def get_or_create_specs(
         if version in repo_specs:
             return repo_specs[version]
 
-    cache_key = (repo, version)
+    # Use instance_id in cache key: instances sharing the same (repo, version)
+    # may have different install_cmd / test_cmd_override fields.
+    instance_id = instance.get("instance_id", "")
+    cache_key = (repo, version, instance_id)
     with _CACHE_LOCK:
         if cache_key in _DYNAMIC_SPECS_CACHE:
             return _DYNAMIC_SPECS_CACHE[cache_key]

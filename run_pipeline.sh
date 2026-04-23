@@ -372,9 +372,9 @@ stage_eval() {
         --timeout "$TIMEOUT" \
         --use_dockerhub_images false \
         --run_perf true \
-        --run_correctness false \
+        --run_correctness true \
         --run_coverage false \
-        --process_isolation false \
+        --process_isolation true \
         --force_rerun true
 
     GOLD_DIR="$EVAL_DIR/gold"
@@ -440,9 +440,9 @@ print(f'  → Created {len(instances)} predictions')
         --timeout "$TIMEOUT" \
         --use_dockerhub_images false \
         --run_perf true \
-        --run_correctness false \
+        --run_correctness true \
         --run_coverage false \
-        --process_isolation false \
+        --process_isolation true \
         --force_rerun true \
         --model_predictions "$pred_file"
 

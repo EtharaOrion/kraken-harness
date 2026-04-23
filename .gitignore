@@ -173,7 +173,8 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
-artifacts/
+artifacts/*
+!artifacts/final/
 logs/
 data/
 logs_no_test_patch/
