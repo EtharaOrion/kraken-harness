@@ -1,0 +1,602 @@
+- generic [active] [ref=e1]:
+  - generic:
+    - generic:
+      - link "Skip to main content" [ref=e2] [cursor=pointer]
+      - link "Accessibility help" [ref=e3] [cursor=pointer]:
+        - /url: https://support.google.com/websearch/answer/181196?hl=en-IN
+      - link "Accessibility feedback" [ref=e4] [cursor=pointer]
+  - generic [ref=e9]:
+    - search [ref=e10]:
+      - generic [ref=e12]:
+        - link "Go to Google Home" [ref=e14] [cursor=pointer]:
+          - /url: https://www.google.com/webhp?hl=en&sa=X&ved=0ahUKEwiJzPPFrYaUAxVOpZUCHbltIoUQPAgJ
+          - img [ref=e15]
+        - generic [ref=e22]:
+          - generic [ref=e23]:
+            - combobox "Search" [ref=e26]: krishna krishna
+            - generic [ref=e27]:
+              - button "Clear" [ref=e29] [cursor=pointer]:
+                - img [ref=e31]
+              - generic [ref=e34]:
+                - button "Search by voice" [ref=e35] [cursor=pointer]:
+                  - img [ref=e36]
+                - button "Search by image" [ref=e38] [cursor=pointer]:
+                  - img [ref=e39]
+          - button "Search" [ref=e41] [cursor=pointer]:
+            - img [ref=e44]
+    - generic [ref=e46]:
+      - button "Settings" [ref=e48] [cursor=pointer]:
+        - img [ref=e51]
+      - generic [ref=e54]:
+        - button "Google apps" [ref=e56] [cursor=pointer]:
+          - img [ref=e57]
+        - link "Sign in" [ref=e61] [cursor=pointer]:
+          - /url: https://accounts.google.com/ServiceLogin?hl=en&passive=true&continue=https://www.google.com/search%3Fq%3Dkrishna%26sei%3DNlDraZTSAdbL1sQPndCBoAo&ec=futura_srp_og_si_72236_p
+  - generic [ref=e63]:
+    - navigation [ref=e69]:
+      - generic [ref=e75]:
+        - list [ref=e76]:
+          - listitem [ref=e77]:
+            - link "AI Mode" [ref=e80] [cursor=pointer]:
+              - /url: /search?q=krishna&sca_esv=9bb8411b62548352&udm=50&fbs=ADc_l-aN0CWEZBOHjofHoaMMDiKpaEWjvZ2Py1XXV8d8KvlI3vWUtYx0DZdicpfE1faGYemg2KC4yuMPyQlIvlWqq2At2yMvCZgi_bwXXU0sv2NZz-tCgYlxSPaGehZCZpfMnU52f07FivVkoVuKjAiOZnoDH7-b3NEYW84RQeTfiKGGvc17h44AF_q_EO92No7l3ErSHvOFsqp8n9L5WaetBdzgacck2g&aep=1&ntc=1&sa=X&ved=2ahUKEwiJzPPFrYaUAxVOpZUCHbltIoUQ2J8OegQIExAI
+              - generic [ref=e83]: AI Mode
+          - listitem [ref=e84]:
+            - link "All" [disabled] [ref=e85]:
+              - generic [ref=e87]: All
+          - listitem [ref=e88]:
+            - link "Images" [ref=e89] [cursor=pointer]:
+              - /url: /search?sca_esv=9bb8411b62548352&udm=2&fbs=ADc_l-aN0CWEZBOHjofHoaMMDiKpaEWjvZ2Py1XXV8d8KvlI3vWUtYx0DZdicpfE1faGYemg2KC4yuMPyQlIvlWqq2At2yMvCZgi_bwXXU0sv2NZz-tCgYlxSPaGehZCZpfMnU52f07FivVkoVuKjAiOZnoDH7-b3NEYW84RQeTfiKGGvc17h44AF_q_EO92No7l3ErSHvOFsqp8n9L5WaetBdzgacck2g&q=krishna&sa=X&ved=2ahUKEwiJzPPFrYaUAxVOpZUCHbltIoUQtKgLegQIFBAB
+              - generic [ref=e91]: Images
+          - listitem [ref=e92]:
+            - link "Videos" [ref=e93] [cursor=pointer]:
+              - /url: /search?sca_esv=9bb8411b62548352&udm=7&fbs=ADc_l-aN0CWEZBOHjofHoaMMDiKpaEWjvZ2Py1XXV8d8KvlI3vWUtYx0DZdicpfE1faGYemg2KC4yuMPyQlIvlWqq2At2yMvCZgi_bwXXU0sv2NZz-tCgYlxSPaGehZCZpfMnU52f07FivVkoVuKjAiOZnoDH7-b3NEYW84RQeTfiKGGvc17h44AF_q_EO92No7l3ErSHvOFsqp8n9L5WaetBdzgacck2g&q=krishna&sa=X&ved=2ahUKEwiJzPPFrYaUAxVOpZUCHbltIoUQtKgLegQIGRAB
+              - generic [ref=e95]: Videos
+          - listitem [ref=e96]:
+            - link "Short videos" [ref=e97] [cursor=pointer]:
+              - /url: /search?sca_esv=9bb8411b62548352&udm=39&fbs=ADc_l-aN0CWEZBOHjofHoaMMDiKpaEWjvZ2Py1XXV8d8KvlI3vWUtYx0DZdicpfE1faGYemg2KC4yuMPyQlIvlWqq2At2yMvCZgi_bwXXU0sv2NZz-tCgYlxSPaGehZCZpfMnU52f07FivVkoVuKjAiOZnoDH7-b3NEYW84RQeTfiKGGvc17h44AF_q_EO92No7l3ErSHvOFsqp8n9L5WaetBdzgacck2g&q=krishna&sa=X&ved=2ahUKEwiJzPPFrYaUAxVOpZUCHbltIoUQs6gLegQIFxAB
+              - generic [ref=e99]: Short videos
+          - listitem [ref=e100]:
+            - link "Shopping" [ref=e101] [cursor=pointer]:
+              - /url: /search?sca_esv=9bb8411b62548352&udm=28&fbs=ADc_l-aN0CWEZBOHjofHoaMMDiKpaEWjvZ2Py1XXV8d8KvlI3vWUtYx0DZdicpfE1faGYemg2KC4yuMPyQlIvlWqq2At2yMvCZgi_bwXXU0sv2NZz-tCgYlxSPaGehZCZpfMnU52f07FivVkoVuKjAiOZnoDH7-b3NEYW84RQeTfiKGGvc17h44AF_q_EO92No7l3ErSHvOFsqp8n9L5WaetBdzgacck2g&q=krishna&ved=1t:220175&ictx=111
+              - generic [ref=e103]: Shopping
+          - listitem [ref=e104]:
+            - link "News" [ref=e105] [cursor=pointer]:
+              - /url: /search?sca_esv=9bb8411b62548352&q=krishna&tbm=nws&source=lnms&fbs=ADc_l-aN0CWEZBOHjofHoaMMDiKpaEWjvZ2Py1XXV8d8KvlI3vWUtYx0DZdicpfE1faGYemg2KC4yuMPyQlIvlWqq2At2yMvCZgi_bwXXU0sv2NZz-tCgYlxSPaGehZCZpfMnU52f07FivVkoVuKjAiOZnoDH7-b3NEYW84RQeTfiKGGvc17h44AF_q_EO92No7l3ErSHvOFsqp8n9L5WaetBdzgacck2g&sa=X&ved=2ahUKEwiJzPPFrYaUAxVOpZUCHbltIoUQ0pQJegQIGBAB
+              - generic [ref=e107]: News
+          - listitem [ref=e108]:
+            - button "More filters" [ref=e109] [cursor=pointer]:
+              - generic "More filters" [ref=e110]:
+                - generic [ref=e111]:
+                  - generic [ref=e112]: More
+                  - img [ref=e114]
+        - button "Tools" [ref=e117] [cursor=pointer]:
+          - generic [ref=e119]:
+            - generic [ref=e120]: Tools
+            - img [ref=e122]
+    - heading "Search Results" [level=1] [ref=e125]
+    - generic [ref=e130]:
+      - generic [ref=e147]:
+        - generic [ref=e150]:
+          - generic [ref=e152]:
+            - generic [ref=e153]:
+              - img [ref=e154]
+              - heading "AI Overview" [level=2] [ref=e156]
+            - generic [ref=e158]:
+              - button "Change language to Hindi" [ref=e159] [cursor=pointer]:
+                - generic [ref=e161]: हिन्दी
+              - button "Listen" [ref=e163]:
+                - img [ref=e168] [cursor=pointer]
+            - button "About this result" [ref=e173]:
+              - img [ref=e175]
+          - generic [ref=e196]:
+            - generic [ref=e198]:
+              - generic [ref=e199]:
+                - button "The purity of of little lord Krishna 5180 – Ninass Arts" [ref=e202]:
+                  - img "The purity of of little lord Krishna 5180 – Ninass Arts" [ref=e203]
+                - text: Krishna is
+                - mark [ref=e204]: a major deity in Hinduism, worshipped as the eighth avatar of Vishnu and the Supreme God of compassion, tenderness, and love
+                - text: . Born in a prison in Mathura to Devaki and Vasudeva, he was raised in Vrindavan, becoming a central figure in the Mahabharata as a guide, strategist, and teacher of the Bhagavad Gita.
+                - button "Wikipedia (+4) – View related links" [ref=e207] [cursor=pointer]:
+                  - generic [ref=e208]:
+                    - img "Wikipedia" [ref=e209]
+                    - generic [ref=e210]:
+                      - generic [ref=e211]: Wikipedia
+                      - generic [ref=e212]: "+4"
+              - strong [ref=e214]: "Key Aspects of Krishna:"
+              - list [ref=e215]:
+                - listitem [ref=e216]:
+                  - generic [ref=e217]:
+                    - strong [ref=e218]: "Life and Legends:"
+                    - text: Known for his childhood as "Makhan Chor" (butter thief), his role as a flute player, and the protector of righteousness, establishing Dwarka.
+                - listitem [ref=e219]:
+                  - generic [ref=e220]:
+                    - strong [ref=e221]: "Divine Role:"
+                    - text: Regarded as a complete incarnation of God, he is a multifaceted figure—a teacher, yogi, warrior, and statesman .
+                - generic [ref=e222]:
+                  - listitem [ref=e223]:
+                    - generic [ref=e224]:
+                      - strong [ref=e225]: "Worship:"
+                      - text: His birth is celebrated annually during
+                      - link [ref=e227] [cursor=pointer]:
+                        - /url: https://www.google.com/search?q=Krishna+Janmashtami&sei=NlDraZTSAdbL1sQPndCBoAo&ved=2ahUKEwiJzPPFrYaUAxVOpZUCHbltIoUQgK4QegYIAQgBEAE
+                        - text: Krishna Janmashtami
+                      - text: ", typically in August or September."
+                  - listitem [ref=e228]:
+                    - generic [ref=e229]:
+                      - strong [ref=e230]: "Key Teachings:"
+                      - text: He delivered the Bhagavad Gita to Arjuna on the battlefield of Kurukshetra, guiding him on duty (dharma), devotion, and righteous action.
+                  - listitem [ref=e231]:
+                    - generic [ref=e232]:
+                      - strong [ref=e233]: "Relationship with Radha:"
+                      - text: His relationship with Radha signifies the highest form of love and devotion, representing the divine union.
+                    - button [ref=e236] [cursor=pointer]:
+                      - generic [ref=e237]:
+                        - img [ref=e238]
+                        - generic [ref=e239]:
+                          - generic [ref=e240]: Wikipedia
+                          - generic [ref=e241]: "+4"
+              - generic [ref=e243]:
+                - text: Krishna is often depicted as a young boy playing the flute (
+                - link [ref=e245] [cursor=pointer]:
+                  - /url: https://www.google.com/search?q=Gopala&sei=NlDraZTSAdbL1sQPndCBoAo&ved=2ahUKEwiJzPPFrYaUAxVOpZUCHbltIoUQgK4QegYIAQgCEAE
+                  - text: Gopala
+                - text: ) or as a young man with his consort Radha. His life, as described in the Bhagavad Gita and other scriptures, holds profound spiritual, philosophical, and cultural significance for millions.
+                - button [ref=e248] [cursor=pointer]:
+                  - generic [ref=e249]:
+                    - img [ref=e250]
+                    - generic [ref=e251]:
+                      - generic [ref=e252]: Wikipedia
+                      - generic [ref=e253]: "+3"
+            - generic [ref=e260]:
+              - list [ref=e262]:
+                - listitem [ref=e263]:
+                  - generic [ref=e264]:
+                    - link "Krishna - Wikipedia. Opens in new tab." [ref=e265] [cursor=pointer]:
+                      - /url: https://en.wikipedia.org/wiki/Krishna
+                    - generic [ref=e266]:
+                      - generic [ref=e268]:
+                        - generic [ref=e269]: Krishna - Wikipedia
+                        - generic [ref=e270]: "Krishna (/ˈkrɪʃnə/; Sanskrit: कृष्ण, IAST: Kṛṣṇa Sanskrit: [ˈkr̩ʂɳɐ]) is a major deity in Hinduism. He is worshipped as the eighth..."
+                      - generic [ref=e272]:
+                        - generic [ref=e277]: Wikipedia
+                        - button "About this result" [ref=e279] [cursor=pointer]:
+                          - img [ref=e280]
+                - listitem [ref=e283]:
+                  - generic [ref=e284]:
+                    - link "Krishna's Special Story - His Birth, Struggle, Wars, Love, Death .... Opens in new tab." [ref=e285] [cursor=pointer]:
+                      - /url: https://www.youtube.com/watch?v=HEAZF_aUkRU&t=13
+                    - generic [ref=e286]:
+                      - generic [ref=e287]:
+                        - generic [ref=e288]:
+                          - generic [ref=e289]: Krishna's Special Story - His Birth, Struggle, Wars, Love, Death ...
+                          - generic [ref=e290]: Krishna is portrayed as an expert strategist who uses the Pandavas and the Kauravas as a means to cleanse the earth of unrighteous...
+                        - button "undefined" [ref=e293] [cursor=pointer]:
+                          - generic [ref=e295]:
+                            - img [ref=e296]
+                            - generic [ref=e298]: 1m
+                          - img [ref=e303]
+                      - generic [ref=e305]:
+                        - generic [ref=e309]:
+                          - generic [ref=e310]: YouTube
+                          - generic [ref=e311]: ·
+                          - generic [ref=e312]: BeerBiceps
+                        - button [ref=e314] [cursor=pointer]:
+                          - img [ref=e315]
+                - listitem [ref=e318]:
+                  - generic [ref=e319]:
+                    - link [ref=e320] [cursor=pointer]:
+                      - /url: https://www.youtube.com/watch?v=LiG1DcqYjXU&t=1
+                    - generic [ref=e321]:
+                      - generic [ref=e322]:
+                        - generic [ref=e323]:
+                          - generic [ref=e324]: "Krishna: A Complete Incarnation of the Divine – Sadhguru"
+                          - generic [ref=e325]: Krishna is regarded as a complete "avatara" or incarnation of God. The consciousness referred to as Krishna embodies a complete di...
+                        - button [ref=e328] [cursor=pointer]:
+                          - generic [ref=e330]:
+                            - img [ref=e331]
+                            - generic [ref=e333]: 6m
+                          - img [ref=e338]
+                      - generic [ref=e340]:
+                        - generic [ref=e344]:
+                          - generic [ref=e345]: YouTube
+                          - generic [ref=e346]: ·
+                          - generic [ref=e347]: Sadhguru
+                        - button [ref=e349] [cursor=pointer]:
+                          - img [ref=e350]
+              - button [ref=e354] [cursor=pointer]:
+                - generic [ref=e355]: Show all
+        - button "Show more AI Overview" [ref=e359]:
+          - generic [ref=e361] [cursor=pointer]:
+            - generic [ref=e362]: Show more
+            - img [ref=e364]
+      - main [ref=e367]:
+        - generic [ref=e372]:
+          - generic [ref=e375]:
+            - heading "Web results" [level=2] [ref=e376]
+            - generic [ref=e377]:
+              - generic [ref=e380]:
+                - link "Krishna Wikipedia https://en.wikipedia.org › wiki › Krishna" [ref=e382] [cursor=pointer]:
+                  - /url: https://en.wikipedia.org/wiki/Krishna
+                  - heading "Krishna" [level=3] [ref=e383]
+                  - generic [ref=e388]:
+                    - generic [ref=e390]: Wikipedia
+                    - generic [ref=e392]: https://en.wikipedia.org › wiki › Krishna
+                - button "About this result" [ref=e393] [cursor=pointer]:
+                  - img [ref=e396]
+              - generic [ref=e399]:
+                - generic [ref=e400]:
+                  - emphasis [ref=e401]: a major deity in Hinduism
+                  - text: . He is worshipped as the eighth avatar of Vishnu and also as the Supreme God in his own right.
+                - link "Read more" [ref=e402] [cursor=pointer]:
+                  - /url: https://en.wikipedia.org/wiki/Krishna#:~:text=a%20major%20deity%20in%20Hinduism.,God%20in%20his%20own%20right.
+          - generic [ref=e406]:
+            - heading "Images" [level=2] [ref=e410]
+            - generic [ref=e414]:
+              - generic [ref=e418] [cursor=pointer]:
+                - link "Radha Krishna - Wikipedia Wikipedia":
+                  - /url: https://en.wikipedia.org/wiki/Radha_Krishna
+                - button "Radha Krishna - Wikipedia" [ref=e420]:
+                  - img "Radha Krishna - Wikipedia" [ref=e422]
+                - generic [ref=e424]:
+                  - generic [ref=e426]: Radha Krishna - Wikipedia
+                  - generic [ref=e427]:
+                    - generic [ref=e434]: Wikipedia
+                    - button "About this result" [ref=e437]:
+                      - img [ref=e440]
+              - generic [ref=e445] [cursor=pointer]:
+                - link "The purity of of little lord Krishna 5180 Ninass Arts":
+                  - /url: https://www.ninassarts.com/product/the-purity-of-of-little-lord-krishna-5180/
+                - button "The purity of of little lord Krishna 5180" [ref=e447]:
+                  - img "The purity of of little lord Krishna 5180" [ref=e449]
+                - generic [ref=e451]:
+                  - generic [ref=e453]: The purity of of little lord Krishna 5180
+                  - generic [ref=e454]:
+                    - generic [ref=e461]: Ninass Arts
+                    - button "About this result" [ref=e464]:
+                      - img [ref=e467]
+              - generic [ref=e472] [cursor=pointer]:
+                - link "Divine Qualities of Krishna's birth Hare Krishna Mandir":
+                  - /url: https://harekrishnamandir.org/blog/post/superhuman-qualities-of-birth-of-krishna
+                - button "Divine Qualities of Krishna's birth" [ref=e474]:
+                  - img "Divine Qualities of Krishna's birth" [ref=e476]
+                - generic [ref=e478]:
+                  - generic [ref=e480]: Divine Qualities of Krishna's birth
+                  - generic [ref=e481]:
+                    - generic [ref=e488]: Hare Krishna Mandir
+                    - button "About this result" [ref=e491]:
+                      - img [ref=e494]
+            - button "Show more images" [ref=e497] [cursor=pointer]:
+              - separator [ref=e498]
+              - generic [ref=e499]:
+                - generic [ref=e500]: Show more images
+                - img [ref=e502]
+          - generic [ref=e507]:
+            - generic [ref=e509]:
+              - heading "Videos" [level=2] [ref=e510]
+              - button "About this result" [ref=e511] [cursor=pointer]:
+                - img [ref=e514]
+            - generic [ref=e517]:
+              - generic [ref=e524]:
+                - generic [ref=e525]:
+                  - link "Little Krishna Full Episodes in 4K | कंस वध से पहले की सभी बाल ... YouTube Big Animation 13 Nov 2025" [ref=e527] [cursor=pointer]:
+                    - /url: https://www.youtube.com/watch?v=-3L9wUnl1-A
+                    - heading "Little Krishna Full Episodes in 4K | कंस वध से पहले की सभी बाल ... YouTube Big Animation 13 Nov 2025" [level=3] [ref=e528]:
+                      - generic [ref=e531]: Little Krishna Full Episodes in 4K | कंस वध से पहले की सभी बाल ...
+                      - generic [ref=e533]:
+                        - generic [ref=e534]:
+                          - text: YouTube
+                          - generic [ref=e535]: · Big Animation
+                        - generic [ref=e536]: 13 Nov 2025
+                  - generic:
+                    - generic:
+                      - generic:
+                        - generic:
+                          - generic:
+                            - text: YouTube
+                            - generic: · Big Animation
+                      - button "About this result" [ref=e537] [cursor=pointer]:
+                        - img [ref=e540]
+                - button "Little Krishna Full Episodes in 4K | कंस वध से पहले की सभी बाल ... by Big Animation on YouTube. Play on Google. 4:35:23" [ref=e542] [cursor=pointer]:
+                  - generic [ref=e543]:
+                    - img [ref=e549]
+                    - generic [ref=e552]:
+                      - generic [ref=e553]: 4:35:23
+                      - img [ref=e556]
+              - generic [ref=e564]:
+                - generic [ref=e565]:
+                  - link "Lord Krishna Reveals His DIVINE Vishwaroop Avatar To Arjun ... YouTube Netflix India 13 Oct 2025" [ref=e567] [cursor=pointer]:
+                    - /url: https://www.youtube.com/watch?v=sHQg0Y-Grrk
+                    - heading "Lord Krishna Reveals His DIVINE Vishwaroop Avatar To Arjun ... YouTube Netflix India 13 Oct 2025" [level=3] [ref=e568]:
+                      - generic [ref=e571]: Lord Krishna Reveals His DIVINE Vishwaroop Avatar To Arjun ...
+                      - generic [ref=e573]:
+                        - generic [ref=e574]:
+                          - text: YouTube
+                          - generic [ref=e575]: · Netflix India
+                        - generic [ref=e576]: 13 Oct 2025
+                  - generic:
+                    - generic:
+                      - generic:
+                        - generic:
+                          - generic:
+                            - text: YouTube
+                            - generic: · Netflix India
+                      - button "About this result" [ref=e577] [cursor=pointer]:
+                        - img [ref=e580]
+                - button "Lord Krishna Reveals His DIVINE Vishwaroop Avatar To Arjun ... by Netflix India on YouTube. Play on Google. 5:30" [ref=e582] [cursor=pointer]:
+                  - generic [ref=e583]:
+                    - img [ref=e589]
+                    - generic [ref=e592]:
+                      - generic [ref=e593]: 5:30
+                      - img [ref=e596]
+              - generic [ref=e604]:
+                - generic [ref=e605]:
+                  - link "Little Krishna | Krishna Ka Zehrila Challenge!| Cartoon for Kids ... YouTube Pogo 28 Oct 2024" [ref=e607] [cursor=pointer]:
+                    - /url: https://www.youtube.com/watch?v=dMhqqR7K1OI
+                    - heading "Little Krishna | Krishna Ka Zehrila Challenge!| Cartoon for Kids ... YouTube Pogo 28 Oct 2024" [level=3] [ref=e608]:
+                      - generic [ref=e611]: Little Krishna | Krishna Ka Zehrila Challenge!| Cartoon for Kids ...
+                      - generic [ref=e613]:
+                        - generic [ref=e614]:
+                          - text: YouTube
+                          - generic [ref=e615]: · Pogo
+                        - generic [ref=e616]: 28 Oct 2024
+                  - generic:
+                    - generic:
+                      - generic:
+                        - generic:
+                          - generic:
+                            - text: YouTube
+                            - generic: · Pogo
+                      - button "About this result" [ref=e617] [cursor=pointer]:
+                        - img [ref=e620]
+                - button "Little Krishna | Krishna Ka Zehrila Challenge!| Cartoon for Kids ... by Pogo on YouTube. Play on Google. 22:11" [ref=e622] [cursor=pointer]:
+                  - generic [ref=e623]:
+                    - img [ref=e629]
+                    - generic [ref=e632]:
+                      - generic [ref=e633]: 22:11
+                      - img [ref=e636]
+            - link "View all videos" [ref=e640] [cursor=pointer]:
+              - /url: /search?sca_esv=9bb8411b62548352&udm=7&q=krishna&sa=X&ved=2ahUKEwiJzPPFrYaUAxVOpZUCHbltIoUQ8ccDKAJ6BAhFEAQ
+              - separator [ref=e641]
+              - generic [ref=e642]:
+                - generic [ref=e643]: View all
+                - img [ref=e645]
+          - generic [ref=e651]:
+            - heading "People also ask" [level=2] [ref=e653]
+            - generic [ref=e654]:
+              - button "Who was Vishnu avatar shown to Arjun?" [ref=e660] [cursor=pointer]:
+                - generic [ref=e662]: Who was Vishnu avatar shown to Arjun?
+                - img [ref=e665]
+              - button "Who did Radha love the most?" [ref=e674] [cursor=pointer]:
+                - generic [ref=e676]: Who did Radha love the most?
+                - img [ref=e679]
+              - button "What was Krishna's first name?" [ref=e688] [cursor=pointer]:
+                - generic [ref=e690]: What was Krishna's first name?
+                - img [ref=e693]
+              - button "Does Krishna accept LGBTQ?" [ref=e702] [cursor=pointer]:
+                - generic [ref=e704]: Does Krishna accept LGBTQ?
+                - img [ref=e707]
+          - generic [ref=e712]:
+            - heading "Web results" [level=2] [ref=e713]
+            - generic [ref=e714]:
+              - generic [ref=e717]:
+                - link "Krishna | Hinduism, Story, Meaning, Description, & Legends Britannica https://www.britannica.com › ... › Religious Beliefs" [ref=e719] [cursor=pointer]:
+                  - /url: https://www.britannica.com/topic/Krishna-Hindu-deity
+                  - heading "Krishna | Hinduism, Story, Meaning, Description, & Legends" [level=3] [ref=e720]
+                  - generic [ref=e725]:
+                    - generic [ref=e727]: Britannica
+                    - generic [ref=e729]: https://www.britannica.com › ... › Religious Beliefs
+                - button "About this result" [ref=e730] [cursor=pointer]:
+                  - img [ref=e733]
+              - generic [ref=e736]:
+                - generic [ref=e737]: 9 Apr 2026 —
+                - generic [ref=e738]:
+                  - text: Krishna,
+                  - emphasis [ref=e739]: one of the most widely revered and most popular of all Indian divinities
+                  - text: ", worshipped as the eighth incarnation (avatar, or avatara) of the Hindu god ..."
+                - link "Read more" [ref=e740] [cursor=pointer]:
+                  - /url: https://www.britannica.com/topic/Krishna-Hindu-deity#:~:text=Krishna%2C%20one%20of%20the%20most,god%20in%20his%20own%20right.
+          - generic [ref=e744]:
+            - generic [ref=e747]:
+              - link "Sri Krishna his life and teachings Online with Amma https://www.amritapuri.org › Other › Symbolism" [ref=e749] [cursor=pointer]:
+                - /url: https://www.amritapuri.org/3605/sri-krishna.aum
+                - heading "Sri Krishna his life and teachings" [level=3] [ref=e750]
+                - generic [ref=e755]:
+                  - generic [ref=e757]: Online with Amma
+                  - generic [ref=e759]: https://www.amritapuri.org › Other › Symbolism
+              - button "About this result" [ref=e760] [cursor=pointer]:
+                - img [ref=e763]
+            - generic [ref=e766]:
+              - generic [ref=e767]:
+                - text: In 3228 BCE in Mathura, India,
+                - emphasis [ref=e768]: a child was born who was destined to reshape the spiritual and temporal destiny of mankind
+                - text: —Sri Krishna. In his 125 years of ...
+              - link "Read more" [ref=e769] [cursor=pointer]:
+                - /url: https://www.amritapuri.org/3605/sri-krishna.aum#:~:text=In%203228%20BCE%20in%20Mathura%2C,In%20his%20125%20years%20of
+          - generic [ref=e773]:
+            - generic [ref=e776]:
+              - link "Krishna Das krishnadas.com https://krishnadas.com" [ref=e778] [cursor=pointer]:
+                - /url: https://krishnadas.com/
+                - heading "Krishna Das" [level=3] [ref=e779]
+                - generic [ref=e784]:
+                  - generic [ref=e786]: krishnadas.com
+                  - generic [ref=e788]: https://krishnadas.com
+              - button "About this result" [ref=e789] [cursor=pointer]:
+                - img [ref=e792]
+            - generic [ref=e796]:
+              - emphasis [ref=e797]: Krishna Das
+              - text: shares his kirtan practice and wonderful stories of his life on the Path and Maharaji-ji, though chanting, retreats and workshops.
+          - generic [ref=e801]:
+            - generic [ref=e804]:
+              - link "Krishna.com – The site all about Krishna! Krishna.com https://krishna.com" [ref=e806] [cursor=pointer]:
+                - /url: https://krishna.com/
+                - heading "Krishna.com – The site all about Krishna!" [level=3] [ref=e807]
+                - generic [ref=e812]:
+                  - generic [ref=e814]: Krishna.com
+                  - generic [ref=e816]: https://krishna.com
+              - button "About this result" [ref=e817] [cursor=pointer]:
+                - img [ref=e820]
+            - generic [ref=e823]:
+              - generic [ref=e824]:
+                - text: Krishna.com
+                - emphasis [ref=e825]: shares the teachings of Lord Krishna
+                - text: ", based on sacred texts like the Bhagavad-gita, with the commentary by AC Bhaktivedanta Swami Prabhupada."
+              - link "Read more" [ref=e826] [cursor=pointer]:
+                - /url: https://krishna.com/#:~:text=Krishna.com%20shares%20the%20teachings%20of,by%20A.C.%20Bhaktivedanta%20Swami%20Prabhupada.
+          - generic [ref=e832]:
+            - generic [ref=e835]:
+              - link "Shree Krishna JioHotstar https://www.hotstar.com · 17 hours ago" [ref=e837] [cursor=pointer]:
+                - /url: https://www.hotstar.com/in/shows/shree-krishna/1971002480
+                - heading "Shree Krishna" [level=3] [ref=e838]
+                - generic [ref=e843]:
+                  - generic [ref=e845]: JioHotstar
+                  - generic [ref=e847]: https://www.hotstar.com · 17 hours ago
+              - button "About this result" [ref=e848] [cursor=pointer]:
+                - img [ref=e851]
+            - generic [ref=e853]:
+              - link "Shree Krishna on JioHotstar. Play on JioHotstar." [ref=e854] [cursor=pointer]:
+                - /url: https://www.hotstar.com/in/shows/shree-krishna/1971002480
+                - img [ref=e859]
+              - generic [ref=e863]: Explore Lord Krishna's journey from 'Makhan Chor' to Prince of Mathura and Dwarka. Discover his deep bond with Radha and friendship with Sudama. Mythology.
+          - generic [ref=e867]:
+            - generic [ref=e870]:
+              - link "5 things to know about Krishna Hindu American Foundation https://www.hinduamerican.org › blog › 5-things-to-kn..." [ref=e872] [cursor=pointer]:
+                - /url: https://www.hinduamerican.org/blog/5-things-to-know-about-krishna/
+                - heading "5 things to know about Krishna" [level=3] [ref=e873]
+                - generic [ref=e878]:
+                  - generic [ref=e880]: Hindu American Foundation
+                  - generic [ref=e882]: https://www.hinduamerican.org › blog › 5-things-to-kn...
+              - button "About this result" [ref=e883] [cursor=pointer]:
+                - img [ref=e886]
+            - generic [ref=e889]:
+              - generic [ref=e890]: 28 Aug 2023 —
+              - generic [ref=e891]:
+                - text: 1)
+                - emphasis [ref=e892]: He is known as the “all attractive” one
+                - text: . In some traditions, Krishna is seen as an avatar of Vishnu (the god of preservation), who descends as an upholder ...
+              - link "Read more" [ref=e893] [cursor=pointer]:
+                - /url: https://www.hinduamerican.org/blog/5-things-to-know-about-krishna/#:~:text=1)%20He%20is%20known%20as,the%20%E2%80%9Call%20attractive%E2%80%9D%20one&text=In%20some%20traditions%2C%20Krishna%20is,god%20of%20preservation)%2C%20who%20descends
+          - generic [ref=e900]:
+            - generic [ref=e903]:
+              - link "Krishna's Special Story - His Birth, Struggle, Wars, Love ... YouTube · BeerBiceps 64.7L+ views · 1 year ago" [ref=e905] [cursor=pointer]:
+                - /url: https://www.youtube.com/watch?v=HEAZF_aUkRU
+                - heading "Krishna's Special Story - His Birth, Struggle, Wars, Love ..." [level=3] [ref=e906]
+                - generic [ref=e911]:
+                  - generic [ref=e913]: YouTube · BeerBiceps
+                  - generic [ref=e915]: 64.7L+ views · 1 year ago
+              - button "About this result" [ref=e916] [cursor=pointer]:
+                - img [ref=e919]
+            - generic [ref=e921]:
+              - button "Krishna's Special Story - His Birth, Struggle, Wars, Love ... by BeerBiceps on YouTube. Play on Google. 2:12:45" [ref=e922] [cursor=pointer]:
+                - generic [ref=e924]:
+                  - img [ref=e930]
+                  - generic [ref=e933]:
+                    - generic [ref=e934]: 2:12:45
+                    - img [ref=e937]
+              - generic [ref=e940]: Krishna's Special Story - His Birth, Struggle, Wars, Love, Death & Tantra with Vinay Varanasi | TRS · Comments. 6.2K. I can't say anything ...
+            - button "25 key moments in this video" [ref=e945] [cursor=pointer]:
+              - generic [ref=e948]:
+                - generic [ref=e951]: 25 key moments in this video
+                - img [ref=e953]
+        - generic [ref=e956]:
+          - generic [ref=e961]:
+            - heading "People also search for" [level=2] [ref=e963]
+            - generic [ref=e965]:
+              - generic [ref=e966]:
+                - link "Krishna Images" [ref=e970] [cursor=pointer]:
+                  - /url: /search?sca_esv=9bb8411b62548352&q=Krishna+Images&sa=X&ved=2ahUKEwiJzPPFrYaUAxVOpZUCHbltIoUQ1QJ6BAhAEAE
+                  - generic [ref=e971]:
+                    - generic [ref=e976]: Krishna Images
+                    - img [ref=e980]
+                - link "Krishna Wallpaper" [ref=e985] [cursor=pointer]:
+                  - /url: /search?sca_esv=9bb8411b62548352&q=Krishna+Wallpaper&sa=X&ved=2ahUKEwiJzPPFrYaUAxVOpZUCHbltIoUQ1QJ6BAhKEAE
+                  - generic [ref=e986]:
+                    - generic [ref=e991]: Krishna Wallpaper
+                    - img [ref=e995]
+                - link "Krishna full name" [ref=e1000] [cursor=pointer]:
+                  - /url: /search?sca_esv=9bb8411b62548352&q=Krishna+full+name&sa=X&ved=2ahUKEwiJzPPFrYaUAxVOpZUCHbltIoUQ1QJ6BAhJEAE
+                  - generic [ref=e1001]:
+                    - generic [ref=e1006]: Krishna full name
+                    - img [ref=e1010]
+                - link "Krishna Movie" [ref=e1015] [cursor=pointer]:
+                  - /url: /search?sca_esv=9bb8411b62548352&q=Krishna+Movie&sa=X&ved=2ahUKEwiJzPPFrYaUAxVOpZUCHbltIoUQ1QJ6BAhIEAE
+                  - generic [ref=e1016]:
+                    - generic [ref=e1021]: Krishna Movie
+                    - img [ref=e1025]
+              - generic [ref=e1027]:
+                - link "Krishna drawing" [ref=e1031] [cursor=pointer]:
+                  - /url: /search?sca_esv=9bb8411b62548352&q=Krishna+drawing&sa=X&ved=2ahUKEwiJzPPFrYaUAxVOpZUCHbltIoUQ1QJ6BAhHEAE
+                  - generic [ref=e1032]:
+                    - generic [ref=e1037]: Krishna drawing
+                    - img [ref=e1041]
+                - link "Lord Krishna wife" [ref=e1046] [cursor=pointer]:
+                  - /url: /search?sca_esv=9bb8411b62548352&q=Lord+Krishna+wife&sa=X&ved=2ahUKEwiJzPPFrYaUAxVOpZUCHbltIoUQ1QJ6BAhGEAE
+                  - generic [ref=e1047]:
+                    - generic [ref=e1052]: Lord Krishna wife
+                    - img [ref=e1056]
+                - link "Krishna Leela" [ref=e1061] [cursor=pointer]:
+                  - /url: /search?sca_esv=9bb8411b62548352&q=Krishna+Leela&sa=X&ved=2ahUKEwiJzPPFrYaUAxVOpZUCHbltIoUQ1QJ6BAhEEAE
+                  - generic [ref=e1062]:
+                    - generic [ref=e1067]: Krishna Leela
+                    - img [ref=e1071]
+                - link "Krishna video" [ref=e1076] [cursor=pointer]:
+                  - /url: /search?sca_esv=9bb8411b62548352&q=Krishna+video&sa=X&ved=2ahUKEwiJzPPFrYaUAxVOpZUCHbltIoUQ1QJ6BAhDEAE
+                  - generic [ref=e1077]:
+                    - generic [ref=e1082]: Krishna video
+                    - img [ref=e1086]
+          - navigation [ref=e1088]:
+            - heading "Page navigation" [level=1] [ref=e1089]
+            - text: "1"
+            - link "Page 2" [ref=e1092] [cursor=pointer]:
+              - /url: /search?q=krishna&sca_esv=9bb8411b62548352&ei=N1DracnUBs7K1sQPuduJqQg&start=10&sa=N&sstk=Af77f_d_wJGsEwHqQxjaVd4AbQq3Je-UUdXPPFxj4J0fxrFHmXJF23_8h5QTONlBuVaXXjEquY-a3beO3_5yi8XepQDvQ_eyoKL_Ow&ved=2ahUKEwiJzPPFrYaUAxVOpZUCHbltIoUQ8tMDegQINhAE
+              - text: "2"
+            - link "Page 3" [ref=e1094] [cursor=pointer]:
+              - /url: /search?q=krishna&sca_esv=9bb8411b62548352&ei=N1DracnUBs7K1sQPuduJqQg&start=20&sa=N&sstk=Af77f_d_wJGsEwHqQxjaVd4AbQq3Je-UUdXPPFxj4J0fxrFHmXJF23_8h5QTONlBuVaXXjEquY-a3beO3_5yi8XepQDvQ_eyoKL_Ow&ved=2ahUKEwiJzPPFrYaUAxVOpZUCHbltIoUQ8tMDegQINhAG
+              - text: "3"
+            - link "Page 4" [ref=e1096] [cursor=pointer]:
+              - /url: /search?q=krishna&sca_esv=9bb8411b62548352&ei=N1DracnUBs7K1sQPuduJqQg&start=30&sa=N&sstk=Af77f_d_wJGsEwHqQxjaVd4AbQq3Je-UUdXPPFxj4J0fxrFHmXJF23_8h5QTONlBuVaXXjEquY-a3beO3_5yi8XepQDvQ_eyoKL_Ow&ved=2ahUKEwiJzPPFrYaUAxVOpZUCHbltIoUQ8tMDegQINhAI
+              - text: "4"
+            - link "Page 5" [ref=e1098] [cursor=pointer]:
+              - /url: /search?q=krishna&sca_esv=9bb8411b62548352&ei=N1DracnUBs7K1sQPuduJqQg&start=40&sa=N&sstk=Af77f_d_wJGsEwHqQxjaVd4AbQq3Je-UUdXPPFxj4J0fxrFHmXJF23_8h5QTONlBuVaXXjEquY-a3beO3_5yi8XepQDvQ_eyoKL_Ow&ved=2ahUKEwiJzPPFrYaUAxVOpZUCHbltIoUQ8tMDegQINhAK
+              - text: "5"
+            - link "Page 6" [ref=e1100] [cursor=pointer]:
+              - /url: /search?q=krishna&sca_esv=9bb8411b62548352&ei=N1DracnUBs7K1sQPuduJqQg&start=50&sa=N&sstk=Af77f_d_wJGsEwHqQxjaVd4AbQq3Je-UUdXPPFxj4J0fxrFHmXJF23_8h5QTONlBuVaXXjEquY-a3beO3_5yi8XepQDvQ_eyoKL_Ow&ved=2ahUKEwiJzPPFrYaUAxVOpZUCHbltIoUQ8tMDegQINhAM
+              - text: "6"
+            - link "Page 7" [ref=e1102] [cursor=pointer]:
+              - /url: /search?q=krishna&sca_esv=9bb8411b62548352&ei=N1DracnUBs7K1sQPuduJqQg&start=60&sa=N&sstk=Af77f_d_wJGsEwHqQxjaVd4AbQq3Je-UUdXPPFxj4J0fxrFHmXJF23_8h5QTONlBuVaXXjEquY-a3beO3_5yi8XepQDvQ_eyoKL_Ow&ved=2ahUKEwiJzPPFrYaUAxVOpZUCHbltIoUQ8tMDegQINhAO
+              - text: "7"
+            - link "Page 8" [ref=e1104] [cursor=pointer]:
+              - /url: /search?q=krishna&sca_esv=9bb8411b62548352&ei=N1DracnUBs7K1sQPuduJqQg&start=70&sa=N&sstk=Af77f_d_wJGsEwHqQxjaVd4AbQq3Je-UUdXPPFxj4J0fxrFHmXJF23_8h5QTONlBuVaXXjEquY-a3beO3_5yi8XepQDvQ_eyoKL_Ow&ved=2ahUKEwiJzPPFrYaUAxVOpZUCHbltIoUQ8tMDegQINhAQ
+              - text: "8"
+            - link "Page 9" [ref=e1106] [cursor=pointer]:
+              - /url: /search?q=krishna&sca_esv=9bb8411b62548352&ei=N1DracnUBs7K1sQPuduJqQg&start=80&sa=N&sstk=Af77f_d_wJGsEwHqQxjaVd4AbQq3Je-UUdXPPFxj4J0fxrFHmXJF23_8h5QTONlBuVaXXjEquY-a3beO3_5yi8XepQDvQ_eyoKL_Ow&ved=2ahUKEwiJzPPFrYaUAxVOpZUCHbltIoUQ8tMDegQINhAS
+              - text: "9"
+            - link "Page 10" [ref=e1108] [cursor=pointer]:
+              - /url: /search?q=krishna&sca_esv=9bb8411b62548352&ei=N1DracnUBs7K1sQPuduJqQg&start=90&sa=N&sstk=Af77f_d_wJGsEwHqQxjaVd4AbQq3Je-UUdXPPFxj4J0fxrFHmXJF23_8h5QTONlBuVaXXjEquY-a3beO3_5yi8XepQDvQ_eyoKL_Ow&ved=2ahUKEwiJzPPFrYaUAxVOpZUCHbltIoUQ8tMDegQINhAU
+              - text: "10"
+            - heading "Next" [level=2] [ref=e1110]:
+              - link "Next" [ref=e1111] [cursor=pointer]:
+                - /url: /search?q=krishna&sca_esv=9bb8411b62548352&ei=N1DracnUBs7K1sQPuduJqQg&start=10&sa=N&sstk=Af77f_d_wJGsEwHqQxjaVd4AbQq3Je-UUdXPPFxj4J0fxrFHmXJF23_8h5QTONlBuVaXXjEquY-a3beO3_5yi8XepQDvQ_eyoKL_Ow&ved=2ahUKEwiJzPPFrYaUAxVOpZUCHbltIoUQ8NMDegQINhAW
+                - generic [ref=e1113]: Next
+        - navigation
+    - contentinfo [ref=e1114]:
+      - heading "Footer links" [level=1] [ref=e1115]
+      - generic [ref=e1119]:
+        - generic [ref=e1121]:
+          - text: India
+          - generic [ref=e1123]:
+            - button "122016, Gurugram, Haryana - From your IP address" [ref=e1125] [cursor=pointer]:
+              - generic [ref=e1126]: 122016, Gurugram, Haryana
+              - generic [ref=e1128]:
+                - text: "-"
+                - generic [ref=e1129]: From your IP address
+            - text: "-"
+            - button "Update location" [ref=e1131] [cursor=pointer]: Update location
+        - generic [ref=e1134]:
+          - link "Help" [ref=e1135] [cursor=pointer]:
+            - /url: https://support.google.com/websearch/?p=ws_results_help&hl=en-IN&fg=1
+          - link "Send feedback" [ref=e1136] [cursor=pointer]:
+            - /url: "#"
+          - link "Privacy" [ref=e1137] [cursor=pointer]:
+            - /url: https://policies.google.com/privacy?hl=en-IN&fg=1
+          - link "Terms" [ref=e1138] [cursor=pointer]:
+            - /url: https://policies.google.com/terms?hl=en-IN&fg=1
