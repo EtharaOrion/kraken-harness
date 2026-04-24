@@ -61,7 +61,6 @@ class TestSpec:
     repo_script_list: list[str]
     eval_script_list: list[str]
     env_script_list: list[str]
-    arch: str
     FAIL_TO_PASS: list[str]
     PASS_TO_PASS: list[str]
     base_commit: str
@@ -158,7 +157,7 @@ class TestSpec:
 
     @property
     def base_image_key(self):
-        return f"sweb.base.{self.arch}:latest"
+        return "sweb.base:latest"
 
     @property
     def env_image_key(self):
@@ -172,15 +171,15 @@ class TestSpec:
         hash_object.update(str(self.env_script_list).encode("utf-8"))
         hash_value = hash_object.hexdigest()
         val = hash_value[:22]  # 22 characters is still very likely to be unique
-        return f"sweb.env.{self.arch}.{val}:latest"
+        return f"sweb.env.{val}:latest"
 
     @property
     def instance_image_key(self):
-        return f"sweb.eval.{self.arch}.{self.instance_id}:latest"
+        return f"sweb.eval.{self.instance_id}:latest"
 
     @property
     def annotate_instance_image_key(self):
-        return f"sweb.eval.{self.arch}.{self.instance_id}.annotate:latest"
+        return f"sweb.eval.{self.instance_id}.annotate:latest"
 
     def get_instance_container_name(self, run_id=None):
         if not run_id:
@@ -189,11 +188,11 @@ class TestSpec:
 
     @property
     def base_dockerfile(self):
-        return get_dockerfile_base(self.platform, self.arch)
+        return get_dockerfile_base(self.platform)
 
     @property
     def env_dockerfile(self):
-        return get_dockerfile_env(self.platform, self.arch)
+        return get_dockerfile_env(self.platform)
 
     @property
     def instance_dockerfile(self):
@@ -205,12 +204,11 @@ class TestSpec:
 
     @property
     def platform(self):
-        if self.arch == "x86_64":
-            return "linux/x86_64"
-        elif self.arch == "arm64":
+        machine = platform.machine()
+        if machine in {"aarch64", "arm64"} and self.instance_id not in USE_X86:
             return "linux/arm64/v8"
         else:
-            raise ValueError(f"Invalid architecture: {self.arch}")
+            return "linux/x86_64"
 
 
 def get_test_specs_from_dataset(
@@ -1448,12 +1446,6 @@ def make_test_spec(instance: SWEfficiencyInstance, observed_versions=None) -> Te
         instance, specs, env_name, repo_directory, base_commit, test_patch
     )
 
-    if platform.machine() in {"aarch64", "arm64"}:
-        # use arm64 unless explicitly specified
-        arch = "arm64" if instance_id not in USE_X86 else "x86_64"
-    else:
-        arch = "x86_64"
-
     workload_text = instance.get("workload", "")
     if workload_text.strip() == "nan" or workload_text.strip() == "":
         workload_text = None
@@ -1465,7 +1457,6 @@ def make_test_spec(instance: SWEfficiencyInstance, observed_versions=None) -> Te
         repo_script_list=repo_script_list,
         eval_script_list=eval_script_list,
         version=version,
-        arch=arch,
         FAIL_TO_PASS=fail_to_pass,
         PASS_TO_PASS=pass_to_pass,
         # SWE-fficiency changes.

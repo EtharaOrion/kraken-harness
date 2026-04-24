@@ -43,8 +43,8 @@ libblas-dev \
 liblapack-dev \
 && rm -rf /var/lib/apt/lists/*
 
-# Download and install conda (arch-aware)
-RUN wget 'https://repo.anaconda.com/miniconda/Miniconda3-py311_24.7.1-0-Linux-{conda_arch}.sh' -O miniconda.sh \
+# Download and install conda (arch derived from platform at template time)
+RUN wget "https://repo.anaconda.com/miniconda/Miniconda3-py311_24.7.1-0-Linux-{conda_arch}.sh" -O miniconda.sh \
     && bash miniconda.sh -b -p /opt/miniconda3
 # Add conda to PATH
 ENV PATH=/opt/miniconda3/bin:$PATH
@@ -56,7 +56,7 @@ RUN conda clean --all --yes
 RUN adduser --disabled-password --gecos 'dog' nonroot
 """
 
-_DOCKERFILE_ENV = r"""FROM --platform={platform} sweb.base.{arch}:latest
+_DOCKERFILE_ENV = r"""FROM --platform={platform} sweb.base:latest
 
 COPY ./setup_env.sh /root/
 RUN chmod +x /root/setup_env.sh
@@ -86,16 +86,13 @@ WORKDIR /testbed/
 """
 
 
-def get_dockerfile_base(platform, arch):
-    if arch == "arm64":
-        conda_arch = "aarch64"
-    else:
-        conda_arch = arch
+def get_dockerfile_base(platform):
+    conda_arch = "aarch64" if "arm64" in platform or "aarch64" in platform else "x86_64"
     return _DOCKERFILE_BASE.format(platform=platform, conda_arch=conda_arch)
 
 
-def get_dockerfile_env(platform, arch):
-    return _DOCKERFILE_ENV.format(platform=platform, arch=arch)
+def get_dockerfile_env(platform):
+    return _DOCKERFILE_ENV.format(platform=platform)
 
 
 def get_dockerfile_instance(platform, env_image_name):

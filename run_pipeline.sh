@@ -18,12 +18,18 @@ set -euo pipefail
 #   --max-workers N         Parallel workers for eval (default: 1)
 #   --skip-scrape           Skip stages 1-6, use existing enriched JSONL
 #   --skip-workload         Skip workload generation
-#   --skip-docker-build     Skip Docker build (assume images exist)
 #   --dataset PATH          Use existing dataset JSONL (skips scrape+filter+version)
 #   --mode MODE             Inference mode: default|openhands (default: default)
 #   --dry-run               Show what would be done without executing
 #   --timeout N             Eval timeout in seconds (default: 1800)
+#   --start-from STAGE      Start from this stage, skip all prior stages
+#   --stop-after STAGE      Stop after this stage, skip all later stages
+#   --stages LIST           Comma-separated list of stages to run (e.g., eval,report)
 #   --help                  Show this help
+#
+# Stages (in execution order):
+#   scrape, perf_filter, versioning, detect_specs, workload,
+#   eval, pred_eval, report, inference
 ###############################################################################
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,11 +43,13 @@ MAX_PULLS=""
 MAX_WORKERS=1
 SKIP_SCRAPE=false
 SKIP_WORKLOAD=false
-SKIP_DOCKER_BUILD=false
 DATASET=""
 MODE="default"
 DRY_RUN=false
 TIMEOUT=1800
+START_FROM=""
+STOP_AFTER=""
+STAGES=""
 
 # ─── Parse args ───────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -53,11 +61,13 @@ while [[ $# -gt 0 ]]; do
         --max-workers)  MAX_WORKERS="$2"; shift 2 ;;
         --skip-scrape)  SKIP_SCRAPE=true; shift ;;
         --skip-workload) SKIP_WORKLOAD=true; shift ;;
-        --skip-docker-build) SKIP_DOCKER_BUILD=true; shift ;;
         --dataset)      DATASET="$2"; shift 2 ;;
         --mode)         MODE="$2"; shift 2 ;;
         --dry-run)      DRY_RUN=true; shift ;;
         --timeout)      TIMEOUT="$2"; shift 2 ;;
+        --start-from)   START_FROM="$2"; shift 2 ;;
+        --stop-after)   STOP_AFTER="$2"; shift 2 ;;
+        --stages)       STAGES="$2"; shift 2 ;;
         --help)
             sed -n '/^# Usage:/,/^###/p' "$0" | head -n -1
             exit 0
@@ -141,6 +151,52 @@ find_jsonl() {
     local dir="$1" pattern="$2"
     find "$dir" -name "$pattern" -type f 2>/dev/null | head -1
 }
+
+ORDERED_STAGES=(scrape perf_filter versioning detect_specs workload eval pred_eval report inference)
+
+validate_stage_name() {
+    local name="$1"
+    for s in "${ORDERED_STAGES[@]}"; do
+        [[ "$s" == "$name" ]] && return 0
+    done
+    echo "ERROR: Unknown stage '$name'. Valid stages: ${ORDERED_STAGES[*]}"
+    exit 1
+}
+
+should_run_stage() {
+    local stage="$1" _s
+
+    if [[ -n "$STAGES" ]]; then
+        IFS=',' read -ra _sel <<< "$STAGES"
+        for _s in "${_sel[@]}"; do
+            [[ "$_s" == "$stage" ]] && return 0
+        done
+        return 1
+    fi
+
+    if [[ -n "$START_FROM" || -n "$STOP_AFTER" ]]; then
+        local in_range=false started=true
+        [[ -n "$START_FROM" ]] && started=false
+        for _s in "${ORDERED_STAGES[@]}"; do
+            [[ -n "$START_FROM" && "$_s" == "$START_FROM" ]] && started=true
+            if $started; then
+                [[ "$_s" == "$stage" ]] && in_range=true
+            fi
+            [[ -n "$STOP_AFTER" && "$_s" == "$STOP_AFTER" ]] && { $started && break; }
+        done
+        $in_range && return 0 || return 1
+    fi
+
+    return 0
+}
+
+[[ -n "$START_FROM" ]] && validate_stage_name "$START_FROM"
+[[ -n "$STOP_AFTER" ]] && validate_stage_name "$STOP_AFTER"
+if [[ -n "$STAGES" ]]; then
+    IFS=',' read -ra _validate <<< "$STAGES"
+    for _s in "${_validate[@]}"; do validate_stage_name "$_s"; done
+    unset _validate _s
+fi
 
 ###############################################################################
 # STAGE 1-3: Scrape PRs + Build Dataset
@@ -585,41 +641,59 @@ main() {
     echo "  Max workers: $MAX_WORKERS"
     echo "  Cutoff date: $CUTOFF_DATE"
     echo "  Platform:    $(uname -s)/$(uname -m)"
+    [[ -n "$START_FROM" ]] && echo "  Start from:  $START_FROM"
+    [[ -n "$STOP_AFTER" ]] && echo "  Stop after:  $STOP_AFTER"
+    [[ -n "$STAGES" ]]     && echo "  Stages:      $STAGES"
 
     check_prereqs
 
+    # ── Auto-discover intermediate files for resume ──
     if [[ -n "$DATASET" ]]; then
         echo "  Using provided dataset: $DATASET"
         ENRICHED_FILE="$DATASET"
         FINAL_DATASET="$DATASET"
-    elif ! $SKIP_SCRAPE; then
-        stage_scrape
-        stage_perf_filter
-        stage_versioning
-        stage_detect_specs
+    elif should_run_stage "scrape" && ! $SKIP_SCRAPE; then
+        : # Will be set by stage_scrape
     else
-        echo "  Skipping scrape stages (--skip-scrape)."
+        if $SKIP_SCRAPE; then
+            echo "  Skipping scrape stages (--skip-scrape)."
+        fi
         ENRICHED_FILE=$(find_jsonl "$ENRICHED_DIR" "${REPO_SLUG}*.jsonl")
-        [[ -z "$ENRICHED_FILE" ]] && ENRICHED_FILE=$(find_jsonl "$FINAL_DIR" "${REPO_SLUG}*.jsonl")
-        [[ -z "$ENRICHED_FILE" ]] && { echo "ERROR: No dataset found. Run without --skip-scrape first."; exit 1; }
-        FINAL_DATASET="$ENRICHED_FILE"
+        FINAL_DATASET=$(find_jsonl "$FINAL_DIR" "${REPO_SLUG}*dataset*.jsonl")
+        [[ -z "$ENRICHED_FILE" && -z "$FINAL_DATASET" ]] && { echo "ERROR: Skipping scrape but no dataset found. Use --dataset."; exit 1; }
+        [[ -z "$FINAL_DATASET" ]] && FINAL_DATASET="$ENRICHED_FILE"
     fi
 
-    # Export for inline Python scripts
+    if ! should_run_stage "eval" && (should_run_stage "pred_eval" || should_run_stage "report"); then
+        GOLD_DIR="$EVAL_DIR/gold"
+        [[ ! -d "$GOLD_DIR" ]] && { echo "ERROR: --start-from pred_eval/report but no gold eval at $GOLD_DIR"; exit 1; }
+    fi
+
+    if ! should_run_stage "pred_eval" && should_run_stage "report"; then
+        PRED_DIR="$EVAL_DIR/gold_as_pred"
+        [[ ! -d "$PRED_DIR" ]] && { echo "ERROR: --start-from report but no pred eval at $PRED_DIR"; exit 1; }
+    fi
+
+    # ── Stage-gated execution ──
+    should_run_stage "scrape" && ! $SKIP_SCRAPE && [[ -z "$DATASET" ]] && stage_scrape
+    should_run_stage "perf_filter" && ! $SKIP_SCRAPE && [[ -z "$DATASET" ]] && stage_perf_filter
+    should_run_stage "versioning" && ! $SKIP_SCRAPE && [[ -z "$DATASET" ]] && stage_versioning
+    should_run_stage "detect_specs" && ! $SKIP_SCRAPE && [[ -z "$DATASET" ]] && stage_detect_specs
+
     export _ENRICHED="${ENRICHED_FILE:-}"
     export _FINAL="${FINAL_DATASET:-}"
     export _WL_OUTPUT=""
 
-    if ! $SKIP_WORKLOAD && [[ -z "$DATASET" ]]; then
+    if should_run_stage "workload" && ! $SKIP_WORKLOAD && [[ -z "$DATASET" ]]; then
         stage_workload
     else
-        FINAL_DATASET="${ENRICHED_FILE:-$DATASET}"
+        FINAL_DATASET="${FINAL_DATASET:-${ENRICHED_FILE:-$DATASET}}"
     fi
 
-    stage_eval
-    stage_pred_eval
-    stage_report
-    stage_inference
+    should_run_stage "eval" && stage_eval
+    should_run_stage "pred_eval" && stage_pred_eval
+    should_run_stage "report" && stage_report
+    should_run_stage "inference" && stage_inference
     print_summary
 }
 
