@@ -193,4 +193,6 @@ vendor/
 
 # Pipeline artifacts
 .specs_cache.json
-.sisyphus/
+.sisyphus/.playwright-mcp/
+.playwright-mcp/
+artifacts/
