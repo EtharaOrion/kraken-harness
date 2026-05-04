@@ -279,6 +279,8 @@ def make_repo_script_list(
 
     # SWE-fficiency: Add coverage, pytest-profiling, pytest-memray.
     setup_commands.append("python -m pip install coverage unidiff")
+    # SWE-fficiency: Ensure pytest is installed in the test env (some datasets omit it from pip_packages).
+    setup_commands.append("python -m pip install pytest pytest-xdist")
 
     # TODO: Add pytest-profiling, pytest-memray later.
     # Note: only sklearn requires interval tree, so we don't install it by default.
@@ -422,7 +424,11 @@ def make_env_script_list(
 
     # Install additional packages if specified
     if "pip_packages" in specs:
-        pip_packages = " ".join(f"'{p}'" for p in specs["pip_packages"])
+        def _quote_pkg(p):
+            if "'" in p:
+                return f'"{p}"'
+            return f"'{p}'"
+        pip_packages = " ".join(_quote_pkg(p) for p in specs["pip_packages"])
         cmd = f"python -m pip install {pip_packages}"
         reqs_commands.append(cmd)
 
@@ -466,6 +472,7 @@ def make_test_command(instance, without_directives=False, prefer_distributed=Fal
                 *test_directives,
             ]
         )
+        test_command = test_command.replace("{test_files}", "").strip()
         return test_command
 
 
@@ -1205,11 +1212,32 @@ def get_correctness_script_list(
     # PASSED/FAILED/SKIPPED/ERROR, which requires the -rA flag. Auto-inject
     # the flags used by TEST_PYTEST when the test_cmd looks like a bare pytest
     # invocation from a dynamic spec.
-    _REQUIRED_CORRECTNESS_FLAGS = "--no-header -rA --tb=no -p no:cacheprovider --continue-on-collection-errors"
+    # SWE-fficiency: Override project-specific addopts from pyproject.toml/setup.cfg.
+    # Many projects (e.g. pydantic) hardcode --benchmark-* flags that require
+    # optional plugins we do not install. `-o addopts=` zeroes out those ini
+    # options so correctness tests run with only the flags we explicitly set.
+    _REQUIRED_CORRECTNESS_FLAGS = "--no-header -rA --tb=no -p no:cacheprovider -p no:pretty --continue-on-collection-errors -o addopts="
     if test_command.strip().startswith("pytest") and "-rA" not in test_command:
         parts = test_command.strip().split(None, 1)
         rest = parts[1] if len(parts) > 1 else ""
         test_command = f"pytest {_REQUIRED_CORRECTNESS_FLAGS} {rest}".strip()
+
+    # SWE-fficiency: -rA needs per-test status lines, which pytest suppresses
+    # when -q is present. Strip -q/--quiet so the parser has PASSED/FAILED/SKIPPED
+    # lines to work with.
+    test_command = re.sub(r"(^|\s)(-q|--quiet)(\s|$)", r"\1\3", test_command).strip()
+
+    test_command = test_command.replace("{test_files}", "").strip()
+
+    # Strip trailing directory args (e.g. "tests/") from pytest commands.
+    # The covering-test directive ($line) already provides the exact test
+    # file path, so a blanket directory arg would cause pytest to collect
+    # the entire suite AND the specific file, leading to collection errors.
+    if test_command.strip().startswith("pytest"):
+        import shlex
+        _parts = shlex.split(test_command)
+        _parts = [p for p in _parts if not (p.endswith("/") or p in ("tests", "test", "src"))]
+        test_command = " ".join(_parts)
 
     test_directive_symbol = "$line"
     if instance["repo"] == "django/django":

@@ -21,6 +21,8 @@ set -euo pipefail
 #   --dataset PATH          Use existing dataset JSONL (skips scrape+filter+version)
 #   --mode MODE             Inference mode: default|openhands (default: default)
 #   --dry-run               Show what would be done without executing
+#   --use-helicone          Route LLM calls through Helicone proxy
+#   --multiarch             Build base+env Docker images for amd64+arm64 via buildx
 #   --timeout N             Eval timeout in seconds (default: 1800)
 #   --start-from STAGE      Start from this stage, skip all prior stages
 #   --stop-after STAGE      Stop after this stage, skip all later stages
@@ -46,6 +48,8 @@ SKIP_WORKLOAD=false
 DATASET=""
 MODE="default"
 DRY_RUN=false
+USE_HELICONE=false
+MULTIARCH=false
 TIMEOUT=1800
 START_FROM=""
 STOP_AFTER=""
@@ -64,6 +68,8 @@ while [[ $# -gt 0 ]]; do
         --dataset)      DATASET="$2"; shift 2 ;;
         --mode)         MODE="$2"; shift 2 ;;
         --dry-run)      DRY_RUN=true; shift ;;
+        --use-helicone) USE_HELICONE=true; shift ;;
+        --multiarch)    MULTIARCH=true; shift ;;
         --timeout)      TIMEOUT="$2"; shift 2 ;;
         --start-from)   START_FROM="$2"; shift 2 ;;
         --stop-after)   STOP_AFTER="$2"; shift 2 ;;
@@ -117,9 +123,11 @@ check_prereqs() {
         exit 1
     fi
 
-    if ! docker info >/dev/null 2>&1; then
-        echo "ERROR: Docker daemon not running. Start Docker Desktop first."
-        exit 1
+    if should_run_stage "eval" || should_run_stage "pred_eval" || should_run_stage "inference"; then
+        if ! docker info >/dev/null 2>&1; then
+            echo "ERROR: Docker daemon not running. Start Docker Desktop first."
+            exit 1
+        fi
     fi
 
     if [[ -z "${GITHUB_TOKENS:-}" && -z "${GITHUB_TOKEN:-}" ]]; then
@@ -274,7 +282,7 @@ stage_versioning() {
 
     # get_versions outputs a JSON array file, not JSONL — convert it
     local json_file
-    json_file=$(find "$VERSIONED_DIR" -name "*.json" -type f 2>/dev/null | head -1)
+    json_file=$(find "$VERSIONED_DIR" -name "${REPO_SLUG}*_versions.json" -type f 2>/dev/null | head -1)
     VERSIONED_FILE="$VERSIONED_DIR/${REPO_SLUG}-versioned.jsonl"
 
     if [[ -n "$json_file" && -f "$json_file" ]]; then
@@ -435,7 +443,8 @@ stage_eval() {
         --run_correctness true \
         --run_coverage false \
         --process_isolation true \
-        --force_rerun true
+        --force_rerun true \
+        --multiarch $MULTIARCH
 
     GOLD_DIR="$EVAL_DIR/gold"
     if [[ ! -d "$GOLD_DIR" ]]; then
@@ -504,6 +513,7 @@ print(f'  → Created {len(instances)} predictions')
         --run_coverage false \
         --process_isolation true \
         --force_rerun true \
+        --multiarch $MULTIARCH \
         --model_predictions "$pred_file"
 
     PRED_DIR="$EVAL_DIR/gold_as_pred"
@@ -646,6 +656,10 @@ main() {
     [[ -n "$STAGES" ]]     && echo "  Stages:      $STAGES"
 
     check_prereqs
+
+    if $USE_HELICONE; then
+        export ENABLE_HELICONE=1
+    fi
 
     # ── Auto-discover intermediate files for resume ──
     if [[ -n "$DATASET" ]]; then

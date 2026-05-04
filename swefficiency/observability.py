@@ -33,6 +33,9 @@ def setup_helicone() -> bool:
     Automatically calls ``load_dotenv()`` so standalone scripts that don't
     load ``.env`` themselves still pick up Helicone credentials.
 
+    Helicone is only activated when the ``ENABLE_HELICONE`` environment
+    variable is set (e.g. via ``--use-helicone`` in *run_pipeline.sh*).
+
     Safe to call multiple times; the callback is registered at most once
     per process.
 
@@ -45,6 +48,10 @@ def setup_helicone() -> bool:
 
     if _DOTENV_PATH.is_file():
         load_dotenv(_DOTENV_PATH, override=False)
+
+    # Only activate if explicitly enabled
+    if not os.environ.get("ENABLE_HELICONE"):
+        return False
 
     api_key = os.environ.get("HELICONE_API_KEY")
     if not api_key:
@@ -119,3 +126,100 @@ def helicone_metadata(
             meta[f"Helicone-Property-{k}"] = v
 
     return meta
+
+
+# ── Cost Tracking ───────────────────────────────────────────────
+
+# Manual pricing table for Bedrock models where litellm returns $0.
+# Prices are USD per 1M tokens.
+BEDROCK_PRICING: dict[str, dict[str, float]] = {
+    # Claude Opus 4.7 (dataset creation model)
+    "global.anthropic.claude-opus-4-7": {"input": 5.00, "output": 25.00},
+    "anthropic.claude-opus-4-7": {"input": 5.00, "output": 25.00},
+    "us.anthropic.claude-opus-4-7": {"input": 5.50, "output": 27.50},
+    # Claude Opus 4.6
+    "global.anthropic.claude-opus-4-6-v1": {"input": 5.00, "output": 25.00},
+    "us.anthropic.claude-opus-4-6-v1": {"input": 5.50, "output": 27.50},
+    # Claude Sonnet 4
+    "global.anthropic.claude-sonnet-4-v1": {"input": 3.00, "output": 15.00},
+    "us.anthropic.claude-sonnet-4-v1": {"input": 3.30, "output": 16.50},
+    "global.anthropic.claude-sonnet-4-20250514-v1:0": {"input": 3.00, "output": 15.00},
+    # Amazon Nova
+    "amazon.nova-lite-v1:0": {"input": 0.06, "output": 0.24},
+    "amazon.nova-pro-v1:0": {"input": 0.80, "output": 3.20},
+    # GLM-5
+    "zai.glm-5": {"input": 1.00, "output": 3.20},
+}
+
+_MODEL_ALIASES: dict[str, str] = {
+    # Opus 4.7
+    "bedrock/converse/global.anthropic.claude-opus-4-7": "global.anthropic.claude-opus-4-7",
+    "bedrock/global.anthropic.claude-opus-4-7": "global.anthropic.claude-opus-4-7",
+    # Opus 4.6
+    "bedrock/converse/global.anthropic.claude-opus-4-6-v1": "global.anthropic.claude-opus-4-6-v1",
+    "bedrock/global.anthropic.claude-opus-4-6-v1": "global.anthropic.claude-opus-4-6-v1",
+    "bedrock/converse/us.anthropic.claude-opus-4-6-v1": "us.anthropic.claude-opus-4-6-v1",
+    # Nova / GLM
+    "bedrock/converse/amazon.nova-lite-v1:0": "amazon.nova-lite-v1:0",
+    "bedrock/converse/amazon.nova-2-lite-v1:0": "amazon.nova-lite-v1:0",
+    "bedrock/converse/zai.glm-5": "zai.glm-5",
+    # ARN inference profiles (response model is raw ARN)
+    "arn:aws:bedrock:us-east-1:426628337772:application-inference-profile/4w7tmk1iplxi": "global.anthropic.claude-opus-4-6-v1",
+    "arn:aws:bedrock:us-east-1:426628337772:application-inference-profile/8lzlkxguk85a": "zai.glm-5",
+    "arn:aws:bedrock:us-east-1:426628337772:application-inference-profile/a0q672msxd5z": "amazon.nova-lite-v1:0",
+}
+
+
+def _resolve_pricing_key(model: str) -> str | None:
+    """Resolve a model string to a BEDROCK_PRICING key."""
+    if model in BEDROCK_PRICING:
+        return model
+    if model in _MODEL_ALIASES:
+        return _MODEL_ALIASES[model]
+    stripped = model
+    for prefix in ("bedrock/converse/", "bedrock/"):
+        if stripped.startswith(prefix):
+            stripped = stripped[len(prefix):]
+            if stripped in BEDROCK_PRICING:
+                return stripped
+    return None
+
+
+def safe_completion_cost(
+    response=None,
+    *,
+    model: str | None = None,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+) -> float:
+    """Compute USD cost, falling back to manual pricing if litellm returns 0.
+
+    Can be called with a litellm response object OR with explicit token counts.
+    """
+    cost = 0.0
+    if response is not None:
+        try:
+            from litellm import completion_cost
+            cost = completion_cost(completion_response=response)
+        except Exception:
+            pass
+
+    if cost > 0:
+        return cost
+
+    if response is not None:
+        model = model or getattr(response, "model", None) or ""
+        usage = getattr(response, "usage", None)
+        if usage:
+            prompt_tokens = prompt_tokens or getattr(usage, "prompt_tokens", 0)
+            completion_tokens = completion_tokens or getattr(usage, "completion_tokens", 0)
+
+    if not model:
+        return 0.0
+
+    key = _resolve_pricing_key(model)
+    if key is None:
+        return 0.0
+
+    prices = BEDROCK_PRICING[key]
+    return (prompt_tokens * prices["input"] + completion_tokens * prices["output"]) / 1_000_000

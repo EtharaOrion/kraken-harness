@@ -1473,6 +1473,7 @@ def main(
     workload_predictions: str,
     force_rerun: bool,
     process_isolation: bool,
+    multiarch: bool = False,
 ):
     """
     Run evaluation harness for the given dataset and predictions.
@@ -1709,7 +1710,7 @@ def main(
             if not ecr_login():
                 raise RuntimeError("ECR login failed — cannot push images")
         # build environment images + run instances
-        build_env_images(client, dataset, force_rebuild, max_build_workers)
+        build_env_images(client, dataset, force_rebuild, max_build_workers, multiarch=multiarch, push_to_ecr=push_to_ecr)
         # this time w/ golden predictions (patch)
         per_instance_results = run_instances(
             predictions,
@@ -1878,6 +1879,13 @@ if __name__ == "__main__":
         type=str2bool,
         default=True,
         help="Use memory process isolation.",
+    )
+
+    parser.add_argument(
+        "--multiarch",
+        type=str2bool,
+        default=False,
+        help="Build multi-architecture images (linux/amd64,linux/arm64).",
     )
 
     args = parser.parse_args()

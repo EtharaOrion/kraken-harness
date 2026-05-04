@@ -15,7 +15,10 @@
 from __future__ import annotations
 
 import logging
+import os
+import platform as platform_mod
 import re
+import subprocess
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -23,6 +26,11 @@ from pathlib import Path
 import docker
 import docker.errors
 from tqdm import tqdm
+
+from swefficiency.harness.dockerfiles import (
+    get_dockerfile_base_multiarch,
+    get_dockerfile_env_multiarch,
+)
 
 USE_HOST_NETWORK = False
 
@@ -235,11 +243,191 @@ def build_image(
         close_logger(logger)  # functions that create loggers should close them
 
 
+# ---------------------------------------------------------------------------
+# Multiarch build support (base + env tiers only)
+# Uses `docker buildx build` CLI via subprocess for true multi-platform images.
+# eval/annotate remain single-arch using the Python Docker SDK above.
+# ---------------------------------------------------------------------------
+
+MULTIARCH_BUILDER_NAME = "swefficiency-multiarch"
+MULTIARCH_PLATFORMS = "linux/amd64,linux/arm64"
+
+
+def _native_platform() -> str:
+    """Return the platform string for the current host architecture."""
+    machine = platform_mod.machine().lower()
+    if machine in ("arm64", "aarch64"):
+        return "linux/arm64"
+    return "linux/amd64"
+
+
+def ensure_buildx_builder() -> str:
+    """
+    Ensure a docker-container buildx builder exists and is bootstrapped.
+    Returns the builder name.
+    """
+    result = subprocess.run(
+        ["docker", "buildx", "inspect", MULTIARCH_BUILDER_NAME],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(f"Creating buildx builder '{MULTIARCH_BUILDER_NAME}'...")
+        subprocess.run(
+            [
+                "docker", "buildx", "create",
+                "--name", MULTIARCH_BUILDER_NAME,
+                "--driver", "docker-container",
+                "--bootstrap",
+            ],
+            check=True,
+        )
+    else:
+        subprocess.run(
+            ["docker", "buildx", "inspect", MULTIARCH_BUILDER_NAME, "--bootstrap"],
+            capture_output=True,
+        )
+    return MULTIARCH_BUILDER_NAME
+
+
+def build_multiarch_image(
+    image_name: str,
+    setup_scripts: dict,
+    dockerfile: str,
+    build_dir: Path,
+    push: bool = False,
+    ecr_tag: str | None = None,
+    ecr_cache_tag: str | None = None,
+    nocache: bool = False,
+    builder: str | None = None,
+) -> None:
+    """
+    Build a multi-architecture Docker image using `docker buildx build`.
+
+    When push=True, builds for MULTIARCH_PLATFORMS and pushes directly to registry.
+    ECR auto-creates the manifest list.
+
+    When push=False, builds for native platform only and loads into local daemon
+    (--load is single-platform only).
+
+    Args:
+        image_name: Local image tag (e.g. sweb.base:latest)
+        setup_scripts: Dict of filename→content to write into build context
+        dockerfile: Dockerfile content string
+        build_dir: Build context directory
+        push: If True, --push to registry. If False, --load to local daemon.
+        ecr_tag: Full ECR image URI for --push (e.g. 123456.dkr.ecr.region.amazonaws.com/repo:tag)
+        ecr_cache_tag: ECR cache URI for --cache-from/--cache-to
+        nocache: If True, pass --no-cache
+        builder: Buildx builder name (auto-created if None)
+    """
+    builder = builder or ensure_buildx_builder()
+    logger = setup_logger(image_name, build_dir / "build_image.log")
+
+    try:
+        build_dir.mkdir(parents=True, exist_ok=True)
+
+        for script_name, script_content in setup_scripts.items():
+            with open(build_dir / script_name, "w") as f:
+                f.write(script_content)
+
+        with open(build_dir / "Dockerfile", "w") as f:
+            f.write(dockerfile)
+
+        tags = [image_name]
+        if push and ecr_tag:
+            tags.append(ecr_tag)
+
+        cmd = ["docker", "buildx", "build", "--builder", builder]
+
+        if push:
+            cmd += ["--platform", MULTIARCH_PLATFORMS, "--push"]
+        else:
+            cmd += ["--platform", _native_platform(), "--load"]
+
+        for tag in tags:
+            cmd += ["--tag", tag]
+
+        if nocache:
+            cmd.append("--no-cache")
+
+        if push and ecr_cache_tag:
+            cmd += ["--cache-from", f"type=registry,ref={ecr_cache_tag}"]
+            cmd += ["--cache-to", f"type=registry,ref={ecr_cache_tag},mode=max"]
+
+        # Proxy build args — pass through from host environment if set
+        for proxy_var in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "no_proxy", "NO_PROXY", "CA_CERT_PATH"):
+            val = os.environ.get(proxy_var)
+            if val:
+                cmd += ["--build-arg", f"{proxy_var}={val}"]
+
+        cmd.append(str(build_dir))
+
+        logger.info(f"Building multiarch image: {' '.join(cmd)}")
+        print(f"Building multiarch image {image_name} ({'push' if push else 'load'})...")
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        if proc.stdout:
+            for line in proc.stdout:
+                logger.info(line.rstrip())
+        proc.wait()
+
+        if proc.returncode != 0:
+            raise BuildImageError(
+                image_name,
+                f"docker buildx build failed with exit code {proc.returncode}",
+                logger,
+            )
+
+        logger.info(f"Multiarch image {image_name} built successfully!")
+        print(f"Multiarch image {image_name} built successfully!")
+
+    except BuildImageError:
+        raise
+    except Exception as e:
+        logger.error(f"Error building multiarch image {image_name}: {e}")
+        raise BuildImageError(image_name, str(e), logger) from e
+    finally:
+        close_logger(logger)
+
+
+def push_multiarch_to_ecr(
+    image_name: str,
+    ecr_registry: str | None = None,
+    ecr_repo: str | None = None,
+    ecr_cache: bool = True,
+) -> str | None:
+    """
+    Derive an ECR tag for a multiarch image.
+    For images built with push=True in build_multiarch_image(), the manifest list
+    is already in ECR — this just computes the tag string.
+    Returns the ECR tag, or None if ECR_REGISTRY is not configured.
+    """
+    ecr_registry = ecr_registry or os.environ.get("ECR_REGISTRY", "")
+    ecr_repo = ecr_repo or os.environ.get("ECR_REPO", "swefficiency-images")
+
+    if not ecr_registry:
+        print("ECR_REGISTRY not set — skipping ECR push.")
+        return None
+
+    tag_part = image_name.replace(":", "-").replace("/", "-")
+    ecr_tag = f"{ecr_registry}/{ecr_repo}:{tag_part}"
+
+    print(f"ECR target: {ecr_tag}")
+    return ecr_tag
+
+
 def build_base_images(
     client: docker.DockerClient,
     dataset: list,
     force_rebuild: bool = False,
     nfs_cache: Path | None = None,
+    multiarch: bool = False,
+    push_to_ecr: bool = False,
 ):
     """
     Builds the base images required for the dataset if they do not already exist.
@@ -248,6 +436,8 @@ def build_base_images(
         client (docker.DockerClient): Docker client to use for building the images
         dataset (list): List of test specs or dataset to build images for
         force_rebuild (bool): Whether to force rebuild the images even if they already exist
+        multiarch (bool): Build for both amd64 and arm64 using docker buildx
+        push_to_ecr (bool): Push multiarch manifest list to ECR (requires multiarch=True)
 
     Note that NFS cache is a Podman hack. It's not invalidated correctly, so it may lead to issues.
 
@@ -274,16 +464,29 @@ def build_base_images(
                 continue
         except docker.errors.ImageNotFound:
             pass
-        # Build the base image (if it does not exist or force rebuild is enabled)
+
         print(f"Building base image ({image_name})")
-        build_image(
-            image_name=image_name,
-            setup_scripts={},
-            dockerfile=dockerfile,
-            platform=platform,
-            client=client,
-            build_dir=BASE_IMAGE_BUILD_DIR / image_name.replace(":", "__"),
-        )
+        if multiarch:
+            ecr_tag = push_multiarch_to_ecr(image_name) if push_to_ecr else None
+            ecr_cache_tag = f"{ecr_tag}-cache" if ecr_tag else None
+            build_multiarch_image(
+                image_name=image_name,
+                setup_scripts={},
+                dockerfile=get_dockerfile_base_multiarch(),
+                build_dir=BASE_IMAGE_BUILD_DIR / image_name.replace(":", "__"),
+                push=push_to_ecr,
+                ecr_tag=ecr_tag,
+                ecr_cache_tag=ecr_cache_tag,
+            )
+        else:
+            build_image(
+                image_name=image_name,
+                setup_scripts={},
+                dockerfile=dockerfile,
+                platform=platform,
+                client=client,
+                build_dir=BASE_IMAGE_BUILD_DIR / image_name.replace(":", "__"),
+            )
 
     print("Base images built successfully.")
 
@@ -350,6 +553,8 @@ def build_env_images(
     force_rebuild: bool = False,
     max_workers: int = 4,
     batch_size: int = 1,
+    multiarch: bool = False,
+    push_to_ecr: bool = False,
 ):
     """
     Builds the environment images required for the dataset if they do not already exist.
@@ -359,13 +564,15 @@ def build_env_images(
         dataset (list): List of test specs or dataset to build images for
         force_rebuild (bool): Whether to force rebuild the images even if they already exist
         max_workers (int): Maximum number of workers to use for building images
+        multiarch (bool): Build for both amd64 and arm64 using docker buildx
+        push_to_ecr (bool): Push multiarch manifest list to ECR (requires multiarch=True)
     """
     # Get the environment images to build from the dataset
     if force_rebuild:
         env_image_keys = {x.env_image_key for x in get_test_specs_from_dataset(dataset)}
         for key in env_image_keys:
             remove_image(client, key, "quiet")
-    build_base_images(client, dataset, force_rebuild)
+    build_base_images(client, dataset, force_rebuild, multiarch=multiarch, push_to_ecr=push_to_ecr)
     configs_to_build = get_env_configs_to_build(client, dataset)
     if len(configs_to_build) == 0:
         print("No environment images need to be built.")
@@ -378,58 +585,82 @@ def build_env_images(
     # Build the environment images
     successful, failed = list(), list()
 
-    # Split into batches if batch_size is specified.
-    actual_batch_size = batch_size * max_workers
-    batched_configs_to_build = [
-        dict(list(configs_to_build.items())[i : i + actual_batch_size])
-        for i in range(0, len(configs_to_build), actual_batch_size)
-    ]
+    if multiarch:
+        # Multiarch builds are serialized — each uses the shared buildx builder
+        for image_name, config in tqdm(configs_to_build.items(), desc="Building env images (multiarch)"):
+            try:
+                ecr_tag = push_multiarch_to_ecr(image_name) if push_to_ecr else None
+                ecr_cache_tag = f"{ecr_tag}-cache" if ecr_tag else None
+                build_multiarch_image(
+                    image_name=image_name,
+                    setup_scripts={"setup_env.sh": config["setup_script"]},
+                    dockerfile=get_dockerfile_env_multiarch(),
+                    build_dir=ENV_IMAGE_BUILD_DIR / image_name.replace(":", "__"),
+                    push=push_to_ecr,
+                    ecr_tag=ecr_tag,
+                    ecr_cache_tag=ecr_cache_tag,
+                )
+                successful.append(image_name)
+            except BuildImageError as e:
+                print(f"BuildImageError {e.image_name}")
+                traceback.print_exc()
+                failed.append(image_name)
+            except Exception:
+                print(f"Error building multiarch env image {image_name}")
+                traceback.print_exc()
+                failed.append(image_name)
+    else:
+        actual_batch_size = batch_size * max_workers
+        batched_configs_to_build = [
+            dict(list(configs_to_build.items())[i : i + actual_batch_size])
+            for i in range(0, len(configs_to_build), actual_batch_size)
+        ]
 
-    with tqdm(
-        total=len(configs_to_build), smoothing=0, desc="Building environment images"
-    ) as pbar:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for configs_to_build in batched_configs_to_build:
-                # Create a future for each image to build
-                futures = {
-                    executor.submit(
-                        build_image,
-                        image_name,
-                        {"setup_env.sh": config["setup_script"]},
-                        config["dockerfile"],
-                        config["platform"],
-                        client,
-                        ENV_IMAGE_BUILD_DIR / image_name.replace(":", "__"),
-                        test_spec=config["test_spec"],
-                        env_mode=True,  # This is just for skipping envs that won't build.
-                        force_rebuild=force_rebuild,
-                    ): image_name
-                    for image_name, config in configs_to_build.items()
-                }
+        with tqdm(
+            total=len(configs_to_build), smoothing=0, desc="Building environment images"
+        ) as pbar:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                for configs_to_build in batched_configs_to_build:
+                    # Create a future for each image to build
+                    futures = {
+                        executor.submit(
+                            build_image,
+                            image_name,
+                            {"setup_env.sh": config["setup_script"]},
+                            config["dockerfile"],
+                            config["platform"],
+                            client,
+                            ENV_IMAGE_BUILD_DIR / image_name.replace(":", "__"),
+                            test_spec=config["test_spec"],
+                            env_mode=True,  # This is just for skipping envs that won't build.
+                            force_rebuild=force_rebuild,
+                        ): image_name
+                        for image_name, config in configs_to_build.items()
+                    }
 
-                # Wait for each future to complete
-                for future in as_completed(futures):
-                    pbar.update(1)
-                    try:
-                        # Update progress bar, check if image built successfully
-                        future.result()
-                        successful.append(futures[future])
-                    except BuildImageError as e:
-                        print(f"BuildImageError {e.image_name}")
-                        traceback.print_exc()
-                        failed.append(futures[future])
-                        continue
-                    except Exception:
-                        print("Error building image")
-                        traceback.print_exc()
-                        failed.append(futures[future])
-                        continue
+                    # Wait for each future to complete
+                    for future in as_completed(futures):
+                        pbar.update(1)
+                        try:
+                            # Update progress bar, check if image built successfully
+                            future.result()
+                            successful.append(futures[future])
+                        except BuildImageError as e:
+                            print(f"BuildImageError {e.image_name}")
+                            traceback.print_exc()
+                            failed.append(futures[future])
+                            continue
+                        except Exception:
+                            print("Error building image")
+                            traceback.print_exc()
+                            failed.append(futures[future])
+                            continue
 
-                # # After each batch parallel completes, run docker system prune to free up space.
-                # print("Pruning batched images to free up space...")
-                # client.api.prune_containers()
-                # client.api.prune_images()
-                # client.api.prune_volumes()
+                    # # After each batch parallel completes, run docker system prune to free up space.
+                    # print("Pruning batched images to free up space...")
+                    # client.api.prune_containers()
+                    # client.api.prune_images()
+                    # client.api.prune_volumes()
 
     # Show how many images failed to build
     if len(failed) == 0:

@@ -29,6 +29,7 @@ import logging
 import multiprocessing
 import os
 import platform as platform_mod
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -129,6 +130,50 @@ def _agent_sent_message(events) -> bool:
     return False
 
 
+# ── Git helper ─────────────────────────────────────────────────────────
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_PATCH_SIZE_WARN_BYTES = 1_048_576  # 1 MiB soft cap
+
+
+class WorkspaceCommandError(RuntimeError):
+    """Raised when a workspace command fails with a non-zero exit code."""
+
+    def __init__(self, cmd: str, exit_code: int, stderr: str) -> None:
+        self.cmd = cmd
+        self.exit_code = exit_code
+        self.stderr = stderr
+        super().__init__(f"Command failed (exit {exit_code}): {cmd}\nstderr: {stderr}")
+
+
+def _run_cmd(workspace, cmd: str, *, critical: bool = True) -> str:
+    """Execute *cmd* in the workspace, return stdout.
+
+    If *critical* is True (default), raises WorkspaceCommandError on failure.
+    If False, logs a warning and returns empty string.
+    """
+    result = workspace.execute_command(cmd)
+
+    if result.timeout_occurred:
+        msg = f"Command timed out: {cmd}"
+        if critical:
+            raise WorkspaceCommandError(cmd, -1, msg)
+        logger.warning(msg)
+        return ""
+
+    if result.exit_code != 0:
+        if critical:
+            raise WorkspaceCommandError(cmd, result.exit_code, result.stderr)
+        logger.warning(
+            "Non-critical command failed (exit %d): %s\nstderr: %s",
+            result.exit_code,
+            cmd,
+            result.stderr,
+        )
+        return ""
+
+    return result.stdout.strip()
+
+
 def _run_conversation_loop(conversation, max_fake_responses: int) -> None:
     """Multi-turn conversation loop with fake user responses.
 
@@ -167,51 +212,73 @@ def _run_conversation_loop(conversation, max_fake_responses: int) -> None:
     logger.info("Conversation completed after %d fake responses", fake_count)
 
 
-def _extract_patch(workspace, instance: dict, working_dir: str) -> str:
-    """Extract git patch from the workspace using official diff format.
+def _extract_patch(
+    workspace, pre_agent_commit: str, working_dir: str
+) -> tuple[str, list[str]]:
+    """Extract git patch of agent-only changes.
 
-    Uses ``git diff --binary`` against base_commit for eval compatibility.
+    Returns (patch_text, warnings). Diffs the working tree against the
+    pre-agent commit so only the agent's edits are captured.
     """
-    base_commit = instance.get("base_commit", "")
+    warnings: list[str] = []
 
-    commands = [
-        f"cd {working_dir} && git add -A",
-    ]
+    head_check = workspace.execute_command(f"test -f {working_dir}/.git/HEAD")
+    if head_check.exit_code != 0:
+        warnings.append("No .git/HEAD found — workspace git repo may be corrupted")
+        logger.warning("_extract_patch: %s", warnings[-1])
+        return "", warnings
 
-    binary_extensions = ("*.o", "*.so", "*.a", "*.dylib", "*.dll", "*.pyc", "*.pyo")
-    for ext in binary_extensions:
-        commands.append(
-            f"cd {working_dir} && git diff --cached --name-only --diff-filter=A "
-            f"| grep '{ext}$' | xargs -r git reset HEAD -- 2>/dev/null || true"
-        )
-
-    commands.append(
-        f"cd {working_dir} && git commit --no-verify --allow-empty -m 'agent patch'"
+    _run_cmd(
+        workspace,
+        f"cd {working_dir} && grep -qF '__pycache__/' .git/info/exclude 2>/dev/null"
+        f" || printf '__pycache__/\\n*.pyc\\n*.pyo\\n.pytest_cache/\\n' >> .git/info/exclude",
+        critical=False,
     )
 
-    if base_commit:
-        diff_cmd = (
-            f"cd {working_dir} && git --no-pager diff --binary {base_commit} HEAD"
+    add_result = workspace.execute_command(f"cd {working_dir} && git add -A")
+    if add_result.exit_code != 0:
+        warnings.append(
+            f"git add -A failed (exit {add_result.exit_code}): {add_result.stderr}"
         )
-    else:
-        diff_cmd = f"cd {working_dir} && git --no-pager diff --binary HEAD~1 HEAD"
-    commands.append(diff_cmd)
+        logger.warning("_extract_patch: %s", warnings[-1])
 
-    for cmd in commands[:-1]:
-        try:
-            result = workspace.execute_command(cmd)
-            if hasattr(result, "exit_code") and result.exit_code != 0:
-                logger.debug("Command returned %d: %s", result.exit_code, cmd)
-        except Exception:
-            logger.debug("Command failed (non-critical): %s", cmd)
+    status_output = _run_cmd(
+        workspace, f"cd {working_dir} && git status --porcelain", critical=False
+    )
 
     try:
-        result = workspace.execute_command(commands[-1])
-        patch_text = result.stdout if hasattr(result, "stdout") else str(result)
-        return patch_text.strip() if patch_text else ""
-    except Exception:
-        logger.exception("Failed to extract patch")
-        return ""
+        diff_result = workspace.execute_command(
+            f"cd {working_dir} && git --no-pager diff --no-color {pre_agent_commit}"
+        )
+    except Exception as e:
+        warnings.append(f"git diff raised exception: {e}")
+        logger.error("_extract_patch: %s", warnings[-1])
+        return "", warnings
+
+    if diff_result.exit_code != 0:
+        warnings.append(
+            f"git diff exited {diff_result.exit_code}: {diff_result.stderr}"
+        )
+        logger.error("_extract_patch: %s", warnings[-1])
+        return "", warnings
+
+    patch_text = diff_result.stdout.strip() if diff_result.stdout else ""
+
+    if not patch_text and status_output:
+        warnings.append(
+            f"git diff is empty but git status shows changes: {status_output[:500]}"
+        )
+        logger.warning("_extract_patch: %s", warnings[-1])
+
+    patch_bytes = len(patch_text.encode("utf-8"))
+    if patch_bytes > _PATCH_SIZE_WARN_BYTES:
+        warnings.append(
+            f"Patch is {patch_bytes:,} bytes ({patch_bytes / 1_048_576:.1f} MiB) — "
+            "may include non-agent changes"
+        )
+        logger.warning("_extract_patch: %s", warnings[-1])
+
+    return patch_text, warnings
 
 
 def _capture_conversation_archive(workspace, instance_id: str, log_dir: Path) -> None:
@@ -229,14 +296,11 @@ def _capture_conversation_archive(workspace, instance_id: str, log_dir: Path) ->
         )
         result = workspace.execute_command(conv_cmd)
 
-        stdout = result.stdout if hasattr(result, "stdout") else str(result)
-        exit_code = result.exit_code if hasattr(result, "exit_code") else 0
-
-        if exit_code == 0 and stdout.strip():
+        if result.exit_code == 0 and result.stdout.strip():
             conv_dir = log_dir.parent / "conversations"
             conv_dir.mkdir(parents=True, exist_ok=True)
             conv_tar = conv_dir / f"{instance_id}.tar.gz"
-            conv_tar.write_bytes(base64.b64decode(stdout.strip()))
+            conv_tar.write_bytes(base64.b64decode(result.stdout.strip()))
             logger.info("Saved conversation archive: %s", conv_tar)
         else:
             logger.debug("No conversation archive for %s", instance_id)
@@ -341,16 +405,37 @@ def process_instance_openhands(
         repo_dir = f"{repo.replace('/', '__')}__{version}" if repo else "testbed"
         working_dir = f"/workspace/{repo_dir}"
 
-        setup_commands = [
-            f"cp -r /testbed/. {working_dir}/",
-            f"cd {working_dir} && git reset --hard",
+        # ── Non-critical setup (git config, env vars) ──────────────
+        for cmd in GIT_SETUP_COMMANDS + ENV_SETUP_COMMANDS:
+            _run_cmd(workspace, cmd, critical=False)
+
+        # ── Critical setup (workspace copy + git state) ────────────
+        # Fix permissions on /testbed/ files created during image build
+        # (e.g. .pdm-build owned by root with 700 perms) before copying.
+        _run_cmd(workspace, "chmod -R a+rX /testbed/ 2>/dev/null || true", critical=False)
+        # cp may exit 1 due to permission-denied on non-essential dirs
+        # (e.g. .pdm-build), so we make it non-critical and verify .git below.
+        _run_cmd(workspace, f"cp -r /testbed/. {working_dir}/", critical=False)
+        _run_cmd(workspace, f"cd {working_dir} && git reset --hard")
+        _run_cmd(
+            workspace,
             f"cd {working_dir} && git remote remove origin 2>/dev/null || true",
-        ]
-        for cmd in GIT_SETUP_COMMANDS + ENV_SETUP_COMMANDS + setup_commands:
-            try:
-                workspace.execute_command(cmd)
-            except Exception:
-                logger.debug("Setup command failed (non-critical): %s", cmd)
+            critical=False,
+        )
+
+        # ── Verify .git/HEAD exists (proves git repo is intact) ────
+        _run_cmd(workspace, f"test -f {working_dir}/.git/HEAD")
+
+        # ── Capture pre-agent commit for accurate diff later ───────
+        raw_sha = _run_cmd(workspace, f"cd {working_dir} && git rev-parse HEAD")
+        if not _SHA_RE.match(raw_sha):
+            raise WorkspaceCommandError(
+                "git rev-parse HEAD",
+                -1,
+                f"Expected 40-char hex SHA, got: {raw_sha!r}",
+            )
+        pre_agent_commit = raw_sha
+        logger.info("[SETUP] %s: pre_agent_commit=%s", instance_id, pre_agent_commit)
 
         llm = _load_llm(llm_config_path)
 
@@ -390,17 +475,41 @@ def process_instance_openhands(
                 conversation_error,
             )
 
-        git_patch = _extract_patch(workspace, instance, working_dir)
+        git_patch, extraction_warnings = _extract_patch(
+            workspace, pre_agent_commit, working_dir
+        )
 
         if git_patch:
-            patch_path.write_text(git_patch)
+            patch_path.write_text(git_patch, encoding="utf-8")
+            written_size = patch_path.stat().st_size
+            expected_size = len(git_patch.encode("utf-8"))
+            if written_size != expected_size:
+                extraction_warnings.append(
+                    f"Patch file size mismatch: wrote {written_size}, "
+                    f"expected {expected_size}"
+                )
+                logger.error(
+                    "[PATCH] %s: %s", instance_id, extraction_warnings[-1]
+                )
 
         cost = llm.metrics.accumulated_cost if hasattr(llm, "metrics") else 0.0
         metrics = {}
         if hasattr(conversation, "conversation_stats"):
             stats = conversation.conversation_stats
             if hasattr(stats, "get_combined_metrics"):
-                metrics = stats.get_combined_metrics()
+                raw_metrics = stats.get_combined_metrics()
+                # Serialize Pydantic model to dict (avoids string serialization bug)
+                if hasattr(raw_metrics, "model_dump"):
+                    metrics = raw_metrics.model_dump()
+                elif isinstance(raw_metrics, dict):
+                    metrics = raw_metrics
+                else:
+                    metrics = {}
+                # Prefer conversation_stats cost over llm.metrics cost
+                # (they may be different Metrics objects)
+                stats_cost = getattr(raw_metrics, "accumulated_cost", None)
+                if stats_cost and stats_cost > 0:
+                    cost = stats_cost
 
         history_serialized = []
         for evt in events_log:
@@ -427,6 +536,7 @@ def process_instance_openhands(
             metrics=metrics,
             cost=cost,
             model_name=model_name,
+            extraction_warnings=extraction_warnings,
         )
         write_eval_output(result, output_jsonl)
 

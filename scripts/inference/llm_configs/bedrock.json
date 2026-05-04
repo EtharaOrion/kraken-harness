@@ -1,6 +1,5 @@
 {
     "model": "bedrock/converse/global.anthropic.claude-opus-4-6-v1",
-    "api_base": "http://helicone.prod.ethara.ai:9090",
     "aws_region_name": "ap-south-1",
     "extended_thinking_budget": null,
     "reasoning_effort": null,

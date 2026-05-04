@@ -46,6 +46,18 @@ class Repo:
         self.token = token
         self.api = GhApi(token=token)
         self.repo = self.call_api(self.api.repos.get, owner=owner, repo=name)
+        # GitHub API may redirect to a fork if the token owner has one.
+        # Force canonical owner/name to prevent fork resolution issues.
+        if self.repo is not None:
+            canonical = f"{owner}/{name}"
+            if self.repo.full_name != canonical:
+                logger.warning(
+                    f"GitHub resolved {canonical} as {self.repo.full_name} "
+                    f"(token user's fork). Forcing canonical name."
+                )
+                self.repo.full_name = canonical
+                self.repo.owner.login = owner
+                self.repo.name = name
 
     def call_api(self, func: Callable, **kwargs) -> dict | None:
         """

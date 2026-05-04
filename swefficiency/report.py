@@ -20,7 +20,7 @@ import json
 import multiprocessing
 from functools import partial
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import datasets
 import pandas as pd
@@ -30,14 +30,42 @@ from swefficiency.harness.log_parsers import MAP_REPO_TO_PARSER
 
 
 def parse_perf_summary(perf_summary: str) -> Dict[str, float]:
-    """Parse performance summary file content."""
-    perf_lines = perf_summary.strip().splitlines()
+    """Parse performance summary file content.
 
-    before_mean = float(perf_lines[0].split(":")[1].strip())
-    before_std = float(perf_lines[1].split(":")[1].strip())
-    after_mean = float(perf_lines[2].split(":")[1].strip())
-    after_std = float(perf_lines[3].split(":")[1].strip())
-    improvement = (after_mean - before_mean) / before_mean * 100
+    Expected format (4 lines, each with 'label: value'):
+        Before Mean: <float>
+        Before Std: <float>
+        After Mean: <float>
+        After Std: <float>
+
+    Returns default values (all zeros, 0% improvement) on malformed input.
+    """
+    try:
+        perf_lines = perf_summary.strip().splitlines()
+        if len(perf_lines) < 4:
+            raise ValueError(
+                f"Expected at least 4 lines, got {len(perf_lines)}"
+            )
+
+        before_mean = float(perf_lines[0].split(":")[1].strip())
+        before_std = float(perf_lines[1].split(":")[1].strip())
+        after_mean = float(perf_lines[2].split(":")[1].strip())
+        after_std = float(perf_lines[3].split(":")[1].strip())
+    except (IndexError, ValueError) as e:
+        print(f"Warning: Failed to parse perf_summary: {e}")
+        return {
+            "before_mean": 0.0,
+            "after_mean": 0.0,
+            "before_std": 0.0,
+            "after_std": 0.0,
+            "improvement": 0.0,
+        }
+
+    improvement = (
+        (after_mean - before_mean) / before_mean * 100
+        if before_mean != 0
+        else 0.0
+    )
 
     return {
         "before_mean": before_mean,
@@ -82,33 +110,80 @@ def evaluate_instance(
     gold_run_entry = gold_run / instance_id / "perf_summary.txt"
     pred_run_entry = pred_run / instance_id / "perf_summary.txt"
 
+    # Track data quality flags
+    data_quality_flags = []
+    has_pred_perf = pred_run_entry.exists()
+    has_gold_perf = gold_run_entry.exists()
+
     # Compute prediction speedup ratio.
-    if pred_run_entry.exists():
+    if has_pred_perf:
         pred_perf_info = parse_perf_summary(pred_run_entry.read_text())
+        after_mean = pred_perf_info["after_mean"]
         pred_speedup_ratio = (
-            pred_perf_info["before_mean"] / pred_perf_info["after_mean"]
+            pred_perf_info["before_mean"] / after_mean if after_mean != 0 else 1.0
         )
     else:
         pred_speedup_ratio = 1.0  # No speedup if no prediction run exists
+        # Check if patch was corrupt (couldn't be applied)
+        patch_diff = pred_run / instance_id / "patch.diff"
+        if patch_diff.exists():
+            patch_text = patch_diff.read_text()
+            if "error:" in patch_text.lower() or len(patch_text.strip()) == 0:
+                data_quality_flags.append("CORRUPT_PATCH")
+            else:
+                data_quality_flags.append("NO_PERF_DATA")
+        else:
+            data_quality_flags.append("NO_PERF_DATA")
 
     # Compute gold speedup ratio.
-    if gold_run_entry.exists():
+    if has_gold_perf:
         gold_perf_info = parse_perf_summary(gold_run_entry.read_text())
+        after_mean = gold_perf_info["after_mean"]
         gold_speedup_ratio = (
-            gold_perf_info["before_mean"] / gold_perf_info["after_mean"]
+            gold_perf_info["before_mean"] / after_mean if after_mean != 0 else 1.0
         )
     else:
         gold_speedup_ratio = 1.0
         gold_perf_info = {"before_mean": 0.0}
 
-    # Check that pass to pass tests are still passing.
-    correctness_dir = pred_run / instance_id / "raw_correctness_output"
+    # Flag gold slowdowns
+    if gold_speedup_ratio < 1.0:
+        data_quality_flags.append("GOLD_SLOWDOWN")
+
     num_modified_lines = get_number_of_patch_modified_lines(instance["patch"])
 
-    if not correctness_dir.exists():
+    # If there are no PASS_TO_PASS tests, correctness is vacuously 1.0.
+    # This handles instances where covering_tests point to non-test files
+    # (e.g. CI configs, requirements files) and no Python tests exist.
+    # Standard practice: SWE-bench treats empty PASS_TO_PASS as vacuously correct.
+    if not pass_to_pass:
+        data_quality_flags.append("UNVERIFIABLE_CORRECTNESS")
         return {
             "instance_id": instance_id,
-            "raw_pred_speedup_ratio": 1.0,
+            "raw_pred_speedup_ratio": pred_speedup_ratio,
+            "pred_speedup_ratio": pred_speedup_ratio,
+            "gold_speedup_ratio": gold_speedup_ratio,
+            "human_speedup_ratio": (
+                pred_speedup_ratio / gold_speedup_ratio
+                if gold_speedup_ratio != 0
+                else 0
+            ),
+            "correctness": 1.0,
+            "correctness_pct": 1.0,
+            "pre_edit_runtime": gold_perf_info["before_mean"],
+            "patch_length": num_modified_lines,
+            "has_pred_perf": has_pred_perf,
+            "data_quality": "|".join(data_quality_flags) if data_quality_flags else "PERF_ONLY",
+        }
+
+    # Check that pass to pass tests are still passing.
+    correctness_dir = pred_run / instance_id / "raw_correctness_output"
+
+    if not correctness_dir.exists():
+        data_quality_flags.append("NO_CORRECTNESS_DATA")
+        return {
+            "instance_id": instance_id,
+            "raw_pred_speedup_ratio": pred_speedup_ratio,
             "pred_speedup_ratio": 1.0,
             "gold_speedup_ratio": gold_speedup_ratio,
             "human_speedup_ratio": (
@@ -118,6 +193,8 @@ def evaluate_instance(
             "correctness_pct": 0.0,
             "pre_edit_runtime": gold_perf_info["before_mean"],
             "patch_length": num_modified_lines,
+            "has_pred_perf": has_pred_perf,
+            "data_quality": "|".join(data_quality_flags) if data_quality_flags else "NO_CORRECTNESS_DATA",
         }
 
     if not use_correctness_files:
@@ -141,6 +218,14 @@ def evaluate_instance(
     correctness_pct = len(passed_tests) / len(pass_to_pass) if pass_to_pass else 1.0
     adjusted_pred_speedup_ratio = 1.0 if correctness_pct != 1.0 else pred_speedup_ratio
 
+    # Determine data quality for verified instances
+    if correctness_pct == 1.0 and has_pred_perf:
+        quality = "VERIFIED"
+    elif not data_quality_flags:
+        quality = "VERIFIED"
+    else:
+        quality = "|".join(data_quality_flags)
+
     return {
         "instance_id": instance_id,
         "raw_pred_speedup_ratio": pred_speedup_ratio,
@@ -154,13 +239,20 @@ def evaluate_instance(
         "correctness": 0.0 if correctness_pct != 1.0 else 1.0,
         "correctness_pct": correctness_pct,
         "pre_edit_runtime": gold_perf_info["before_mean"],
-        "patch_length": len(instance["patch"].splitlines()),
+        "patch_length": num_modified_lines,
+        "has_pred_perf": has_pred_perf,
+        "data_quality": quality,
     }
 
 
 def compute_performance_breakdown(df: pd.DataFrame) -> Dict:
     """
     Compute performance breakdown metrics from evaluation results.
+
+    Instances without actual perf data (has_pred_perf=False) are EXCLUDED from
+    the 4-way category proportions and overall score. They are reported separately
+    as 'proportion_excluded'. This prevents fake SR=1.0 defaults from polluting
+    the category breakdown.
 
     Args:
         df: DataFrame with evaluation results
@@ -177,52 +269,102 @@ def compute_performance_breakdown(df: pd.DataFrame) -> Dict:
             "proportion_correct_but_no_speedup": 0.0,
             "proportion_correct_with_speedup_but_human_no_speedup": 0.0,
             "proportion_human_speedup_or_better": 0.0,
+            "proportion_excluded": 0.0,
         }
 
-    # Compute harmonic mean of human speedup ratios (overall score)
-    # Floor human_speedup_ratio at 0.001 (capping effective gold speedup at
-    # 1000x) to prevent extreme outliers from dominating the benchmark score.
-    floored_human_speedup = df["human_speedup_ratio"].clip(lower=0.001)
-    overall_score = total_instances / (1 / floored_human_speedup).sum()
+    # Separate evaluable instances (has actual perf data) from excluded ones
+    has_perf_col = "has_pred_perf" in df.columns
+    if has_perf_col:
+        evaluable = df[df["has_pred_perf"] == True]
+        excluded = df[df["has_pred_perf"] == False]
+    else:
+        evaluable = df
+        excluded = df.iloc[0:0]  # empty
 
-    # Proportion incorrect (correctness < 1.0)
-    incorrect_instances = (df["correctness"] < 1.0).sum()
-    proportion_incorrect = incorrect_instances / total_instances
+    effective_n = len(evaluable)
+    n_excluded = len(excluded)
 
-    # Proportion correct but no speedup
+    # Overall score computed ONLY over evaluable instances
+    if effective_n > 0:
+        eval_floored = evaluable["human_speedup_ratio"].clip(lower=0.001)
+        overall_score = effective_n / (1 / eval_floored).sum()
+    else:
+        overall_score = 0.0
+
+    # 4-way category proportions computed ONLY over evaluable instances
+    # Then divided by total_instances so all 5 proportions (4 + excluded) sum to 1.0
+    incorrect_instances = (evaluable["correctness"] < 1.0).sum() if effective_n > 0 else 0
+
     correct_but_no_speedup = (
-        (df["correctness"] == 1.0) & (df["raw_pred_speedup_ratio"] < 1.0)
-    ).sum()
-    proportion_correct_but_no_speedup = correct_but_no_speedup / total_instances
+        (evaluable["correctness"] == 1.0) & (evaluable["raw_pred_speedup_ratio"] < 1.0)
+    ).sum() if effective_n > 0 else 0
 
-    # Proportion correct with speedup but human no speedup
     correct_with_speedup_but_human_no_speedup = (
-        (df["correctness"] == 1.0)
-        & (df["raw_pred_speedup_ratio"] >= 1.0)
-        & (df["human_speedup_ratio"] < 1.0)
-    ).sum()
-    proportion_correct_with_speedup_but_human_no_speedup = (
-        correct_with_speedup_but_human_no_speedup / total_instances
-    )
+        (evaluable["correctness"] == 1.0)
+        & (evaluable["raw_pred_speedup_ratio"] >= 1.0)
+        & (evaluable["human_speedup_ratio"] < 1.0)
+    ).sum() if effective_n > 0 else 0
 
-    # Proportion with human speedup or better
-    human_speedup_or_better = (df["human_speedup_ratio"] >= 1.0).sum()
-    proportion_human_speedup_or_better = human_speedup_or_better / total_instances
+    human_speedup_or_better = (
+        (evaluable["correctness"] == 1.0)
+        & (evaluable["raw_pred_speedup_ratio"] >= 1.0)
+        & (evaluable["human_speedup_ratio"] >= 1.0)
+    ).sum() if effective_n > 0 else 0
 
-    return {
+    result = {
         "total_instances": total_instances,
+        "effective_n": effective_n,
+        "instances_excluded": n_excluded,
         "overall_score": round(overall_score, 4),
-        "proportion_incorrect": round(proportion_incorrect, 4),
+        "proportion_incorrect": round(incorrect_instances / total_instances, 4),
         "proportion_correct_but_no_speedup": round(
-            proportion_correct_but_no_speedup, 4
+            correct_but_no_speedup / total_instances, 4
         ),
         "proportion_correct_with_speedup_but_human_no_speedup": round(
-            proportion_correct_with_speedup_but_human_no_speedup, 4
+            correct_with_speedup_but_human_no_speedup / total_instances, 4
         ),
         "proportion_human_speedup_or_better": round(
-            proportion_human_speedup_or_better, 4
+            human_speedup_or_better / total_instances, 4
         ),
+        "proportion_excluded": round(n_excluded / total_instances, 4),
     }
+
+    # Count correctness-verified vs unverifiable
+    verified_correct = 0
+    unverifiable_correct = 0
+    if "data_quality" in df.columns:
+        verified_correct = len(df[
+            (df["correctness"] == 1.0) &
+            (~df["data_quality"].str.contains("UNVERIFIABLE", na=False)) &
+            (~df["data_quality"].str.contains("PERF_ONLY", na=False)) &
+            (~df["data_quality"].str.contains("NO_PERF", na=False)) &
+            (~df["data_quality"].str.contains("CORRUPT", na=False))
+        ])
+        unverifiable_correct = len(df[
+            df["data_quality"].str.contains("UNVERIFIABLE", na=False)
+        ])
+
+    result["correctness_verified_count"] = verified_correct
+    result["correctness_unverifiable_count"] = unverifiable_correct
+    result["caveats"] = []
+    if n_excluded > 0:
+        result["caveats"].append(
+            f"{n_excluded} instance(s) excluded from score — no perf data "
+            f"(corrupt patch or eval failure). NOT included in overall_score or category proportions."
+        )
+    if unverifiable_correct > 0:
+        result["caveats"].append(
+            f"{unverifiable_correct} instance(s) have empty PASS_TO_PASS tests; "
+            f"correctness is vacuously 1.0 (standard SWE-bench practice, disclosed)"
+        )
+    gold_slowdowns = (df["gold_speedup_ratio"] < 1.0).sum()
+    if gold_slowdowns > 0:
+        result["caveats"].append(
+            f"{gold_slowdowns} instance(s) where gold expert patch actually slows code down; "
+            f"model can 'beat expert' by regressing less"
+        )
+
+    return result
 
 
 def generate_report(
@@ -231,7 +373,7 @@ def generate_report(
     output_dir: Path,
     num_workers: int = 4,
     dataset_name: str = "swefficiency/swefficiency",
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, Dict, Path, Path]:
     """
     Generate evaluation report comparing gold and prediction runs.
 

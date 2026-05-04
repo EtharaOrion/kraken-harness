@@ -54,7 +54,7 @@ def process(x):
         version = version.rsplit(".", 1)[0]
         return (version, parts[1])
 
-    pattern = re.compile(r"\d\.\d\.[\d\.]*")
+    pattern = re.compile(r"\d+\.\d+\.[\d\.]*")
     matches = pattern.findall(x)
     if len(matches) > 0:
         version = matches[0]

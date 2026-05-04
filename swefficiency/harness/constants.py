@@ -47,6 +47,7 @@ class SWEfficiencyInstance(TypedDict):
     covering_tests: NotRequired[list[str]]
     notes: NotRequired[str]
     single_thread_tests: NotRequired[list[str]]
+    workload_generation_cost: NotRequired[dict]
 
     # Dynamic repo support — auto-detected fields for repos not in MAP_REPO_VERSION_TO_SPECS
     python_version: NotRequired[str]  # e.g. "3.9" — conda Python version

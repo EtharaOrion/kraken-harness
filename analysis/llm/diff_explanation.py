@@ -101,6 +101,7 @@ def extract_json_objects(s: str):
 
 
 import multiprocessing
+import os
 import time
 
 import datasets
@@ -160,7 +161,7 @@ def worker(instance):
     for _ in range(5):
         try:
             response = completion(
-                model="gemini/gemini-2.5-flash",
+                model=os.environ.get("ANALYSIS_MODEL", "bedrock/converse/global.anthropic.claude-opus-4-7"),
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {
@@ -168,10 +169,9 @@ def worker(instance):
                         "content": USER_PROMPT.format(diff=diff, workload=workload),
                     },
                 ],
-                temperature=0.0,
                 metadata=helicone_metadata(
                     call_type="analysis",
-                    model_id="gemini-2.5-flash",
+                    model_id=os.environ.get("ANALYSIS_MODEL", "bedrock/converse/global.anthropic.claude-opus-4-7").split("/")[-1],
                     extra={
                         "Script": "diff_explanation",
                         "InstanceId": instance["instance_id"],

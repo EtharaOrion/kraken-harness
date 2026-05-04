@@ -40,9 +40,26 @@ class OpenHandsResult:
     cost: float = 0.0
     model_name: str = ""
     attempt: int = 1
+    extraction_warnings: list[str] = field(default_factory=list)
     timestamp: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
+
+
+def _validate_result(result: OpenHandsResult) -> list[str]:
+    """Return a list of validation errors (empty = valid)."""
+    errors: list[str] = []
+    if not result.instance_id:
+        errors.append("instance_id is empty")
+    if result.git_patch is None:
+        errors.append("git_patch is None (should be empty string if no changes)")
+    if not result.instruction:
+        errors.append("instruction is empty")
+    if result.status not in ("success", "error", "skipped", "max_iterations"):
+        errors.append(f"invalid status: {result.status!r}")
+    if result.status == "success" and result.cost <= 0:
+        errors.append(f"cost is non-positive for successful run: {result.cost}")
+    return errors
 
 
 def write_eval_output(
@@ -50,6 +67,14 @@ def write_eval_output(
     output_jsonl: Path,
 ) -> None:
     """Append one result to the output.jsonl file (thread-safe)."""
+    validation_errors = _validate_result(result)
+    if validation_errors:
+        logger.warning(
+            "Output validation warnings for %s: %s",
+            result.instance_id,
+            "; ".join(validation_errors),
+        )
+
     record = {
         "instance_id": result.instance_id,
         "attempt": result.attempt,
@@ -58,6 +83,8 @@ def write_eval_output(
         "error": result.error,
         "history": result.history,
         "metrics": result.metrics,
+        "extraction_warnings": result.extraction_warnings,
+        "validation_errors": validation_errors,
         "metadata": {
             "model_name": result.model_name,
             "cost": result.cost,

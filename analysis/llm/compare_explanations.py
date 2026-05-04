@@ -200,6 +200,7 @@ Return the JSON object as specified in the system prompt.
 """
 
 import multiprocessing
+import os
 import time
 
 import datasets
@@ -277,7 +278,7 @@ for model_name in model_names:
         for attempt in range(10):
             try:
                 response = completion(
-                    model="gemini/gemini-2.5-flash",
+                    model=os.environ.get("ANALYSIS_MODEL", "bedrock/converse/global.anthropic.claude-opus-4-7"),
                     messages=[
                         {"role": "system", "content": SYSTEM_PROMPT},
                         {"role": "user", "content": user_prompt},
@@ -286,10 +287,9 @@ for model_name in model_names:
                             "content": "Think step-by-step about the code changes and their performance implications, then output the JSON object as specified.",
                         },
                     ],
-                    temperature=0.0,
                     metadata=helicone_metadata(
                         call_type="analysis",
-                        model_id="gemini-2.5-flash",
+                        model_id=os.environ.get("ANALYSIS_MODEL", "bedrock/converse/global.anthropic.claude-opus-4-7").split("/")[-1],
                         extra={
                             "Script": "compare_explanations",
                             "InstanceId": instance["instance_id"],

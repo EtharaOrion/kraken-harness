@@ -27,7 +27,7 @@ MAP_REPO_TO_VERSION_PATHS = {
     "marshmallow-code/marshmallow": ["src/marshmallow/__init__.py"],
     "modin-project/modin": ["modin/__init__.py"],
     "mwaskom/seaborn": ["seaborn/__init__.py"],
-    "pallets/flask": ["src/flask/__init__.py", "flask/__init__.py"],
+    "pallets/flask": ["src/flask/__init__.py", "flask/__init__.py", "pyproject.toml"],
     "pandas-dev/pandas": ["pandas/__init__.py"],
     "Project-MONAI/MONAI": ["monai/__init__.py"],
     "psf/requests": [
@@ -73,7 +73,6 @@ MAP_REPO_TO_VERSION_PATTERNS = {
         "marshmallow-code/marshmallow",
         "modin-project/modin",
         "mwaskom/seaborn",
-        "pallets/flask",
         "pandas-dev/pandas",
         "Project-MONAI/MONAI",
         "psf/requests",
@@ -147,4 +146,33 @@ MAP_REPO_TO_VERSION_PATTERNS.update(
 MAP_REPO_TO_VERSION_PATHS.update({"scikit-bio/scikit-bio": ["skbio/__init__.py"]})
 MAP_REPO_TO_VERSION_PATTERNS.update(
     {"scikit-bio/scikit-bio": [r'__version__ = [\'"](.*)[\'"]']}
+)
+
+# tiangolo/fastapi
+MAP_REPO_TO_VERSION_PATHS.update(
+    {"tiangolo/fastapi": ["fastapi/__init__.py", "pyproject.toml"]}
+)
+MAP_REPO_TO_VERSION_PATTERNS.update(
+    {"tiangolo/fastapi": [r'__version__ = [\'"](.*)[\'"]', r'version\s*=\s*[\'"](.*)[\'"]']}
+)
+
+# aio-libs/aiohttp
+MAP_REPO_TO_VERSION_PATHS.update(
+    {"aio-libs/aiohttp": ["aiohttp/__init__.py", "aiohttp/__version__.py"]}
+)
+MAP_REPO_TO_VERSION_PATTERNS.update(
+    {"aio-libs/aiohttp": [r'__version__ = [\'"](.*)[\'"]', r"VERSION = \((.*)\)"]}
+)
+
+# pallets/werkzeug
+MAP_REPO_TO_VERSION_PATHS.update(
+    {"pallets/werkzeug": ["src/werkzeug/__init__.py", "werkzeug/__init__.py", "pyproject.toml"]}
+)
+MAP_REPO_TO_VERSION_PATTERNS.update(
+    {"pallets/werkzeug": [r'__version__ = [\'"](.*)[\'"]', r"VERSION = \((.*)\)", r'version\s*=\s*[\'"]([\d.]+(?:\.dev\d*)?)[\'"]']}
+)
+
+# pallets/flask
+MAP_REPO_TO_VERSION_PATTERNS.update(
+    {"pallets/flask": [r'__version__ = [\'"](.*)[\'"]', r"VERSION = \((.*)\)", r'version\s*=\s*[\'"]([\d.]+(?:\.dev\d*)?)[\'"]']}
 )

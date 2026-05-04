@@ -32,6 +32,14 @@ def is_perf_pr(repo_name, pr):
     
     return constants.REPO_PERF_FILTERS['default'](pr)
 
+def is_ci_file(file_path: str) -> bool:
+    return any(pattern in file_path for pattern in constants.CI_FILE_PATTERNS)
+
+
+def is_deps_file(file_path: str) -> bool:
+    return any(pattern in file_path for pattern in constants.DEPS_FILE_PATTERNS)
+
+
 def main(args):
     # First, create output dir if not exists.
     output_dir = Path(args.output_dir)
@@ -74,7 +82,6 @@ def main(args):
         for instance in tqdm.tqdm(instances, desc="Writing instances"):
             is_in_perf_pr_numbers = instance['pull_number'] in perf_pr_numbers
             has_perf_keywords_in_text = constants.filter_content(instance['problem_statement'])
-            has_perf_keywords_in_text = False
             
             if not is_in_perf_pr_numbers and not has_perf_keywords_in_text:
                 continue
@@ -85,6 +92,12 @@ def main(args):
                 continue
             
             if any(utils.has_lock_file_change(file_name) for file_name, _, _ in edits):
+                continue
+
+            if all(is_ci_file(file_name) for file_name, _, _ in edits):
+                continue
+
+            if all(is_deps_file(file_name) for file_name, _, _ in edits):
                 continue
             
             print(json.dumps(instance), flush=True, file=output)

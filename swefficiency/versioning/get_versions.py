@@ -46,8 +46,9 @@ INSTALL_CMD = {
 _GENERIC_VERSION_PATTERNS = [
     r'__version__\s*=\s*[\'"]([^\'"]+)[\'"]',
     r'__version__\s*=\s*version\s*=\s*[\'"]([^\'"]+)[\'"]',
-    r'version\s*=\s*[\'"](\d+\.\d+[^\'"]*)[\'"]',
+    r'\bversion\s*=\s*[\'"](\d+\.\d+[^\'"]*)[\'"]',
     r"VERSION\s*=\s*\(([^)]+)\)",
+    r'VERSION\s*=\s*[\'"]([^\'"]+)[\'"]',
 ]
 
 
@@ -61,6 +62,8 @@ def _find_version_in_text(text: str, instance: dict) -> str:
     Returns:
         str: Version text, if found
     """
+    if text is None:
+        return None
     # Remove comments
     pattern = r'""".*?"""'
     text = re.sub(pattern, "", text, flags=re.DOTALL)
@@ -72,14 +75,16 @@ def _find_version_in_text(text: str, instance: dict) -> str:
         matches = re.search(pattern, text)
         if matches is not None:
             print(instance["repo"])
-            result = str(matches.group(1))
 
             if instance["repo"] == "pyvista/pyvista":
                 text = matches.group(0)
                 text = text.split("=")[-1].strip() if "=" in text else text.strip()
                 text = ".".join(text.split(","))
                 return text
-            elif instance["repo"] == "networkx/networkx":
+
+            result = str(matches.group(1))
+
+            if instance["repo"] == "networkx/networkx":
                 # Check if there are multiple groups.
                 if len(matches.groups()) > 1:
                     print(text)

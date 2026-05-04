@@ -35,7 +35,6 @@ BASE_PERF_KEYWORDS = [
     "optimization",
     "profiling",
     "accelerate",
-    "fast",
     "runtime",
     "efficiency",
     "benchmark",
@@ -45,7 +44,6 @@ BASE_PERF_KEYWORDS = [
     "parallel",
     "concurrency",
     "concurrent",
-    "profiling",
     "CPU usage",
     "memory usage",
     "resource usage",
@@ -54,6 +52,68 @@ BASE_PERF_KEYWORDS = [
     # Other common ones related to timing and benchmarks.
     "timeit",
     "asv",
+]
+
+# Keywords that require word-boundary matching to avoid false positives.
+# "fast" matches "FastAPI", "breakfast", etc. — use regex word boundary instead.
+WORD_BOUNDARY_KEYWORDS = [
+    "fast",
+]
+
+# Negative keywords: PRs matching these are likely NOT performance-related.
+# Applied after positive keyword match to reduce false positives.
+NEGATIVE_TITLE_KEYWORDS = [
+    # CI/automation
+    "bump",
+    "pin",
+    "pre-commit",
+    "dependabot",
+    "renovate",
+    "github actions",
+    "ci:",
+    "ci(",
+    "[ci]",
+    # Documentation
+    "translation",
+    "translate",
+    "typo",
+    "docs:",
+    "doc:",
+    "[docs]",
+    # Bug fixes (not perf)
+    "fix duplicate",
+    "fix mount",
+    "operationid",
+    "forwardref",
+    "backgroundtask",
+    "deprecat",
+    # Feature additions (not perf)
+    "eventsource",
+    "sse",
+]
+
+# Files that indicate CI-only changes (not real code).
+CI_FILE_PATTERNS = [
+    ".github/workflows/",
+    ".github/actions/",
+    ".circleci/",
+    ".travis.yml",
+    "Jenkinsfile",
+    "azure-pipelines",
+    ".gitlab-ci",
+    "tox.ini",
+    "noxfile.py",
+]
+
+# Files that indicate dependency-only changes (not real code).
+DEPS_FILE_PATTERNS = [
+    "requirements",
+    "setup.cfg",
+    "setup.py",
+    "pyproject.toml",
+    "Pipfile",
+    "poetry.lock",
+    "constraints.txt",
 ]
 
 
@@ -67,15 +127,25 @@ def remove_markdown_comments(input_str):
     return re.sub(r"<!--.*?-->", "", input_str, flags=re.DOTALL)
 
 
+def has_negative_title_keywords(pull: dict) -> bool:
+    title_lower = (pull.get("title") or "").lower()
+    return any(neg in title_lower for neg in NEGATIVE_TITLE_KEYWORDS)
+
+
 def filter_base(pull: dict, keywords=BASE_PERF_KEYWORDS):
+    if has_negative_title_keywords(pull):
+        return False
+
     pull_body = pull["body"] or ""
     pull_title = pull["title"] or ""
-    # pull_body = ""
 
     for item in [pull_body, pull_title]:
         item_lower = remove_markdown_comments(item.lower())
 
         if any(kw in item_lower for kw in BASE_PERF_KEYWORDS):
+            return True
+
+        if any(re.search(r'\b' + re.escape(kw) + r'\b', item_lower) for kw in WORD_BOUNDARY_KEYWORDS):
             return True
 
         if any(kw in item for kw in VERBATIM_KEYWORDS):
@@ -238,6 +308,55 @@ REPO_PERF_FILTERS = {
     "xarray": filter_xarray,
     # TODO: Rest of SWE-Gym?
 }
+
+
+def filter_flask(pull: dict):
+    if has_negative_title_keywords(pull):
+        return False
+
+    pr_title = (pull.get("title") or "").lower()
+
+    if check_labels(pull, ["performance", "perf"]):
+        return True
+
+    flask_perf_keywords = [
+        "perf", "speed", "efficiency", "performance", "optimize",
+        "benchmark", "latency", "throughput", "async", "cache",
+        "memory", "profil", "response time", "request handling",
+    ]
+    if any(kw in pr_title for kw in flask_perf_keywords):
+        return True
+
+    return False
+
+
+def filter_fastapi(pull: dict):
+    if has_negative_title_keywords(pull):
+        return False
+
+    pr_title = (pull.get("title") or "").lower()
+
+    if check_labels(pull, ["performance", "perf"]):
+        return True
+
+    fastapi_perf_keywords = [
+        "perf", "speed", "efficiency", "performance", "optimize",
+        "benchmark", "latency", "throughput", "async", "cache",
+        "memory", "profil", "response time", "middleware",
+        "streaming", "concurren",
+    ]
+    if any(kw in pr_title for kw in fastapi_perf_keywords):
+        return True
+
+    return False
+
+
+REPO_PERF_FILTERS.update(
+    {
+        "flask": filter_flask,
+        "fastapi": filter_fastapi,
+    }
+)
 
 # SWE-GYM
 

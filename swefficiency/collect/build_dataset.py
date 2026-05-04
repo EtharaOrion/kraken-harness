@@ -117,7 +117,7 @@ def has_test_patch(instance: dict) -> bool:
     return True
 
 
-def main(pr_file: str, output: str, token: Optional[str] = None):
+def main(pr_file: str, output: str, token: Optional[str] = None, canonical_repo: Optional[str] = None):
     """
     Main thread for creating task instances from pull requests
 
@@ -125,6 +125,7 @@ def main(pr_file: str, output: str, token: Optional[str] = None):
         pr_file (str): path to pull request JSONL file
         output (str): output file name
         token (str): GitHub token
+        canonical_repo (str): canonical owner/repo name (prevents GitHub fork resolution)
     """
     if token is None:
         # Get GitHub token from environment variable if not provided
@@ -170,25 +171,23 @@ def main(pr_file: str, output: str, token: Optional[str] = None):
             for ix, line in enumerate(open(pr_file)):
                 total_instances += 1
                 pull = json.loads(line)
+                pr_repo_name = canonical_repo or pull["base"]["repo"]["full_name"]
                 if ix % 100 == 0:
                     logger.info(
-                        f"[{pull['base']['repo']['full_name']}] (Up to {ix} checked) "
+                        f"[{pr_repo_name}] (Up to {ix} checked) "
                         f"{completed} valid, {with_tests} with tests."
                     )
-                # Construct instance fields
                 instance_id = (
-                    pull["base"]["repo"]["full_name"] + "-" + str(pull["number"])
+                    pr_repo_name + "-" + str(pull["number"])
                 )
                 instance_id = instance_id.replace("/", "__")
                 if instance_id in seen_prs:
                     seen_prs -= {instance_id}
                     continue
                 if not is_valid_pull(pull):
-                    # Throw out invalid PRs
                     continue
 
-                # Create task instance
-                repo_name = pull["base"]["repo"]["full_name"]
+                repo_name = pr_repo_name
                 if repo_name not in repos:
                     repos[repo_name] = load_repo(repo_name)
                 repo = repos[repo_name]

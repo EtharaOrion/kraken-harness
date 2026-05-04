@@ -29,7 +29,10 @@ from swefficiency.harness.docker_build import (
     build_image,
     build_instance_image,
     build_instance_images,
+    build_multiarch_image,
     close_logger,
+    ensure_buildx_builder,
+    push_multiarch_to_ecr,
     setup_logger,
 )
 from swefficiency.harness.docker_utils import (

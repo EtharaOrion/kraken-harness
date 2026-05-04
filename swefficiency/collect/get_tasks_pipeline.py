@@ -90,7 +90,7 @@ def construct_data_files(data: dict):
             path_task = os.path.join(path_tasks, f"{repo_name}-task-instances.jsonl")
             if not os.path.exists(path_task):
                 print(f"Task instance data for {repo} not found, creating...")
-                build_dataset(path_pr, path_task, token)
+                build_dataset(path_pr, path_task, token, canonical_repo=repo)
                 print(
                     f"✅ Successfully saved task instance data for {repo} to {path_task}"
                 )

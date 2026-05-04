@@ -27,7 +27,7 @@ from tqdm import tqdm
 
 from swefficiency.harness.constants import SWEfficiencyInstance
 from swefficiency.harness.utils import load_swefficiency_dataset
-from swefficiency.observability import helicone_metadata, setup_helicone
+from swefficiency.observability import helicone_metadata, safe_completion_cost, setup_helicone
 
 WORKLOAD_GENERATION_DIR = Path("logs/workload_generation")
 
@@ -146,7 +146,7 @@ def worker_function(
         try:
             model_name = os.environ.get(
                 "WORKLOAD_MODEL",
-                "bedrock/converse/global.anthropic.claude-opus-4-6-v1",
+                "bedrock/converse/global.anthropic.claude-opus-4-7",
             )
             api_base = os.environ.get("AWS_BEDROCK_RUNTIME_ENDPOINT")
             response = completion(
@@ -166,7 +166,6 @@ def worker_function(
                         "content": "Can you write a workload in same style as the example?",
                     },
                 ],
-                temperature=0.0,
                 api_base=api_base,
                 metadata=helicone_metadata(
                     call_type="synthetic",
@@ -182,6 +181,13 @@ def worker_function(
     result = response.choices[0].message.content
     code_block_content = extract_code_block(result)
 
+    usage = getattr(response, "usage", None)
+    prompt_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
+    completion_tokens = getattr(usage, "completion_tokens", 0) if usage else 0
+    total_tokens = getattr(usage, "total_tokens", 0) if usage else 0
+
+    cost_usd = safe_completion_cost(response)
+
     with open(output_file, "w") as f:
         if code_block_content:
             f.write(code_block_content)
@@ -190,6 +196,13 @@ def worker_function(
         "instance_id": datum["instance_id"],
         "run_id": run_id,
         "workload": code_block_content if code_block_content else result,
+        "workload_generation_cost": {
+            "model": model_name,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "cost_usd": round(cost_usd, 6),
+        },
     }
 
 
@@ -225,7 +238,17 @@ def main(
             result = future.result()
             results.append(result)
 
-    # Save results to JSON lines.
+    total_cost = sum(
+        r.get("workload_generation_cost", {}).get("cost_usd", 0.0) for r in results
+    )
+    total_tokens = sum(
+        r.get("workload_generation_cost", {}).get("total_tokens", 0) for r in results
+    )
+    print(
+        f"\nWorkload generation complete: {len(results)} instances, "
+        f"{total_tokens:,} tokens, ${total_cost:.4f} USD"
+    )
+
     with open(output_path, "w") as f:
         for result in results:
             f.write(json.dumps(result) + "\n")
