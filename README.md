@@ -3,16 +3,21 @@
 </div>
 
 <p align="center">
+  <a href="https://github.com/Ethara-Ai/kraken">
+    <img src="https://img.shields.io/badge/GitHub-Ethara--Ai%2Fkraken-181717?logo=github" alt="GitHub">
+  </a>
   <a href="https://huggingface.co/datasets/ethara/Kraken">
     <img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Dataset-blue" alt="Dataset">
   </a>
   <a href="https://arxiv.org/abs/2511.06090">
-    <img src="https://img.shields.io/badge/arXiv-2511.06090-b31b1b.svg" alt="paper">
+    <img src="https://img.shields.io/badge/Paper-arXiv%3A2511.06090-b31b1b?logo=arxiv&logoColor=white" alt="Paper">
   </a>
+  <img src="https://img.shields.io/badge/Instances-20-blue" alt="Instances">
+  <img src="https://img.shields.io/badge/Repositories-6-orange" alt="Repositories">
+  <img src="https://img.shields.io/badge/Max%20Speedup-26.92%C3%97-red" alt="Max Speedup">
   <a href="LICENSE">
     <img src="https://img.shields.io/badge/License-Apache%202.0-lightgrey.svg" alt="License">
   </a>
-  <img src="https://img.shields.io/badge/Python-3.8%2B-blue?logo=python" alt="Python">
 </p>
 
 ---
