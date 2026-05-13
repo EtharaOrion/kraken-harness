@@ -11,7 +11,7 @@
 
 ---
 
-Kraken is a repository-level evaluation framework for benchmarking LLM coding agents on **performance optimization**. Each task ships a full codebase snapshot, a targeted performance workload to speed up, and the subset of repository correctness tests that must remain green. Patches are scored using the **Harmonic Speedup Ratio (HSR)**, jointly measuring correctness and runtime efficiency.
+Kraken is a repository-level RL environment for training LLM coding agents on **performance optimization**. Each task provides an agent with a full codebase snapshot, a targeted performance workload to speed up, and a set of correctness tests that must remain green. The agent is scored using the **Harmonic Speedup Ratio (HSR)**, jointly measuring correctness and runtime efficiency.
 
 ## Table of Contents
 
@@ -29,18 +29,18 @@ Kraken is a repository-level evaluation framework for benchmarking LLM coding ag
 
 ## Overview
 
-Kraken evaluates *pass-to-pass* performance engineering: start from a codebase and a slow workload, improve runtime, and don't break behavior. The focus is on investigation (profiling/localization) and correctness-preserving edits — mirroring how performance engineers work day-to-day.
+Kraken frames *pass-to-pass* performance engineering as an RL problem: start from a codebase and a slow workload, improve runtime, and don't break behavior. The focus is on investigation (profiling/localization) and correctness-preserving edits — mirroring how performance engineers work day-to-day.
 
-Unlike traditional SWE benchmarks that measure only functional correctness, Kraken jointly evaluates **correctness and efficiency**. A patch that breaks tests scores zero, even if it's fast.
+Unlike traditional coding benchmarks that measure only functional correctness, Kraken jointly rewards **correctness and efficiency**. An agent that breaks tests receives zero reward, regardless of speed.
 
-### Key Capabilities
+### Key Features
 
-- **Performance-Aware Evaluation** — Jointly measures functional correctness and runtime speedup using HSR
-- **Docker-Isolated Runs** — Every evaluation runs in a prebuilt container with CPU/memory pinning for reproducibility
-- **Flexible Agent Integration** — Works with OpenHands, SWE-agent, Cursor CLI, or any agent that produces git patches
-- **Full Pipeline Automation** — `run_pipeline.sh` orchestrates PR scraping → dataset construction → evaluation → report
-- **Rich Analysis Toolkit** — Scripts for flamegraph profiling, workload analysis, difficulty classification, and model comparison
-- **Extensible** — Add new repositories via auto-detect pipeline with version discovery and Docker image building
+- **Performance-Aware Reward** — Jointly scores functional correctness and runtime speedup via HSR. Patches that break tests score zero.
+- **Docker-Isolated Environment** — Every run uses a prebuilt container with CPU/memory pinning for reproducible training runs.
+- **Flexible Agent Support** — Works with OpenHands, SWE-agent, Cursor CLI, or any agent that produces git patches.
+- **Full Pipeline Automation** — `run_pipeline.sh` handles the entire workflow from data collection to reward computation.
+- **Rich Analysis Toolkit** — Scripts for flamegraph profiling, workload analysis, difficulty classification, and model comparison.
+- **Extensible** — Add new repositories via auto-detect pipeline with version discovery and Docker image building.
 
 ---
 
@@ -70,38 +70,38 @@ pip install -e .
 Establishes reference performance using expert (human) patches:
 
 ```bash
-swefficiency eval --run_id my_eval --num_workers 12
+swefficiency eval --run_id my_run --num_workers 12
 ```
 
-Results stored in `logs/run_evaluation/my_eval/gold/`.
+Results stored in `logs/run_evaluation/my_run/gold/`.
 
-### 2. Evaluate model predictions
+### 2. Run an agent
 
 ```bash
-swefficiency eval --run_id my_eval --num_workers 12 --prediction_path predictions.jsonl
+swefficiency eval --run_id my_run --num_workers 12 --prediction_path agent_predictions.jsonl
 ```
 
 Prediction format (JSONL):
 
 ```json
-{"instance_id": "<id>", "model_patch": "<patch_text>", "model_name_or_path": "<model_name>"}
+{"instance_id": "<id>", "model_patch": "<patch_text>", "model_name_or_path": "<agent_name>"}
 ```
 
-Results stored in `logs/run_evaluation/my_eval/<model_name>/`.
+Results stored in `logs/run_evaluation/my_run/<agent_name>/`.
 
-### 3. Generate report
+### 3. Score the agent
 
 ```bash
 swefficiency report \
-    --gold_run logs/run_evaluation/my_eval/gold \
-    --pred_run logs/run_evaluation/my_eval/<model_name>
+    --gold_run logs/run_evaluation/my_run/gold \
+    --pred_run logs/run_evaluation/my_run/<agent_name>
 ```
 
-Outputs `eval_reports/eval_report_<model_name>.csv` (per-instance) and `.json` (summary metrics).
+Outputs `eval_reports/eval_report_<agent_name>.csv` (per-instance results) and `.json` (summary metrics including HSR).
 
 ### Reproducibility Setup
 
-For faithful reproduction, use a dedicated machine (GCP `n2-standard-64` recommended) with Docker CPU pinning:
+For reproducible training runs, use a dedicated machine (GCP `n2-standard-64` recommended) with Docker CPU pinning:
 
 ```bash
 bash scripts/vm/setup_vm.sh
@@ -118,10 +118,10 @@ Use `--num_workers 12` for 4 vCPUs / 16 GB RAM per worker.
 
 | Flag | Default | Description |
 |:---|:---|:---|
-| `--num_workers` | `4` | Parallel evaluation workers |
+| `--num_workers` | `4` | Parallel workers |
 | `--run_id` | auto-generated | Run identifier for output directories |
 | `--dataset` | `swefficiency/swefficiency` | HuggingFace dataset or local JSONL path |
-| `--prediction_path` | — | Path to predictions JSONL (omit for gold baseline) |
+| `--prediction_path` | — | Path to agent predictions JSONL (omit for gold baseline) |
 | `--instances_regex` | — | Filter instances by regex pattern (e.g. `"numpy.*"`) |
 | `--force_rerun` | `false` | Re-run even if cached results exist |
 
@@ -130,7 +130,7 @@ Use `--num_workers 12` for 4 vCPUs / 16 GB RAM per worker.
 | Flag | Description |
 |:---|:---|
 | `--gold_run` (required) | Path to gold run directory |
-| `--pred_run` (required) | Path to prediction run directory |
+| `--pred_run` (required) | Path to agent prediction run directory |
 | `--report_output` | Output directory (default: `eval_reports/`) |
 | `--num_workers` | Parallel workers (default: `4`) |
 
@@ -138,7 +138,7 @@ Use `--num_workers 12` for 4 vCPUs / 16 GB RAM per worker.
 
 ## Agent Integration
 
-Kraken provides a Docker-based inference harness at `scripts/inference/custom.py` for running agents against benchmark instances.
+Kraken provides a Docker-based inference harness at `scripts/inference/custom.py` for running agents against environment tasks.
 
 ### OpenHands
 
@@ -160,7 +160,7 @@ python scripts/inference/custom.py \
   --var cursor_cli_args="--max-steps 75"
 ```
 
-Each instance produces a git patch at `logs/run_inference/<run_id>/<instance_id>/patch.diff`, ready for `swefficiency eval`.
+Each instance produces a git patch at `logs/run_inference/<run_id>/<instance_id>/patch.diff`, ready for scoring via `swefficiency eval`.
 
 ---
 
@@ -170,8 +170,8 @@ The `run_pipeline.sh` orchestrator automates the full workflow:
 
 ```
 Scrape PRs → Filter Performance PRs → Version Detection → Detect Specs
-→ Workload Generation → Assemble Dataset → Build Docker → Agent Inference
-→ Evaluate Patches → Generate Report
+→ Workload Generation → Assemble Dataset → Build Docker → Agent Run
+→ Score Patches → Generate Report
 ```
 
 ```bash
@@ -195,14 +195,14 @@ Scrape PRs → Filter Performance PRs → Version Detection → Detect Specs
 ├── run_pipeline.sh             # Pipeline orchestrator
 ├── swefficiency/               # Python package
 │   ├── cli.py                  # CLI entrypoint
-│   ├── report.py               # Report generation
-│   ├── harness/                # Docker-based evaluation
+│   ├── report.py               # Report generation (HSR scoring)
+│   ├── harness/                # Docker-based environment
 │   ├── collect/                # Dataset collection
 │   ├── versioning/             # Version detection
 │   ├── perf_filter/            # Performance PR filtering
 │   └── workload/               # Workload generation
 ├── scripts/
-│   ├── eval/                   # Evaluation scripts
+│   ├── eval/                   # Scoring scripts
 │   ├── inference/              # Agent harness
 │   ├── perf/                   # Performance analysis
 │   ├── vm/                     # Docker/VM setup
@@ -216,7 +216,7 @@ Scrape PRs → Filter Performance PRs → Version Detection → Detect Specs
 
 ## Contributing
 
-See [CONTRIBUTING.md](docs/CONTRIBUTING.md) for guidelines. This codebase began as a fork from [SWE-Gym's SWE-Bench fork](https://github.com/SWE-Gym/SWE-Bench-Fork) and extends the pipeline with performance-specific commit filtering, workload evaluation, and additional analysis tooling.
+See [CONTRIBUTING.md](docs/CONTRIBUTING.md) for guidelines. This codebase began as a fork from [SWE-Gym's SWE-Bench fork](https://github.com/SWE-Gym/SWE-Bench-Fork) and extends the pipeline with performance-specific commit filtering, workload evaluation, and additional training tooling.
 
 ---
 
