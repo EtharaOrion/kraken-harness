@@ -1,110 +1,99 @@
 <div align="center">
-  <img src="docs/assets/logos/swefficiency_banner_main.png" alt="Kraken Logo" width="500"/>
+<div align="center">
+  <img src="docs/assets/logos/kraken.png" alt="Kraken Logo" width="500"/>
+</div>
+  <p><em>Evaluation framework for benchmarking LLM coding agents on real-world performance optimization</em></p>
+
+  <p>
+    <a href="https://huggingface.co/datasets/ethara/Kraken"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Dataset-blue" alt="Dataset"></a>
+    <a href="https://arxiv.org/abs/2511.06090"><img src="https://img.shields.io/badge/Paper-arXiv%3A2511.06090-b31b1b?logo=arxiv&logoColor=white" alt="Paper"></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-lightgrey.svg" alt="License"></a>
+  </p>
 </div>
 
-<p align="center">
-  <a href="https://github.com/Ethara-Ai/kraken">
-    <img src="https://img.shields.io/badge/GitHub-Ethara--Ai%2Fkraken-181717?logo=github" alt="GitHub">
-  </a>
-  <a href="https://huggingface.co/datasets/ethara/Kraken">
-    <img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Dataset-blue" alt="Dataset">
-  </a>
-  <a href="https://arxiv.org/abs/2511.06090">
-    <img src="https://img.shields.io/badge/Paper-arXiv%3A2511.06090-b31b1b?logo=arxiv&logoColor=white" alt="Paper">
-  </a>
-  <img src="https://img.shields.io/badge/Instances-20-blue" alt="Instances">
-  <img src="https://img.shields.io/badge/Repositories-6-orange" alt="Repositories">
-  <img src="https://img.shields.io/badge/Max%20Speedup-26.92%C3%97-red" alt="Max Speedup">
-  <a href="LICENSE">
-    <img src="https://img.shields.io/badge/License-Apache%202.0-lightgrey.svg" alt="License">
-  </a>
-</p>
+---
+
+Kraken is a repository-level evaluation framework for benchmarking LLM coding agents on **performance optimization**. Each task ships a full codebase snapshot, a targeted performance workload to speed up, and the subset of repository correctness tests that must remain green. Patches are scored using the **Harmonic Speedup Ratio (HSR)**, jointly measuring correctness and runtime efficiency.
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [CLI Reference](#cli-reference)
+- [Dataset](#dataset)
+- [Evaluation](#evaluation)
+- [Agent Integration](#agent-integration)
+- [Pipeline](#pipeline)
+- [Project Structure](#project-structure)
+- [Contributing](#contributing)
+- [License](#license)
 
 ---
 
-# Kraken: Benchmarking LLM Coding Agents on Real-World Performance Optimization
+## Overview
 
-**TL;DR** — Kraken is a *repository-level* evaluation framework for **performance optimization** (not bug fixing). It builds on the SWE-fficiency methodology to jointly evaluate LLM agents on correctness and runtime efficiency. Each task ships:
-- a full codebase snapshot,
-- a targeted **performance workload** to speed up,
-- and the subset of repository **correctness tests** that must remain green.
+Kraken evaluates *pass-to-pass* performance engineering: start from a codebase and a slow workload, improve runtime, and don't break behavior. The focus is on investigation (profiling/localization) and correctness-preserving edits — mirroring how performance engineers work day-to-day.
 
-We evaluate patches by applying them, running the correctness suite, and measuring runtime speedups against the *expert (human) PR* using the **Harmonic Speedup Ratio (HSR)**.
+Unlike traditional SWE benchmarks that measure only functional correctness, Kraken jointly evaluates **correctness and efficiency**. A patch that breaks tests scores zero, even if it's fast.
 
----
+### Key Capabilities
 
-## 🚀 What is Kraken?
-
-Kraken evaluates *pass-to-pass* performance engineering: start from a codebase and a slow workload, improve runtime, and **don't break behavior**. The focus is on **investigation** (profiling/localization) and **correctness-preserving** edits—mirroring how performance engineers work day-to-day.
-
-Unlike traditional SWE benchmarks that measure only functional correctness, Kraken jointly evaluates **correctness and efficiency**. Agents must produce patches that pass the test suite *and* deliver measurable speedups.
-
-### Highlights
-- **Performance-Aware Evaluation**: Jointly measures functional correctness *and* runtime speedup. A patch that breaks tests scores zero, even if it's fast.
-- **Real repos, real workloads**: **20** tasks from **6** major Python libraries—**networkx, flask, fastapi, pydantic, httpx, jinja**.
-- **Docker-Isolated Runs**: Every evaluation runs in a prebuilt container matched to the target repository's environment with CPU/memory pinning, ensuring reproducibility.
-- **Flexible Agent Integration**: Works with OpenHands, SWE-agent, Cursor CLI, or any agent that produces git patches.
-- **Full Pipeline Automation**: The `run_pipeline.sh` orchestrator handles everything from GitHub PR scraping through to evaluation reports.
-- **Rich Analysis Toolkit**: Scripts for flamegraph profiling, workload distribution analysis, difficulty classification, and model comparison plots.
-
-### Why This Matters
-
-Performance improvements in widely used libraries have outsized impact. Kraken isolates the open-ended challenge: **find bottlenecks, propose safe optimizations, and prove correctness** against the repository's own tests—at repository scope.
+- **Performance-Aware Evaluation** — Jointly measures functional correctness and runtime speedup using HSR
+- **Docker-Isolated Runs** — Every evaluation runs in a prebuilt container with CPU/memory pinning for reproducibility
+- **Flexible Agent Integration** — Works with OpenHands, SWE-agent, Cursor CLI, or any agent that produces git patches
+- **Full Pipeline Automation** — `run_pipeline.sh` orchestrates PR scraping → dataset construction → evaluation → report
+- **Rich Analysis Toolkit** — Scripts for flamegraph profiling, workload analysis, difficulty classification, and model comparison
+- **Extensible** — Add new repositories via auto-detect pipeline with version discovery and Docker image building
 
 ---
 
-## 📦 Install & Environment
+## Installation
 
-We recommend Python 3.12 and a Linux host. The benchmark is also installable via `pip` in editable mode.
+Requires Python 3.8+. Linux host recommended.
 
 ```bash
+git clone https://github.com/Ethara-Ai/kraken.git
+cd kraken
+
+# Using uv (recommended)
 uv venv --python 3.12
 source .venv/bin/activate
 uv sync
 
-# Alternatively, you can install directly via pip.
+# Or using pip
 pip install -e .
 ```
 
+---
+
 ## Quick Start
 
-Evaluating on Kraken is a multi-step process via our package's CLI.
+### 1. Run the gold baseline
 
-### Step 0: VM / Container Setup (highly recommended for reproducibility)
-
-For faithful reproduction of results, use a large VM (we recommend GCP `n2-standard-64`) and run the setup scripts to configure Docker and CPU pinning. We recommend using `--num_workers 12` on this configuration, which allocates 4 vCPUs and 16 GB RAM per worker.
-
-```bash
-bash scripts/vm/setup_vm.sh
-
-# IMPORTANT: This script pins the number of CPUs for the docker daemon
-# hence why it must be run in sudo privileges. This is so image building
-# and pulling overhead does not interfere with evaluation.
-sudo scripts/vm/setup_docker.sh MEM_MAX MEM_HIGH
-```
-
-### Step 1: Run gold baseline (establishes reference performance)
+Establishes reference performance using expert (human) patches:
 
 ```bash
 swefficiency eval --run_id my_eval --num_workers 12
 ```
 
-This runs the expert (human) patches to establish baseline performance metrics. Results are stored in `logs/run_evaluation/my_eval/gold/`.
+Results stored in `logs/run_evaluation/my_eval/gold/`.
 
-### Step 2: Run your model predictions
+### 2. Evaluate model predictions
 
 ```bash
 swefficiency eval --run_id my_eval --num_workers 12 --prediction_path predictions.jsonl
 ```
 
-Your predictions file should be JSONL with each line containing:
+Prediction format (JSONL):
+
 ```json
 {"instance_id": "<id>", "model_patch": "<patch_text>", "model_name_or_path": "<model_name>"}
 ```
 
-Results are stored in `logs/run_evaluation/my_eval/<model_name>/`.
+Results stored in `logs/run_evaluation/my_eval/<model_name>/`.
 
-### Step 3: Generate evaluation report
+### 3. Generate report
 
 ```bash
 swefficiency report \
@@ -112,152 +101,136 @@ swefficiency report \
     --pred_run logs/run_evaluation/my_eval/<model_name>
 ```
 
-This generates two output files in `eval_reports/`:
-- `eval_report_<model_name>.csv` — Per-instance results
-- `eval_report_<model_name>.json` — Summary metrics including:
-  - `overall_score`: Harmonic mean of HSR across instances
-  - `proportion_incorrect`: Instances that failed correctness tests
-  - `proportion_correct_but_no_speedup`: Correct but slower than baseline
-  - `proportion_human_speedup_or_better`: Matched or beat expert performance
+Outputs `eval_reports/eval_report_<model_name>.csv` (per-instance) and `.json` (summary metrics).
+
+### Reproducibility Setup
+
+For faithful reproduction, use a dedicated machine (GCP `n2-standard-64` recommended) with Docker CPU pinning:
+
+```bash
+bash scripts/vm/setup_vm.sh
+sudo scripts/vm/setup_docker.sh MEM_MAX MEM_HIGH
+```
+
+Use `--num_workers 12` for 4 vCPUs / 16 GB RAM per worker.
 
 ---
 
-## 🧰 Dataset
+## CLI Reference
 
-The Kraken benchmark dataset is available on **[Hugging Face](https://huggingface.co/datasets/ethara/Kraken)**.
+### `swefficiency eval`
+
+| Flag | Default | Description |
+|:---|:---|:---|
+| `--num_workers` | `4` | Parallel evaluation workers |
+| `--run_id` | auto-generated | Run identifier for output directories |
+| `--dataset` | `swefficiency/swefficiency` | HuggingFace dataset or local JSONL path |
+| `--prediction_path` | — | Path to predictions JSONL (omit for gold baseline) |
+| `--instances_regex` | — | Filter instances by regex pattern (e.g. `"numpy.*"`) |
+| `--force_rerun` | `false` | Re-run even if cached results exist |
+
+### `swefficiency report`
+
+| Flag | Description |
+|:---|:---|
+| `--gold_run` (required) | Path to gold run directory |
+| `--pred_run` (required) | Path to prediction run directory |
+| `--report_output` | Output directory (default: `eval_reports/`) |
+| `--num_workers` | Parallel workers (default: `4`) |
+
+---
+
+## Dataset
+
+The Kraken benchmark is available on **[Hugging Face](https://huggingface.co/datasets/ethara/Kraken)** (20 instances, 6 repositories).
 
 ### Statistics
 
 | Property | Value |
-| :--- | :--- |
+|:---|:---|
 | Total Instances | 20 |
 | Source Repositories | 6 |
-| Gold Speedup Range | 1.02× &ndash; 26.92× |
+| Gold Speedup Range | 1.02× – 26.92× |
 | Mean Gold Speedup | 4.22× |
 | Median Gold Speedup | 1.49× |
 | Primary Metric | Harmonic Speedup Ratio (HSR) |
 
-### Repository Coverage
+### Repository Breakdown
 
 | Repository | Instances | Domain | Speedup Range |
-| :--- | :---: | :--- | :---: |
-| `networkx/networkx` | 10 | Graph algorithms | 1.02× &ndash; 13.09× |
-| `pallets/flask` | 4 | Web framework | 1.10× &ndash; 2.50× |
-| `fastapi/fastapi` | 2 | Async web framework | 1.61× &ndash; 9.36× |
-| `pydantic/pydantic` | 2 | Data validation | 1.67× &ndash; 6.51× |
+|:---|---:|:---|---:|
+| `networkx/networkx` | 10 | Graph algorithms | 1.02× – 13.09× |
+| `pallets/flask` | 4 | Web framework | 1.10× – 2.50× |
+| `fastapi/fastapi` | 2 | Async web framework | 1.61× – 9.36× |
+| `pydantic/pydantic` | 2 | Data validation | 1.67× – 6.51× |
 | `encode/httpx` | 1 | HTTP client | 26.92× |
 | `pallets/jinja` | 1 | Template engine | 1.25× |
 
-### Difficulty Distribution
+### Loading
 
-| Difficulty | Count | Description |
-| :--- | :---: | :--- |
-| Easy | 4 | Straightforward optimizations (e.g., using built-in functions) |
-| Medium | 5 | Moderate algorithmic improvements |
-| Hard | 9 | Complex multi-file changes requiring deep framework knowledge |
-| Expert | 2 | Architectural-level optimizations spanning multiple components |
+```python
+from datasets import load_dataset
 
-### Task Structure (per instance)
-
-Each task in the dataset includes:
-- Repo snapshot + diff metadata
-- A **performance workload** script that exhibits a measurable speedup under the expert patch
-- The set of repository **tests** whose coverage intersects the expert diff (the "guarding" tests)
-
-> The workloads are **separate from correctness tests** (as in real projects). The benchmark rejects instances whose speedups are not statistically significant in a controlled environment.
+dataset = load_dataset("ethara/Kraken", split="test")
+instance = dataset[0]
+print(f"{instance['instance_id']} — {instance['speedup']:.2f}× speedup")
+```
 
 ---
 
-## 📊 Evaluation
+## Evaluation
 
-### Metric: Harmonic Speedup Ratio (HSR)
+### Metric: HSR
 
-The **Harmonic Speedup Ratio (HSR)** is the primary aggregate metric. For each instance:
+The **Harmonic Speedup Ratio (HSR)** balances correctness and speedup into a single score. For each instance:
 
-1. **Apply** the candidate patch to the codebase at `base_commit`
-2. **Test** — run the `FAIL_TO_PASS` + `PASS_TO_PASS` test suites
-3. **Benchmark** — measure runtime of original vs. patched code under the declared workload
-4. **Score** — derive `correctness` (binary pass/fail), `speedup` (runtime ratio), and `HSR` (harmonic mean of both)
+1. **Apply** — apply the candidate patch at `base_commit`
+2. **Test** — run `FAIL_TO_PASS` + `PASS_TO_PASS` test suites
+3. **Benchmark** — measure runtime before and after the patch under the declared workload
+4. **Score** — derive correctness (binary), speedup ratio, and HSR
 
-If a patch fails to apply or breaks correctness tests, it scores zero for that instance.
+Patches that fail to apply or break tests score zero.
 
 ### Baseline Results
 
-Two models evaluated on Kraken using this harness:
-
-| Model | Correctness | HSR (Harmonic) | Mean HSR | Mean LM Speedup |
-| :--- | :---: | :---: | :---: | :---: |
+| Model | Correctness | HSR (Harmonic) | Mean HSR | Mean Speedup |
+|:---|:---:|:---:|:---:|:---:|
 | GLM-5 | 14 / 20 (70%) | 0.313 | 0.984 | 2.84× |
 | Kimi K2.5 | 12 / 20 (60%) | 0.268 | 0.606 | 1.62× |
 
-### Performance Visualizations
+### Per-Difficulty Correctness
 
-<table align="center" width="100%">
+| Difficulty | GLM-5 | Kimi K2.5 |
+|:---|---:|---:|
+| Easy | 4 / 4 (100%) | 4 / 4 (100%) |
+| Medium | 4 / 5 (80%) | 4 / 5 (80%) |
+| Hard | 5 / 9 (56%) | 3 / 9 (33%) |
+| Expert | 1 / 2 (50%) | 1 / 2 (50%) |
+
+Both models achieve perfect correctness on Easy instances but struggle with Hard problems requiring deep framework knowledge and multi-step reasoning.
+
+### Visualizations
+
+<table>
   <tr>
-    <td align="center" width="50%" valign="top">
-      <a href="docs/assets/figures/swefficiency_overview.png">
-        <img src="docs/assets/figures/swefficiency_overview.png" height="300" alt="Benchmark Overview"/>
-      </a>
-      <br/>
-      <b>Figure 1.</b> Benchmark overview — HSR, correctness, and speedup across models.
-    </td>
-    <td align="center" width="50%" valign="top">
-      <a href="docs/assets/figures/correctness_breakdown.png">
-        <img src="docs/assets/figures/correctness_breakdown.png" height="300" alt="Correctness Breakdown"/>
-      </a>
-      <br/>
-      <b>Figure 2.</b> Correctness breakdown by difficulty tier.
-    </td>
+    <td width="50%"><img src="docs/assets/figures/swefficiency_overview.png" alt="Overview"/><br/><b>Fig 1.</b> Benchmark overview</td>
+    <td width="50%"><img src="docs/assets/figures/correctness_breakdown.png" alt="Correctness"/><br/><b>Fig 2.</b> Correctness by difficulty</td>
   </tr>
   <tr>
-    <td align="center" width="50%" valign="top">
-      <a href="docs/assets/figures/scaling_trends.png">
-        <img src="docs/assets/figures/scaling_trends.png" height="300" alt="Scaling Trends"/>
-      </a>
-      <br/>
-      <b>Figure 3.</b> Scaling trends — model performance vs. compute budget.
-    </td>
-    <td align="center" width="50%" valign="top">
-      <a href="docs/assets/figures/diff_classification_counts.png">
-        <img src="docs/assets/figures/diff_classification_counts.png" height="300" alt="Diff Classification"/>
-      </a>
-      <br/>
-      <b>Figure 4.</b> Diff classification — types of changes agents make.
-    </td>
+    <td width="50%"><img src="docs/assets/figures/scaling_trends.png" alt="Scaling"/><br/><b>Fig 3.</b> Scaling trends</td>
+    <td width="50%"><img src="docs/assets/figures/diff_classification_counts.png" alt="Diff Classification"/><br/><b>Fig 4.</b> Diff classification</td>
   </tr>
   <tr>
-    <td align="center" width="50%" valign="top">
-      <a href="docs/assets/figures/flamegraph.png">
-        <img src="docs/assets/figures/flamegraph.png" height="300" alt="Flamegraph"/>
-      </a>
-      <br/>
-      <b>Figure 5.</b> Flamegraph analysis — profiling agent vs. gold patch runtime.
-    </td>
-    <td align="center" width="50%" valign="top">
-      <a href="docs/assets/figures/workload_distribution.png">
-        <img src="docs/assets/figures/workload_distribution.png" height="300" alt="Workload Distribution"/>
-      </a>
-      <br/>
-      <b>Figure 6.</b> Workload distribution across repositories.
-    </td>
+    <td width="50%"><img src="docs/assets/figures/flamegraph.png" alt="Flamegraph"/><br/><b>Fig 5.</b> Flamegraph analysis</td>
+    <td width="50%"><img src="docs/assets/figures/workload_distribution.png" alt="Workload"/><br/><b>Fig 6.</b> Workload distribution</td>
   </tr>
 </table>
 
 ---
 
-## 🛠️ Generation (Agents & Harness)
+## Agent Integration
 
-We provide integration points for popular SWE agent harnesses like OpenHands and SWE-agent via prebuilt Docker containers.
-
-We ship **prebuilt Docker images** for generation to match the evaluation environment and avoid dependency drift.
-
-> Recommended per-task limits: **3 hours** wall-clock, **100** max actions/turns; be generous with workload timeouts (since tests or workloads can be substantial).
-
-Need a generalized way to prep instances, run your agent, and capture patches? See
-`scripts/inference/README.md` for the inference harness. It loads the
-dataset directly from Hugging Face, runs prework/inference steps
-defined in YAML specs (Cursor CLI example included), and writes git patches ready
-for evaluation via `swefficiency eval`.
+Kraken provides a Docker-based inference harness at `scripts/inference/custom.py` for running agents against benchmark instances.
 
 ### OpenHands
 
@@ -279,81 +252,74 @@ python scripts/inference/custom.py \
   --var cursor_cli_args="--max-steps 75"
 ```
 
----
-
-## 🔬 Reproducibility Tips
-
-* Use the provided **container images** (prebuilt for each instance).
-* **Pin CPU and memory** per worker (4 vCPUs / 16 GB RAM). See `scripts/vm/` for details.
-* Pre-built images include everything needed.
-* Run gold baselines first before comparing model predictions.
+Each instance produces a git patch at `logs/run_inference/<run_id>/<instance_id>/patch.diff`, ready for `swefficiency eval`.
 
 ---
 
-## 📈 Baseline Snapshot
+## Pipeline
 
-Overall, agents today are **far from expert parity** (HSR ≪ 1.0) and frequently introduce correctness regressions when attempting optimizations. Both models achieve perfect correctness on Easy instances but struggle significantly with Hard problems, where deep framework knowledge and multi-step reasoning are decisive.
+The `run_pipeline.sh` orchestrator automates the full workflow:
 
-| Difficulty | GLM-5 | Kimi K2.5 |
-| :--- | :---: | :---: |
-| Easy | 4 / 4 (100%) | 4 / 4 (100%) |
-| Medium | 4 / 5 (80%) | 4 / 5 (80%) |
-| Hard | 5 / 9 (56%) | 3 / 9 (33%) |
-| Expert | 1 / 2 (50%) | 1 / 2 (50%) |
+```
+Scrape PRs → Filter Performance PRs → Version Detection → Detect Specs
+→ Workload Generation → Assemble Dataset → Build Docker → Agent Inference
+→ Evaluate Patches → Generate Report
+```
+
+```bash
+# Full pipeline from scratch
+./run_pipeline.sh --repo owner/repo --run-id my_run
+
+# Use existing dataset (skips stages 1-6)
+./run_pipeline.sh --dataset artifacts/final/dataset.jsonl --run-id my_run --stages eval,pred_eval,report
+
+# With agent inference
+./run_pipeline.sh --dataset artifacts/final/dataset.jsonl --run-id my_run --mode openhands
+```
 
 ---
 
-## 🧭 Project Structure (high level)
+## Project Structure
 
 ```
 .
+├── pyproject.toml              # Package configuration
+├── run_pipeline.sh             # Pipeline orchestrator
+├── swefficiency/               # Python package
+│   ├── cli.py                  # CLI entrypoint
+│   ├── report.py               # Report generation
+│   ├── harness/                # Docker-based evaluation
+│   ├── collect/                # Dataset collection
+│   ├── versioning/             # Version detection
+│   ├── perf_filter/            # Performance PR filtering
+│   └── workload/               # Workload generation
 ├── scripts/
-│   ├── eval/           # evaluation runner + aggregator
-│   ├── inference/      # agent inference harness
-│   ├── perf/           # performance analysis scripts
-│   ├── annotate/       # dataset annotation tools
-│   └── vm/             # docker & VM pinning helpers
-├── swefficiency/       # python package (cli, utils, loaders)
-│   ├── cli.py          # CLI entrypoint (eval/report commands)
-│   ├── harness/        # evaluation harness (Docker, grading)
-│   ├── collect/        # dataset collection pipeline
-│   ├── versioning/     # python version detection
-│   ├── perf_filter/    # performance PR filtering
-│   └── workload/       # synthetic workload generation
-├── analysis/           # research & analysis scripts
-├── tests/              # test suite
-├── docs/assets/figures # charts & visualization images
-└── README.md
+│   ├── eval/                   # Evaluation scripts
+│   ├── inference/              # Agent harness
+│   ├── perf/                   # Performance analysis
+│   ├── vm/                     # Docker/VM setup
+│   └── slurm/                  # Cluster support
+├── analysis/                   # Research scripts + plots
+├── tests/                      # Test suite
+└── docs/                       # Documentation + figures
 ```
 
 ---
 
-## Acknowledgements
+## Contributing
 
-This codebase began as a fork from SWE-Gym's fork of SWE-Bench (https://github.com/SWE-Gym/SWE-Bench-Fork). We updated repo specific dependencies in the constants files, extended the data pipeline to be able to filter performance specific commits (as per our paper), and updated the evaluation harness to validate our performance + correctness setting. We've also added several helper scripts and utilities to support evaluation and experiment analysis.
+See [CONTRIBUTING.md](docs/CONTRIBUTING.md) for guidelines. This codebase began as a fork from [SWE-Gym's SWE-Bench fork](https://github.com/SWE-Gym/SWE-Bench-Fork) and extends the pipeline with performance-specific commit filtering, workload evaluation, and additional analysis tooling.
 
 ### Methodology
 
-Kraken builds on the **SWE-fficiency** methodology, which extends SWE-Bench with performance workloads and defines the Harmonic Speedup Ratio (HSR) metric:
+Kraken builds on the SWE-fficiency methodology (Ma et al., 2025), which extends SWE-Bench with performance workloads and the Harmonic Speedup Ratio (HSR) metric.
 
-> Ma et al., *"SWE-fficiency: Can Language Models Optimize Real-World Repositories on Real Workloads?"*, arXiv:2511.06090, 2025.
+---
 
 ## License
 
 Copyright 2026 Google LLC
 
-All software is licensed under the Apache License, Version 2.0 (Apache 2.0); you may not use this file except in compliance with the Apache 2.0 license. You may obtain a copy of the Apache 2.0 license at: https://www.apache.org/licenses/LICENSE-2.0
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
 
-All other materials are licensed under the Creative Commons Attribution 4.0 International License (CC-BY). You may obtain a copy of the CC-BY license at: https://creativecommons.org/licenses/by/4.0/legalcode
-
-Unless required by applicable law or agreed to in writing, all software and materials distributed here under the Apache 2.0 or CC-BY licenses are distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the licenses for the specific language governing permissions and limitations under those licenses.
-
-This is not an officially supported Google product. This project is not
-eligible for the [Google Open Source Software Vulnerability Rewards
-Program](https://bughunters.google.com/open-source-security).
-
----
-
-<div align="center">
-  <sub>Kraken Evaluation Framework — Benchmarking LLM Agents on Real-World Performance Optimization</sub>
-</div>
+This is not an officially supported Google product.
