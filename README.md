@@ -218,10 +218,6 @@ Scrape PRs → Filter Performance PRs → Version Detection → Detect Specs
 
 See [CONTRIBUTING.md](docs/CONTRIBUTING.md) for guidelines. This codebase began as a fork from [SWE-Gym's SWE-Bench fork](https://github.com/SWE-Gym/SWE-Bench-Fork) and extends the pipeline with performance-specific commit filtering, workload evaluation, and additional analysis tooling.
 
-### Methodology
-
-Kraken builds on the SWE-fficiency methodology (Ma et al., 2025), which extends SWE-Bench with performance workloads and the Harmonic Speedup Ratio (HSR) metric.
-
 ---
 
 ## License
