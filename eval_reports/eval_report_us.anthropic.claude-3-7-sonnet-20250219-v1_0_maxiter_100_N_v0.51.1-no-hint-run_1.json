@@ -1,9 +1,0 @@
-{
-  "total_instances": 498,
-  "overall_score": 0.0565,
-  "proportion_incorrect": 0.3474,
-  "proportion_correct_but_no_speedup": 0.1245,
-  "proportion_correct_with_speedup_but_human_no_speedup": 0.3233,
-  "proportion_human_speedup_or_better": 0.2048,
-  "report": "eval_report_us.anthropic.claude-3-7-sonnet-20250219-v1_0_maxiter_100_N_v0.51.1-no-hint-run_1.csv"
-}

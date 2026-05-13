@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+import logging
 import os
 import random
 import re
@@ -20,6 +21,7 @@ import time
 from argparse import ArgumentParser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Optional
 
 import requests
 from litellm import completion
@@ -29,7 +31,18 @@ from swefficiency.harness.constants import SWEfficiencyInstance
 from swefficiency.harness.utils import load_swefficiency_dataset
 from swefficiency.observability import helicone_metadata, safe_completion_cost, setup_helicone
 
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
 WORKLOAD_GENERATION_DIR = Path("logs/workload_generation")
+
+# Retry settings
+MAX_LLM_RETRIES = 5
+LLM_BACKOFF_BASE = 2  # exponential backoff: 2, 4, 8, 16, 32 seconds
+HTTP_TIMEOUT = 30  # seconds for fetching source files
+HTTP_MAX_RETRIES = 3
 
 SYSTEM_MSG = """You are a performance testing expert. You will be provided a code edit as a git diff and the pre-edit source files. You need to generate a **self-contained Python performance workload script** that measures perfomance of code paths or APIs changed in the diff.
 
@@ -105,6 +118,22 @@ def extract_code_block(text):
     return None
 
 
+def _fetch_file_with_retry(url: str) -> Optional[str]:
+    """Fetch a file from GitHub with retry and timeout."""
+    for attempt in range(HTTP_MAX_RETRIES):
+        try:
+            response = requests.get(url, timeout=HTTP_TIMEOUT)
+            if response.status_code == 200:
+                return response.text
+            if response.status_code == 404:
+                return None  # File doesn't exist at this commit
+        except requests.RequestException as e:
+            logger.warning(f"Request failed for {url}: {e} (attempt {attempt + 1}/{HTTP_MAX_RETRIES})")
+        if attempt < HTTP_MAX_RETRIES - 1:
+            time.sleep(2 ** attempt)
+    return None
+
+
 def worker_function(
     datum: SWEfficiencyInstance,
     run_id: str,
@@ -112,11 +141,27 @@ def worker_function(
     output_file = WORKLOAD_GENERATION_DIR / run_id / f"{datum['instance_id']}.py"
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
+    # Resume: skip if output already exists and is non-empty
+    if output_file.exists() and output_file.stat().st_size > 0:
+        logger.info(f"[{datum['instance_id']}] Already generated, skipping (resume)")
+        return {
+            "instance_id": datum["instance_id"],
+            "run_id": run_id,
+            "workload": output_file.read_text(),
+            "workload_generation_cost": {
+                "model": "cached",
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "cost_usd": 0.0,
+            },
+            "resumed": True,
+        }
+
     # Get relevant files from the patch.
     patch = datum["patch"]
     diff_pattern = r"diff --git a/.* b/(.*)"
     directives = re.findall(diff_pattern, patch)
-    directives = [d for d in directives]
 
     owner, repo = datum["repo"].split("/")
     commit_hash = datum["base_commit"]
@@ -124,25 +169,22 @@ def worker_function(
     file_contents = []
 
     for file_path in directives:
-        max_retries = 3
-        for attempt in range(max_retries):
-            url = f"https://raw.githubusercontent.com/{owner}/{repo}/{commit_hash}/{file_path}"
-            response = requests.get(url)
-
-            if response.status_code == 200:
-                file_contents.append(f"File: {file_path}")
-                file_contents.append(f"```\n{response.text}\n```\n")
-                break
-            else:
-                time.sleep(1)  # Wait before retrying
-                print(f"Failed to fetch {file_path} from {url}, retrying...")
-                continue
+        url = f"https://raw.githubusercontent.com/{owner}/{repo}/{commit_hash}/{file_path}"
+        content = _fetch_file_with_retry(url)
+        if content is not None:
+            file_contents.append(f"File: {file_path}")
+            file_contents.append(f"```\n{content}\n```\n")
+        else:
+            logger.warning(f"[{datum['instance_id']}] Could not fetch {file_path}")
 
     # Combine all file contents into a single string
     commit_diff = patch.strip()
     all_preedit_file_contents = "\n".join(file_contents)
 
-    while True:
+    # LLM call with bounded retries and exponential backoff
+    response = None
+    last_error = None
+    for attempt in range(MAX_LLM_RETRIES):
         try:
             model_name = os.environ.get(
                 "WORKLOAD_MODEL",
@@ -175,11 +217,40 @@ def worker_function(
             )
             break
         except Exception as e:
-            print(f"Error during completion: {e}")
-            time.sleep(5)
+            last_error = e
+            backoff = LLM_BACKOFF_BASE ** attempt
+            logger.warning(
+                f"[{datum['instance_id']}] LLM error (attempt {attempt + 1}/{MAX_LLM_RETRIES}): {e}. "
+                f"Retrying in {backoff}s..."
+            )
+            time.sleep(backoff)
+
+    if response is None:
+        logger.error(
+            f"[{datum['instance_id']}] Failed after {MAX_LLM_RETRIES} attempts. Last error: {last_error}"
+        )
+        return {
+            "instance_id": datum["instance_id"],
+            "run_id": run_id,
+            "workload": None,
+            "error": str(last_error),
+            "workload_generation_cost": {
+                "model": model_name,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "cost_usd": 0.0,
+            },
+        }
 
     result = response.choices[0].message.content
     code_block_content = extract_code_block(result)
+
+    if code_block_content is None:
+        logger.warning(
+            f"[{datum['instance_id']}] No code block found in LLM response. "
+            f"Response length: {len(result) if result else 0} chars"
+        )
 
     usage = getattr(response, "usage", None)
     prompt_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
@@ -191,6 +262,10 @@ def worker_function(
     with open(output_file, "w") as f:
         if code_block_content:
             f.write(code_block_content)
+        else:
+            # Write raw response as fallback so file exists for resume
+            f.write(f"# WARNING: No code block extracted from LLM response\n# Raw response saved below\n")
+            f.write(f'"""\n{result}\n"""' if result else "# Empty response\n")
 
     return {
         "instance_id": datum["instance_id"],
@@ -212,6 +287,7 @@ def main(
     instance_ids: list[str],
     max_workers: int,
     run_id: str,
+    no_resume: bool = False,
 ):
     setup_helicone()
     dataset = load_swefficiency_dataset(dataset_name, split)
@@ -226,7 +302,30 @@ def main(
     if instance_ids:
         dataset = [d for d in dataset if d["instance_id"] in instance_ids]
 
+    # Resume: filter out already-completed instances (unless --no-resume)
+    if not no_resume and output_path.exists():
+        existing_ids = set()
+        with open(output_path) as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                    if entry.get("workload") is not None:
+                        existing_ids.add(entry["instance_id"])
+                except (json.JSONDecodeError, KeyError):
+                    continue
+        if existing_ids:
+            before = len(dataset)
+            dataset = [d for d in dataset if d["instance_id"] not in existing_ids]
+            logger.info(f"Resume: skipping {before - len(dataset)} already-completed instances")
+
+    if not dataset:
+        logger.info("All instances already completed. Nothing to do.")
+        return
+
+    logger.info(f"Processing {len(dataset)} instances with {max_workers} workers")
+
     results = []
+    failed = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(worker_function, datum, run_id): datum["instance_id"]
@@ -235,8 +334,28 @@ def main(
         for future in tqdm(
             as_completed(futures), total=len(futures), desc="Generating workloads"
         ):
-            result = future.result()
-            results.append(result)
+            instance_id = futures[future]
+            try:
+                result = future.result()
+                results.append(result)
+                if result.get("error"):
+                    failed.append(instance_id)
+            except Exception as e:
+                logger.error(f"[{instance_id}] Unhandled exception: {e}")
+                failed.append(instance_id)
+                results.append({
+                    "instance_id": instance_id,
+                    "run_id": run_id,
+                    "workload": None,
+                    "error": str(e),
+                    "workload_generation_cost": {
+                        "model": "unknown",
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "total_tokens": 0,
+                        "cost_usd": 0.0,
+                    },
+                })
 
     total_cost = sum(
         r.get("workload_generation_cost", {}).get("cost_usd", 0.0) for r in results
@@ -244,14 +363,22 @@ def main(
     total_tokens = sum(
         r.get("workload_generation_cost", {}).get("total_tokens", 0) for r in results
     )
-    print(
-        f"\nWorkload generation complete: {len(results)} instances, "
+    resumed_count = sum(1 for r in results if r.get("resumed"))
+
+    logger.info(
+        f"Workload generation complete: {len(results)} instances "
+        f"({resumed_count} resumed, {len(failed)} failed), "
         f"{total_tokens:,} tokens, ${total_cost:.4f} USD"
     )
+    if failed:
+        logger.warning(f"Failed instances: {failed}")
 
-    with open(output_path, "w") as f:
+    # Append to output file (supports resume across runs)
+    mode = "a" if output_path.exists() and not no_resume else "w"
+    with open(output_path, mode) as f:
         for result in results:
-            f.write(json.dumps(result) + "\n")
+            if not result.get("resumed"):  # Don't re-write cached entries
+                f.write(json.dumps(result) + "\n")
 
 
 if __name__ == "__main__":
@@ -280,6 +407,18 @@ if __name__ == "__main__":
     parser.add_argument(
         "--run_id", type=str, required=True, help="Run ID - identifies the run"
     )
+    parser.add_argument(
+        "--no_resume",
+        action="store_true",
+        help="Disable resume mode (re-generate all instances from scratch)",
+    )
     args = parser.parse_args()
 
-    main(**vars(args))
+    main(
+        dataset_name=args.dataset_name,
+        split=args.split,
+        instance_ids=args.instance_ids,
+        max_workers=args.max_workers,
+        run_id=args.run_id,
+        no_resume=args.no_resume,
+    )

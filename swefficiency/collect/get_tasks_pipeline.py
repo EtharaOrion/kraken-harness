@@ -12,9 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Script to collect pull requests and convert them to candidate task instances"""
+"""Script to collect pull requests and convert them to candidate task instances.
+
+Supports multiple input methods for repos:
+  --repos owner/repo1 owner/repo2 ...   (inline list)
+  --repos-file path/to/repos.txt        (one owner/repo per line, # comments ok)
+
+Tokens are distributed across repos for parallel scraping.
+"""
 
 import argparse
+import logging
 import os
 import traceback
 from multiprocessing import Pool
@@ -25,6 +33,37 @@ from swefficiency.collect.build_dataset import main as build_dataset
 from swefficiency.collect.print_pulls import main as print_pulls
 
 load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+
+def load_repos_from_file(repos_file: str) -> list[str]:
+    """
+    Load repository list from a file.
+
+    Supports formats:
+    - Simple: one owner/repo per line
+    - Ranked (from discover_repos.py): "owner/repo  # comment" lines
+    - Comments (#) and blank lines are skipped
+    """
+    repos = []
+    with open(repos_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            # Handle ranked format: "owner/repo  # stars | est_perf_prs | density"
+            repo_name = line.split("#")[0].strip()
+            # Handle any trailing whitespace or extra fields
+            repo_name = repo_name.split()[0] if repo_name else ""
+            if "/" in repo_name:
+                repos.append(repo_name)
+            else:
+                logger.warning(f"Skipping invalid repo line: {line!r}")
+    return repos
 
 
 def split_instances(input_list: list, n: int) -> list:
@@ -107,9 +146,10 @@ def construct_data_files(data: dict):
 
 
 def main(
-    repos: list,
-    path_prs: str,
-    path_tasks: str,
+    repos: list = None,
+    repos_file: str = None,
+    path_prs: str = ".",
+    path_tasks: str = ".",
     max_pulls: int = None,
     cutoff_date: str = None,
 ):
@@ -118,14 +158,40 @@ def main(
 
     Args:
         repos (list): List of repositories to retrieve instruction data for
+        repos_file (str): Path to file containing repos (one per line)
         path_prs (str): Path to save PR data files to
         path_tasks (str): Path to save task instance data files to
+        max_pulls (int): Maximum number of PRs to fetch per repo
         cutoff_date (str): Cutoff date for PRs to consider in format YYYYMMDD
     """
+    # Resolve repos from --repos or --repos-file
+    all_repos = []
+    if repos:
+        all_repos.extend(repos)
+    if repos_file:
+        file_repos = load_repos_from_file(repos_file)
+        all_repos.extend(file_repos)
+        logger.info(f"Loaded {len(file_repos)} repos from {repos_file}")
+
+    if not all_repos:
+        raise ValueError(
+            "No repos specified. Use --repos or --repos-file."
+        )
+
+    # Deduplicate while preserving order
+    seen = set()
+    deduped = []
+    for r in all_repos:
+        r_clean = r.strip()
+        if r_clean not in seen:
+            seen.add(r_clean)
+            deduped.append(r_clean)
+    all_repos = deduped
+
     path_prs, path_tasks = os.path.abspath(path_prs), os.path.abspath(path_tasks)
     print(f"Will save PR data to {path_prs}")
     print(f"Will save task instance data to {path_tasks}")
-    print(f"Received following repos to create task instances for: {repos}")
+    print(f"Processing {len(all_repos)} repos: {all_repos[:10]}{'...' if len(all_repos) > 10 else ''}")
 
     tokens = os.getenv("GITHUB_TOKENS")
     if not tokens:
@@ -133,18 +199,18 @@ def main(
             "Missing GITHUB_TOKENS, consider rerunning with GITHUB_TOKENS=$(gh auth token)"
         )
     tokens = tokens.split(",")
-    data_task_lists = split_instances(repos, len(tokens))
+    data_task_lists = split_instances(all_repos, len(tokens))
 
     data_pooled = [
         {
-            "repos": repos,
+            "repos": repos_chunk,
             "path_prs": path_prs,
             "path_tasks": path_tasks,
             "max_pulls": max_pulls,
             "cutoff_date": cutoff_date,
             "token": token,
         }
-        for repos, token in zip(data_task_lists, tokens)
+        for repos_chunk, token in zip(data_task_lists, tokens)
     ]
 
     with Pool(len(tokens)) as p:
@@ -157,6 +223,13 @@ if __name__ == "__main__":
         "--repos",
         nargs="+",
         help="List of repositories (e.g., `sqlfluff/sqlfluff`) to create task instances for",
+    )
+    parser.add_argument(
+        "--repos-file",
+        "--repos_file",
+        type=str,
+        dest="repos_file",
+        help="Path to file with repos (one owner/repo per line). Output of discover_repos.py.",
     )
     parser.add_argument(
         "--path_prs", type=str, help="Path to folder to save PR data files to"

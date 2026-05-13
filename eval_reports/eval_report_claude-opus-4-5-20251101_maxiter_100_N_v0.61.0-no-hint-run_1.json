@@ -1,9 +1,0 @@
-{
-  "total_instances": 498,
-  "overall_score": 0.225,
-  "proportion_incorrect": 0.0924,
-  "proportion_correct_but_no_speedup": 0.012,
-  "proportion_correct_with_speedup_but_human_no_speedup": 0.4699,
-  "proportion_human_speedup_or_better": 0.4257,
-  "report": "eval_report_claude-opus-4-5-20251101_maxiter_100_N_v0.61.0-no-hint-run_1.csv"
-}

@@ -1,9 +1,0 @@
-{
-  "total_instances": 498,
-  "overall_score": 0.0504,
-  "proportion_incorrect": 0.259,
-  "proportion_correct_but_no_speedup": 0.1024,
-  "proportion_correct_with_speedup_but_human_no_speedup": 0.3594,
-  "proportion_human_speedup_or_better": 0.2791,
-  "report": "eval_report_default_sweperf_openai__openai--gpt-5-mini__t-1.00__p-1.00__c-1.00___swefficiency_full_test.csv"
-}

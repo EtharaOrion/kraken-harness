@@ -108,8 +108,8 @@ def run_instance(
         try:
             # link the image build dir in the log dir
             image_build_link.symlink_to(build_dir.absolute(), target_is_directory=True)
-        except:
-            # some error, idk why
+        except Exception:
+            # Symlink creation can fail (e.g., cross-device, permissions)
             pass
     log_file = log_dir / "run_instance.log"
 

@@ -196,3 +196,7 @@ vendor/
 .sisyphus/.playwright-mcp/
 .playwright-mcp/
 artifacts/
+dump/
+.sisyphus/
+checkpoint.md
+

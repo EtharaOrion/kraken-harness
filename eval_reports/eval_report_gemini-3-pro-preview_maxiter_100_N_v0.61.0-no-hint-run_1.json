@@ -1,9 +1,0 @@
-{
-  "total_instances": 498,
-  "overall_score": 0.1024,
-  "proportion_incorrect": 0.1406,
-  "proportion_correct_but_no_speedup": 0.0301,
-  "proportion_correct_with_speedup_but_human_no_speedup": 0.3574,
-  "proportion_human_speedup_or_better": 0.4719,
-  "report": "eval_report_gemini-3-pro-preview_maxiter_100_N_v0.61.0-no-hint-run_1.csv"
-}

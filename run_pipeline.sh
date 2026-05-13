@@ -12,12 +12,14 @@ set -euo pipefail
 #
 # Options:
 #   --repo OWNER/NAME       Target repo (default: psf/requests)
+#   --repos-file PATH       File with repos, one per line (output of discover_repos.py)
 #   --run-id NAME           Run identifier (default: auto-generated timestamp)
 #   --cutoff-date YYYYMMDD  PR cutoff date (default: 20180101)
 #   --max-pulls N           Max PRs to scrape (default: unlimited)
 #   --max-workers N         Parallel workers for eval (default: 1)
 #   --skip-scrape           Skip stages 1-6, use existing enriched JSONL
 #   --skip-workload         Skip workload generation
+#   --filter-early          Apply perf filter at Stage I (reduces volume ~95%)
 #   --dataset PATH          Use existing dataset JSONL (skips scrape+filter+version)
 #   --mode MODE             Inference mode: default|openhands (default: default)
 #   --dry-run               Show what would be done without executing
@@ -39,6 +41,8 @@ cd "$SCRIPT_DIR"
 
 # ─── Defaults ─────────────────────────────────────────────────────────────────
 REPO="psf/requests"
+REPOS_FILE=""
+FILTER_EARLY=false
 RUN_ID=""
 CUTOFF_DATE="20180101"
 MAX_PULLS=""
@@ -59,6 +63,7 @@ STAGES=""
 while [[ $# -gt 0 ]]; do
     case $1 in
         --repo)         REPO="$2"; shift 2 ;;
+        --repos-file)   REPOS_FILE="$2"; shift 2 ;;
         --run-id)       RUN_ID="$2"; shift 2 ;;
         --cutoff-date)  CUTOFF_DATE="$2"; shift 2 ;;
         --max-pulls)    MAX_PULLS="$2"; shift 2 ;;
@@ -74,6 +79,7 @@ while [[ $# -gt 0 ]]; do
         --start-from)   START_FROM="$2"; shift 2 ;;
         --stop-after)   STOP_AFTER="$2"; shift 2 ;;
         --stages)       STAGES="$2"; shift 2 ;;
+        --filter-early) FILTER_EARLY=true; shift ;;
         --help)
             sed -n '/^# Usage:/,/^###/p' "$0" | head -n -1
             exit 0
@@ -83,9 +89,16 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ─── Derived values ───────────────────────────────────────────────────────────
-REPO_SLUG="${REPO##*/}"
-REPO_OWNER="${REPO%%/*}"
-[[ -z "$RUN_ID" ]] && RUN_ID="${REPO_SLUG}_$(date +%Y%m%d_%H%M%S)"
+if [[ -n "$REPOS_FILE" ]]; then
+    # Multi-repo mode: use generic slug
+    REPO_SLUG="multi"
+    REPO_OWNER="multi"
+    [[ -z "$RUN_ID" ]] && RUN_ID="multi_$(date +%Y%m%d_%H%M%S)"
+else
+    REPO_SLUG="${REPO##*/}"
+    REPO_OWNER="${REPO%%/*}"
+    [[ -z "$RUN_ID" ]] && RUN_ID="${REPO_SLUG}_$(date +%Y%m%d_%H%M%S)"
+fi
 
 ARTIFACTS_DIR="$SCRIPT_DIR/artifacts"
 PRS_DIR="$ARTIFACTS_DIR/pull_requests"
@@ -210,21 +223,33 @@ fi
 # STAGE 1-3: Scrape PRs + Build Dataset
 ###############################################################################
 stage_scrape() {
-    log "STAGE 1-3: Scraping PRs from $REPO"
+    if [[ -n "$REPOS_FILE" ]]; then
+        log "STAGE 1-3: Scraping PRs from repos file: $REPOS_FILE"
+    else
+        log "STAGE 1-3: Scraping PRs from $REPO"
+    fi
     ensure_dir "$PRS_DIR" "$TASKS_DIR"
 
     local pulls_args=(
-        --repos "$REPO"
         --path_prs "$PRS_DIR"
         --path_tasks "$TASKS_DIR"
     )
+
+    # Support both single --repo and --repos-file
+    if [[ -n "$REPOS_FILE" ]]; then
+        pulls_args+=(--repos-file "$REPOS_FILE")
+    else
+        pulls_args+=(--repos "$REPO")
+    fi
+
     [[ -n "$CUTOFF_DATE" ]] && pulls_args+=(--cutoff_date "$CUTOFF_DATE")
     [[ -n "$MAX_PULLS" ]] && pulls_args+=(--max_pulls "$MAX_PULLS")
 
     step "Scraping PRs and building task instances..."
     run_cmd python -m swefficiency.collect.get_tasks_pipeline "${pulls_args[@]}"
 
-    TASKS_FILE=$(find_jsonl "$TASKS_DIR" "${REPO_SLUG}*task-instances*.jsonl")
+    # Find task instances (may be multiple files for multi-repo)
+    TASKS_FILE=$(find_jsonl "$TASKS_DIR" "*task-instances*.jsonl")
     if [[ -z "$TASKS_FILE" ]]; then
         echo "ERROR: No task instances file found in $TASKS_DIR"
         exit 1
@@ -239,19 +264,43 @@ stage_perf_filter() {
     log "STAGE 4: Performance filtering"
     ensure_dir "$FILTERED_DIR"
 
-    PRS_FILE=$(find_jsonl "$PRS_DIR" "${REPO_SLUG}*prs*.jsonl")
+    # In multi-repo mode, find ALL PR files; in single-repo mode, use slug
+    local prs_pattern
+    if [[ "$REPO_SLUG" == "multi" ]]; then
+        prs_pattern="*prs*.jsonl"
+    else
+        prs_pattern="${REPO_SLUG}*prs*.jsonl"
+    fi
+
+    PRS_FILE=$(find_jsonl "$PRS_DIR" "$prs_pattern")
     if [[ -z "$PRS_FILE" ]]; then
         echo "ERROR: No PRs file found in $PRS_DIR"
         exit 1
     fi
 
     step "Filtering for performance-related PRs..."
-    run_cmd python -m swefficiency.perf_filter.attributes.filter \
-        --prs_path "$PRS_FILE" \
-        --instances_path "$TASKS_FILE" \
-        --output_dir "$FILTERED_DIR"
+    # For multi-repo, process each PR file against corresponding task file
+    if [[ "$REPO_SLUG" == "multi" ]]; then
+        # Concatenate all task instance files into one for filtering
+        local merged_tasks="$TASKS_DIR/_all_task_instances.jsonl"
+        cat "$TASKS_DIR"/*task-instances*.jsonl > "$merged_tasks" 2>/dev/null || true
+        TASKS_FILE="$merged_tasks"
 
-    FILTERED_FILE=$(find_jsonl "$FILTERED_DIR" "${REPO_SLUG}*attribute*.jsonl")
+        # Run filter on each PR file and merge results
+        local all_prs_merged="$PRS_DIR/_all_prs.jsonl"
+        cat "$PRS_DIR"/*prs*.jsonl > "$all_prs_merged" 2>/dev/null || true
+        run_cmd python -m swefficiency.perf_filter.attributes.filter \
+            --prs_path "$all_prs_merged" \
+            --instances_path "$TASKS_FILE" \
+            --output_dir "$FILTERED_DIR"
+    else
+        run_cmd python -m swefficiency.perf_filter.attributes.filter \
+            --prs_path "$PRS_FILE" \
+            --instances_path "$TASKS_FILE" \
+            --output_dir "$FILTERED_DIR"
+    fi
+
+    FILTERED_FILE=$(find_jsonl "$FILTERED_DIR" "*attribute*.jsonl")
     if [[ -z "$FILTERED_FILE" ]]; then
         echo "WARNING: No filtered instances found. Using unfiltered tasks..."
         FILTERED_FILE="$TASKS_FILE"
@@ -282,7 +331,7 @@ stage_versioning() {
 
     # get_versions outputs a JSON array file, not JSONL — convert it
     local json_file
-    json_file=$(find "$VERSIONED_DIR" -name "${REPO_SLUG}*_versions.json" -type f 2>/dev/null | head -1)
+    json_file=$(find "$VERSIONED_DIR" -name "*_versions.json" -type f 2>/dev/null | head -1)
     VERSIONED_FILE="$VERSIONED_DIR/${REPO_SLUG}-versioned.jsonl"
 
     if [[ -n "$json_file" && -f "$json_file" ]]; then
@@ -348,7 +397,7 @@ stage_workload() {
     run_cmd python -m swefficiency.workload.run_synthetic_generation \
         --dataset_name "$ENRICHED_FILE" \
         --run_id "$RUN_ID" \
-        --max_workers 1
+        --max_workers "$MAX_WORKERS"
 
     # Find workload output
     local wl_output
@@ -645,7 +694,11 @@ print(f'  Human speedup+:     {r[\"proportion_human_speedup_or_better\"]}')
 # MAIN
 ###############################################################################
 main() {
-    log "SWE-fficiency Pipeline — $REPO"
+    if [[ -n "$REPOS_FILE" ]]; then
+        log "SWE-fficiency Pipeline — multi-repo (from $REPOS_FILE)"
+    else
+        log "SWE-fficiency Pipeline — $REPO"
+    fi
     echo "  Run ID:      $RUN_ID"
     echo "  Mode:        $MODE"
     echo "  Max workers: $MAX_WORKERS"

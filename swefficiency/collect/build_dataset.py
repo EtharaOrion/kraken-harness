@@ -14,6 +14,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Build task instances from scraped pull requests.
+
+Supports --filter-early to apply perf keyword filtering at Stage I (reduces
+downstream volume ~95% for large repos). When disabled (default), ALL merged
+PRs pass through and filtering happens at Stage II.
+"""
 
 import argparse
 import json
@@ -49,10 +55,6 @@ def create_instance(repo: Repo, pull: dict) -> dict:
     patch, test_patch = extract_patches(pull, repo)
     problem_statement, hints = extract_problem_statement_and_hints(pull, repo)
 
-    # pr_title = pull.get('title', '')
-    # pr_body = pull.get('body', '')
-
-    # print(pr_title, pr_body)
     return {
         "repo": repo.repo.full_name,
         "pull_number": pull["number"],
@@ -117,7 +119,13 @@ def has_test_patch(instance: dict) -> bool:
     return True
 
 
-def main(pr_file: str, output: str, token: Optional[str] = None, canonical_repo: Optional[str] = None):
+def main(
+    pr_file: str,
+    output: str,
+    token: Optional[str] = None,
+    canonical_repo: Optional[str] = None,
+    filter_early: bool = False,
+):
     """
     Main thread for creating task instances from pull requests
 
@@ -126,6 +134,7 @@ def main(pr_file: str, output: str, token: Optional[str] = None, canonical_repo:
         output (str): output file name
         token (str): GitHub token
         canonical_repo (str): canonical owner/repo name (prevents GitHub fork resolution)
+        filter_early (bool): if True, apply perf keyword filter at this stage
     """
     if token is None:
         # Get GitHub token from environment variable if not provided
@@ -140,6 +149,7 @@ def main(pr_file: str, output: str, token: Optional[str] = None, canonical_repo:
     completed = 0
     with_tests = 0
     total_instances = 0
+    filtered_out = 0
     all_output = output + ".all"
     seen_prs = set()
 
@@ -192,9 +202,14 @@ def main(pr_file: str, output: str, token: Optional[str] = None, canonical_repo:
                     repos[repo_name] = load_repo(repo_name)
                 repo = repos[repo_name]
 
-                # Maybe add this back later?
-                # if not is_perf_pr(repo.name, pull):
-                #     continue
+                # Early perf filtering: skip non-perf PRs at Stage I
+                # This reduces downstream volume ~95% but may miss edge cases.
+                # The dynamic filter (filter_base) handles any repo without a
+                # repo-specific filter — no more hardcoded filter-per-repo needed.
+                if filter_early:
+                    if not is_perf_pr(repo.name, pull):
+                        filtered_out += 1
+                        continue
 
                 instance = create_instance(repo, pull)
                 if is_valid_instance(instance):
@@ -208,8 +223,13 @@ def main(pr_file: str, output: str, token: Optional[str] = None, canonical_repo:
                         print(json.dumps(instance), end="\n", flush=True, file=output)
                         with_tests += 1
     logger.info(
-        f"[{', '.join(repos.keys())}] Total instances: {total_instances}, completed: {completed}, with tests: {with_tests}"
+        f"[{', '.join(repos.keys())}] Total instances: {total_instances}, "
+        f"completed: {completed}, with tests: {with_tests}"
     )
+    if filter_early:
+        logger.info(
+            f"[{', '.join(repos.keys())}] Early filter removed {filtered_out} non-perf PRs"
+        )
     logger.info(
         f"[{', '.join(repos.keys())}] Skipped {len(seen_prs)} pull requests that have already been inspected"
     )
@@ -220,5 +240,16 @@ if __name__ == "__main__":
     parser.add_argument("pr_file", type=str, help="Path to pull request JSONL file")
     parser.add_argument("output", type=str, help="Output file name")
     parser.add_argument("--token", type=str, help="GitHub token")
+    parser.add_argument(
+        "--filter-early",
+        action="store_true",
+        default=False,
+        help="Apply perf keyword filter at Stage I (reduces volume ~95%%)",
+    )
     args = parser.parse_args()
-    main(**vars(args))
+    main(
+        pr_file=args.pr_file,
+        output=args.output,
+        token=args.token,
+        filter_early=args.filter_early,
+    )

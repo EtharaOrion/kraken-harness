@@ -110,7 +110,7 @@ for filepath in all_coverage_filepaths:
         measured_files = covdb.measured_files()
 
         print(test_file_name)
-    except:
+    except Exception:
         continue
 
     try:

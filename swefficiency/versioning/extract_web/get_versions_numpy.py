@@ -50,7 +50,7 @@ while True:
         if len(raw_releases) == 0:
             break
         i += 1
-    except:
+    except Exception:
         break
 
     for raw_release in raw_releases:

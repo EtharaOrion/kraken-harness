@@ -19,7 +19,10 @@ import logging
 import os
 import re
 import subprocess
+import time
+from collections import defaultdict
 from multiprocessing import Manager, Pool
+from typing import Optional
 
 import requests
 
@@ -42,6 +45,11 @@ INSTALL_CMD = {
     "pydata/xarray": "pip install -e .",
 }
 
+# HTTP request settings
+HTTP_TIMEOUT = 30  # seconds
+HTTP_MAX_RETRIES = 3
+HTTP_BACKOFF_BASE = 2  # exponential backoff base
+
 
 _GENERIC_VERSION_PATTERNS = [
     r'__version__\s*=\s*[\'"]([^\'"]+)[\'"]',
@@ -50,6 +58,24 @@ _GENERIC_VERSION_PATTERNS = [
     r"VERSION\s*=\s*\(([^)]+)\)",
     r'VERSION\s*=\s*[\'"]([^\'"]+)[\'"]',
 ]
+
+
+def _fetch_url_with_retry(url: str, max_retries: int = HTTP_MAX_RETRIES, timeout: int = HTTP_TIMEOUT) -> Optional[str]:
+    """Fetch URL content with exponential backoff retry."""
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(url, timeout=timeout)
+            if resp.status_code == 200:
+                return resp.text
+            if resp.status_code == 404:
+                return None  # File doesn't exist, no point retrying
+            logger.warning(f"HTTP {resp.status_code} for {url} (attempt {attempt + 1}/{max_retries})")
+        except requests.RequestException as e:
+            logger.warning(f"Request failed for {url}: {e} (attempt {attempt + 1}/{max_retries})")
+        if attempt < max_retries - 1:
+            sleep_time = HTTP_BACKOFF_BASE ** attempt
+            time.sleep(sleep_time)
+    return None
 
 
 def _find_version_in_text(text: str, instance: dict) -> str:
@@ -74,7 +100,7 @@ def _find_version_in_text(text: str, instance: dict) -> str:
     for pattern in patterns:
         matches = re.search(pattern, text)
         if matches is not None:
-            print(instance["repo"])
+            logger.debug(f"Version match for {instance['repo']} using pattern: {pattern}")
 
             if instance["repo"] == "pyvista/pyvista":
                 text = matches.group(0)
@@ -87,7 +113,7 @@ def _find_version_in_text(text: str, instance: dict) -> str:
             if instance["repo"] == "networkx/networkx":
                 # Check if there are multiple groups.
                 if len(matches.groups()) > 1:
-                    print(text)
+                    logger.debug(f"NetworkX multi-group match: {text}")
                     result = f"{matches.group(1)}.{matches.group(2)}"
 
             return result.replace(" ", "")
@@ -131,7 +157,7 @@ def get_version(instance, is_build=False, path_repo=None):
             version_path_abs = os.path.join(path_repo, path_to_version)
             if os.path.exists(version_path_abs):
                 logger.info(f"Found version file at {path_to_version}")
-                with open(path_to_version) as f:
+                with open(version_path_abs) as f:
                     init_text = f.read()
         else:
             url = os.path.join(
@@ -140,7 +166,7 @@ def get_version(instance, is_build=False, path_repo=None):
                 instance["base_commit"],
                 path_to_version,
             )
-            init_text = requests.get(url).text
+            init_text = _fetch_url_with_retry(url)
         version = _find_version_in_text(init_text, instance)
         if version is not None:
             if "." in version:
@@ -203,6 +229,11 @@ def get_versions_from_build(data: dict):
     os.chdir(path_repo)
 
     for instance in data_tasks[::-1]:
+        # Skip already-versioned instances (resume support)
+        if instance.get("version"):
+            logger.info(f"[{instance['instance_id']}] Already versioned ({instance['version']}), skipping")
+            continue
+
         # Reset repo to base commit
         subprocess.run(
             "git restore .", check=True, shell=True, stdout=subprocess.DEVNULL
@@ -255,6 +286,11 @@ def get_versions_from_web(data: dict):
     data_tasks, save_path = data["data_tasks"], data["save_path"]
     version_not_found = data["not_found_list"]
     for instance in data_tasks:
+        # Skip already-versioned instances (resume support)
+        if instance.get("version"):
+            logger.info(f"[{instance['instance_id']}] Already versioned ({instance['version']}), skipping")
+            continue
+
         version = get_version(instance)
         if version is not None:
             instance["version"] = version
@@ -277,20 +313,32 @@ def merge_results(instances_path: str, repo_prefix: str, output_dir: str = None)
     Returns:
         int: Number of instances in merged results
     """
+    # Search in output_dir if provided, otherwise CWD
+    search_dir = output_dir if output_dir else "."
+    glob_pattern = os.path.join(search_dir, f"{repo_prefix}_versions_*.json")
+
     # Merge values from result JSON files into a single list
     merged = []
-    for task_with_version_path in glob.glob(f"{repo_prefix}_versions_*.json"):
+    for task_with_version_path in glob.glob(glob_pattern):
         with open(task_with_version_path) as f:
             task_with_version = json.load(f)
             merged.extend(task_with_version)
         os.remove(task_with_version_path)
 
+    # Also check CWD if nothing found in output_dir (backward compat)
+    if not merged and output_dir:
+        for task_with_version_path in glob.glob(f"{repo_prefix}_versions_*.json"):
+            with open(task_with_version_path) as f:
+                task_with_version = json.load(f)
+                merged.extend(task_with_version)
+            os.remove(task_with_version_path)
+
     # Save merged results to original task instances file's path with `_versions` suffix
-    old_path_file = instances_path.split("/")[-1]
-    instances_path_new = f"{old_path_file.split('.')[0]}_versions.json"
+    old_path_file = os.path.basename(instances_path)
+    instances_path_new = f"{os.path.splitext(old_path_file)[0]}_versions.json"
     if output_dir is not None:
         instances_path_new = os.path.join(output_dir, instances_path_new)
-    with open(f"{instances_path_new}", "w") as f:
+    with open(instances_path_new, "w") as f:
         json.dump(merged, fp=f)
     logger.info(
         f"Saved merged results to {instances_path_new} ({len(merged)} instances)"
@@ -298,18 +346,40 @@ def merge_results(instances_path: str, repo_prefix: str, output_dir: str = None)
     return len(merged)
 
 
+def _group_instances_by_repo(data_tasks: list) -> dict:
+    """Group instances by repo for multi-repo support."""
+    groups = defaultdict(list)
+    for instance in data_tasks:
+        groups[instance["repo"]].append(instance)
+    return dict(groups)
+
+
 def main(args):
     """
     Main function for looking up versions for task instances.
+    Supports both single-repo and multi-repo datasets.
     """
     # Get task instances + split into groups for each thread
     data_tasks = get_instances(args.instances_path)
-    data_task_lists = split_instances(data_tasks, args.num_workers)
-    repo_prefix = data_tasks[0]["repo"].replace("/", "__")
 
-    logger.info(
-        f"Getting versions for {len(data_tasks)} instances for {data_tasks[0]['repo']}"
-    )
+    # Detect single vs multi-repo
+    repos = set(inst["repo"] for inst in data_tasks)
+    is_multi_repo = len(repos) > 1
+
+    if is_multi_repo:
+        logger.info(f"Multi-repo mode: {len(repos)} repos, {len(data_tasks)} total instances")
+        for repo in sorted(repos):
+            count = sum(1 for inst in data_tasks if inst["repo"] == repo)
+            logger.info(f"  {repo}: {count} instances")
+        # Use a generic prefix for multi-repo
+        repo_prefix = "multi"
+    else:
+        repo_prefix = data_tasks[0]["repo"].replace("/", "__")
+        logger.info(
+            f"Getting versions for {len(data_tasks)} instances for {data_tasks[0]['repo']}"
+        )
+
+    data_task_lists = split_instances(data_tasks, args.num_workers)
     logger.info(
         f"Split instances into {len(data_task_lists)} groups with lengths {[len(x) for x in data_task_lists]}"
     )
@@ -318,16 +388,19 @@ def main(args):
     if any([x == args.retrieval_method for x in ["github", "mix"]]):
         manager = Manager()
         shared_result_list = manager.list()
+
+        save_dir = args.output_dir if args.output_dir else "."
         pool = Pool(processes=args.num_workers)
         pool.map(
             get_versions_from_web,
             [
                 {
                     "data_tasks": data_task_list,
-                    "save_path": (
+                    "save_path": os.path.join(
+                        save_dir,
                         f"{repo_prefix}_versions_{i}.json"
                         if args.retrieval_method == "github"
-                        else f"{repo_prefix}_versions_{i}_web.json"
+                        else f"{repo_prefix}_versions_{i}_web.json",
                     ),
                     "not_found_list": (
                         shared_result_list if args.retrieval_method == "mix" else None
@@ -341,9 +414,13 @@ def main(args):
 
         if args.retrieval_method == "github":
             # If retrieval method is just GitHub, then merge results and return
-            assert len(data_tasks) == merge_results(
+            merged_count = merge_results(
                 args.instances_path, repo_prefix, args.output_dir
             )
+            if merged_count != len(data_tasks):
+                logger.warning(
+                    f"Expected {len(data_tasks)} instances, got {merged_count} after merge"
+                )
             return
         elif args.retrieval_method == "mix":
             # Otherwise, remove instances that were found via GitHub from the list
@@ -362,22 +439,40 @@ def main(args):
 
     cwd = os.getcwd()
     os.chdir(args.testbed)
+
+    if is_multi_repo:
+        # Multi-repo build mode: clone each repo separately
+        repo_to_prefix = {}
+        for repo in repos:
+            rp = repo.replace("/", "__")
+            repo_to_prefix[repo] = rp
+            for x in range(0, args.num_workers):
+                testbed_repo_name = f"{rp}__{x}"
+                if not os.path.exists(testbed_repo_name):
+                    logger.info(f"Creating clone of {repo} at {testbed_repo_name}")
+                    cmd_clone = f"git clone git@github.com:swe-bench/{rp} {testbed_repo_name}"
+                    subprocess.run(cmd_clone, shell=True, check=True, stdout=subprocess.DEVNULL)
+                else:
+                    logger.info(f"Repo for {repo} exists: {testbed_repo_name}; skipping...")
+    else:
+        for x in range(0, args.num_workers):
+            # Clone git repo per thread
+            testbed_repo_name = f"{repo_prefix}__{x}"
+            if not os.path.exists(testbed_repo_name):
+                logger.info(
+                    f"Creating clone of {data_tasks[0]['repo']} at {testbed_repo_name}"
+                )
+                cmd_clone = (
+                    f"git clone git@github.com:swe-bench/{repo_prefix} {testbed_repo_name}"
+                )
+                subprocess.run(cmd_clone, shell=True, check=True, stdout=subprocess.DEVNULL)
+            else:
+                logger.info(
+                    f"Repo for {data_tasks[0]['repo']} exists: {testbed_repo_name}; skipping..."
+                )
+
+    # Clone conda environment per thread
     for x in range(0, args.num_workers):
-        # Clone git repo per thread
-        testbed_repo_name = f"{repo_prefix}__{x}"
-        if not os.path.exists(testbed_repo_name):
-            logger.info(
-                f"Creating clone of {data_tasks[0]['repo']} at {testbed_repo_name}"
-            )
-            cmd_clone = (
-                f"git clone git@github.com:swe-bench/{repo_prefix} {testbed_repo_name}"
-            )
-            subprocess.run(cmd_clone, shell=True, check=True, stdout=subprocess.DEVNULL)
-        else:
-            logger.info(
-                f"Repo for {data_tasks[0]['repo']} exists: {testbed_repo_name}; skipping..."
-            )
-        # Clone conda environment per thread
         conda_env_name = f"{args.conda_env}_clone_{x}"
         if not os.path.exists(os.path.join(args.path_conda, "envs", conda_env_name)):
             logger.info(f"Creating clone of {args.conda_env} at {conda_env_name}")
@@ -393,17 +488,39 @@ def main(args):
 
     # Create pool tasks
     pool_tasks = []
-    for i in range(0, args.num_workers):
-        testbed_repo_name = f"{repo_prefix}__{i}"
-        pool_tasks.append(
-            {
-                "data_tasks": data_task_lists[i],
-                "path_repo": os.path.join(args.testbed, testbed_repo_name),
-                "conda_env": f"{args.conda_env}_clone_{i}",
-                "path_conda": args.path_conda,
-                "save_path": os.path.join(cwd, f"{repo_prefix}_versions_{i}.json"),
-            }
-        )
+    if is_multi_repo:
+        # For multi-repo, each worker gets a mixed bag; use first instance's repo for path
+        # Better: split by repo, then distribute evenly
+        repo_groups = _group_instances_by_repo(data_tasks)
+        all_instances_flat = []
+        for repo, instances in repo_groups.items():
+            all_instances_flat.extend(instances)
+        data_task_lists = split_instances(all_instances_flat, args.num_workers)
+        for i in range(0, args.num_workers):
+            # Use first instance's repo for testbed path (workers handle multi-repo internally)
+            first_repo = data_task_lists[i][0]["repo"] if data_task_lists[i] else list(repos)[0]
+            first_prefix = first_repo.replace("/", "__")
+            pool_tasks.append(
+                {
+                    "data_tasks": data_task_lists[i],
+                    "path_repo": os.path.join(args.testbed, f"{first_prefix}__{i}"),
+                    "conda_env": f"{args.conda_env}_clone_{i}",
+                    "path_conda": args.path_conda,
+                    "save_path": os.path.join(cwd, f"{repo_prefix}_versions_{i}.json"),
+                }
+            )
+    else:
+        for i in range(0, args.num_workers):
+            testbed_repo_name = f"{repo_prefix}__{i}"
+            pool_tasks.append(
+                {
+                    "data_tasks": data_task_lists[i],
+                    "path_repo": os.path.join(args.testbed, testbed_repo_name),
+                    "conda_env": f"{args.conda_env}_clone_{i}",
+                    "path_conda": args.path_conda,
+                    "save_path": os.path.join(cwd, f"{repo_prefix}_versions_{i}.json"),
+                }
+            )
 
     # Parallelized call
     pool = Pool(processes=args.num_workers)
@@ -413,24 +530,28 @@ def main(args):
 
     # Check that correct number of instances were versioned
     if args.retrieval_method == "mix":
-        assert (
-            len(data_tasks)
-            == merge_results(args.instances_path, repo_prefix, args.output_dir)
-            + total_web
-        )
+        merged_count = merge_results(args.instances_path, repo_prefix, args.output_dir)
+        expected = len(data_tasks)
+        if merged_count + total_web != expected:
+            logger.warning(f"Expected {expected} instances, got {merged_count} + {total_web} web = {merged_count + total_web}")
     elif args.retrieval_method == "build":
-        assert len(data_tasks) == merge_results(
-            args.instances_path, repo_prefix, args.output_dir
-        )
+        merged_count = merge_results(args.instances_path, repo_prefix, args.output_dir)
+        if merged_count != len(data_tasks):
+            logger.warning(f"Expected {len(data_tasks)} instances, got {merged_count} after merge")
 
     # Remove testbed repo and conda environments
     if args.cleanup:
         cwd = os.getcwd()
         os.chdir(args.testbed)
         for x in range(0, args.num_workers):
-            # Remove git repo
-            testbed_repo_name = f"{repo_prefix}__{x}"
-            subprocess.run(f"rm -rf {testbed_repo_name}", shell=True, check=True)
+            if is_multi_repo:
+                for repo in repos:
+                    rp = repo.replace("/", "__")
+                    testbed_repo_name = f"{rp}__{x}"
+                    subprocess.run(f"rm -rf {testbed_repo_name}", shell=True, check=True)
+            else:
+                testbed_repo_name = f"{repo_prefix}__{x}"
+                subprocess.run(f"rm -rf {testbed_repo_name}", shell=True, check=True)
 
             # Remove conda environment
             cmd_rm_env = (

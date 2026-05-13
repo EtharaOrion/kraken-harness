@@ -52,7 +52,7 @@ for match in matches:
         try:
             date_obj = datetime.strptime(date_str, f_)
             times.append((date_obj.strftime("%Y-%m-%d"), version))
-        except:
+        except (ValueError, TypeError):
             continue
         break
 

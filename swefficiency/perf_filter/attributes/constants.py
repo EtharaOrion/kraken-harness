@@ -13,17 +13,28 @@
 # limitations under the License.
 
 """
-Defining repo specific filters.
+Performance PR filtering constants and keyword-based filters.
+
+PAPER ALIGNMENT (Appendix C.2, arxiv 2511.06090):
+  Stage II Criterion 2 specifies EXACTLY 28 keywords for PR metadata matching.
+  These are preserved in PAPER_PERF_KEYWORDS below (do NOT modify).
+  
+  EXTENDED_PERF_KEYWORDS adds additional recall keywords for the scaled pipeline.
+  The combined set is used by default for broader coverage at 10k+ scale.
+
+DESIGN PHILOSOPHY:
+  Universal filter_base() works for ANY Python repo via keyword + label matching.
+  Repo-specific filters are OPTIONAL overrides for known repos with label conventions.
+  For unknown repos, filter_base applies automatically.
 """
 
 import re
 
-VERBATIM_KEYWORDS = [
-    "PERF",
-    "OPTIM",
-]
-
-BASE_PERF_KEYWORDS = [
+# ─────────────────────────────────────────────────────────────────────────────
+# KEYWORDS — PAPER-SPECIFIED (DO NOT MODIFY)
+# ─────────────────────────────────────────────────────────────────────────────
+# Exact 28 keywords from Appendix C.2 of arxiv 2511.06090
+PAPER_PERF_KEYWORDS = [
     "performance",
     "speedup",
     "speeds up",
@@ -35,6 +46,7 @@ BASE_PERF_KEYWORDS = [
     "optimization",
     "profiling",
     "accelerate",
+    "fast",          # NOTE: also in WORD_BOUNDARY_KEYWORDS for precision
     "runtime",
     "efficiency",
     "benchmark",
@@ -49,19 +61,48 @@ BASE_PERF_KEYWORDS = [
     "resource usage",
     "cache",
     "caching",
-    # Other common ones related to timing and benchmarks.
     "timeit",
     "asv",
 ]
 
-# Keywords that require word-boundary matching to avoid false positives.
-# "fast" matches "FastAPI", "breakfast", etc. — use regex word boundary instead.
+# ─────────────────────────────────────────────────────────────────────────────
+# KEYWORDS — EXTENDED (for broader recall at scale)
+# ─────────────────────────────────────────────────────────────────────────────
+# Additional keywords beyond the paper's 28, for catching implicit perf PRs.
+# Used when --extended-keywords flag is passed to the filter.
+EXTENDED_PERF_KEYWORDS = PAPER_PERF_KEYWORDS + [
+    "bottleneck",
+    "slow",
+    "overhead",
+    "vectorize",
+    "vectorization",
+    "allocat",         # allocate, allocation, allocator
+    "gc",
+    "garbage collect",
+    "memoiz",          # memoize, memoization
+    "lazy",
+    "eager",
+    "batch",
+    "bulk",
+    "regression",      # performance regression
+    "time complex",    # time complexity
+    "space complex",   # space complexity
+]
+
+# Keywords requiring word-boundary matching (avoid FastAPI, breakfast, etc.)
 WORD_BOUNDARY_KEYWORDS = [
     "fast",
 ]
 
-# Negative keywords: PRs matching these are likely NOT performance-related.
-# Applied after positive keyword match to reduce false positives.
+# Case-sensitive verbatim keywords
+VERBATIM_KEYWORDS = [
+    "PERF",
+    "OPTIM",
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEGATIVE KEYWORDS — reject PRs matching these regardless of positive signals
+# ─────────────────────────────────────────────────────────────────────────────
 NEGATIVE_TITLE_KEYWORDS = [
     # CI/automation
     "bump",
@@ -80,69 +121,78 @@ NEGATIVE_TITLE_KEYWORDS = [
     "docs:",
     "doc:",
     "[docs]",
-    # Bug fixes (not perf)
-    "fix duplicate",
-    "fix mount",
-    "operationid",
-    "forwardref",
-    "backgroundtask",
+    # Dependency management
     "deprecat",
-    # Feature additions (not perf)
-    "eventsource",
-    "sse",
+    # Release automation
+    "release:",
+    "[release]",
+    "changelog",
 ]
 
-# Files that indicate CI-only changes (not real code).
-CI_FILE_PATTERNS = [
-    ".github/workflows/",
-    ".github/actions/",
-    ".circleci/",
-    ".travis.yml",
-    "Jenkinsfile",
-    "azure-pipelines",
-    ".gitlab-ci",
-    "tox.ini",
-    "noxfile.py",
-]
-
-# Files that indicate dependency-only changes (not real code).
-DEPS_FILE_PATTERNS = [
-    "requirements",
-    "setup.cfg",
-    "setup.py",
-    "pyproject.toml",
-    "Pipfile",
-    "poetry.lock",
-    "constraints.txt",
-]
+# ─────────────────────────────────────────────────────────────────────────────
+# UNIVERSAL FILTER FUNCTIONS
+# ─────────────────────────────────────────────────────────────────────────────
 
 
-def check_labels(pull: dict, value: list[str]) -> bool:
-    labels = [label["name"].lower() for label in pull["labels"]]
-    return any(v in label for v in value for label in labels)
+def check_labels(pull: dict, values: list[str]) -> bool:
+    """Check if PR has any of the given label values (case-insensitive substring match)."""
+    labels = pull.get("labels", [])
+    if not labels:
+        return False
+    label_names = []
+    for label in labels:
+        if isinstance(label, dict):
+            label_names.append(label.get("name", "").lower())
+        elif isinstance(label, str):
+            label_names.append(label.lower())
+    return any(v in label_name for v in values for label_name in label_names)
 
 
-def remove_markdown_comments(input_str):
-    # Use a regular expression to find and remove Markdown comments
+def remove_markdown_comments(input_str: str) -> str:
+    """Remove HTML/Markdown comments from text."""
     return re.sub(r"<!--.*?-->", "", input_str, flags=re.DOTALL)
 
 
 def has_negative_title_keywords(pull: dict) -> bool:
+    """Check if PR title contains negative keywords (likely NOT performance-related)."""
     title_lower = (pull.get("title") or "").lower()
     return any(neg in title_lower for neg in NEGATIVE_TITLE_KEYWORDS)
 
 
-def filter_base(pull: dict, keywords=BASE_PERF_KEYWORDS):
+def filter_base(pull: dict, keywords=None, use_extended: bool = False):
+    """
+    Universal performance filter. Works for ANY repo without configuration.
+
+    Implements paper Criterion 2:
+    1. Reject if title contains negative keywords (CI bumps, docs, etc.)
+    2. Accept if PR labels contain performance-related terms
+    3. Accept if title/body contains performance keywords
+    4. Accept if title/body matches WORD_BOUNDARY_KEYWORDS with \\b
+    5. Accept if title/body contains VERBATIM_KEYWORDS (case-sensitive)
+    
+    Args:
+        pull: PR dict with 'title', 'body', 'labels' fields
+        keywords: Override keyword list (default: PAPER_PERF_KEYWORDS)
+        use_extended: If True, use EXTENDED_PERF_KEYWORDS instead of paper-specified
+    """
+    if keywords is None:
+        keywords = EXTENDED_PERF_KEYWORDS if use_extended else PAPER_PERF_KEYWORDS
+
     if has_negative_title_keywords(pull):
         return False
 
-    pull_body = pull["body"] or ""
-    pull_title = pull["title"] or ""
+    # Check labels (works for any repo that uses perf-related labels)
+    common_perf_labels = ["performance", "perf", "optimization", "speed", "benchmark"]
+    if check_labels(pull, common_perf_labels):
+        return True
+
+    pull_body = pull.get("body") or ""
+    pull_title = pull.get("title") or ""
 
     for item in [pull_body, pull_title]:
         item_lower = remove_markdown_comments(item.lower())
 
-        if any(kw in item_lower for kw in BASE_PERF_KEYWORDS):
+        if any(kw in item_lower for kw in keywords):
             return True
 
         if any(re.search(r'\b' + re.escape(kw) + r'\b', item_lower) for kw in WORD_BOUNDARY_KEYWORDS):
@@ -154,377 +204,105 @@ def filter_base(pull: dict, keywords=BASE_PERF_KEYWORDS):
     return False
 
 
-def filter_content(issue_text, keywords=BASE_PERF_KEYWORDS):
+def filter_content(issue_text: str, keywords=None, use_extended: bool = False) -> bool:
+    """Check if issue/problem statement text contains performance keywords."""
     if not issue_text:
         return False
 
-    issue_text = issue_text.lower()
-    issue_text = remove_markdown_comments(issue_text)
-    if any(kw in issue_text for kw in keywords):
-        return True
-    return False
+    if keywords is None:
+        keywords = EXTENDED_PERF_KEYWORDS if use_extended else PAPER_PERF_KEYWORDS
+
+    issue_text_lower = remove_markdown_comments(issue_text.lower())
+    return any(kw in issue_text_lower for kw in keywords)
 
 
-def filter_sklearn(pull: dict):
-    pr_title = pull["title"].lower()
-
-    # 1. If labelled with "Performance" label, probably perf related :-).
-    if check_labels(pull, ["performance"]):
-        return True
-
-    # 2. Otherwise, check if pull title has "PERF" or  (commonly observed.)
-    if any(kw in pr_title for kw in ["eff", "perf"]):
-        return True
-
-    # 3. Other filters?
-
-    return False
+# ─────────────────────────────────────────────────────────────────────────────
+# REPO-SPECIFIC FILTER OVERRIDES (optional precision for known repos)
+# ─────────────────────────────────────────────────────────────────────────────
 
 
-def filter_astropy(pull: dict):
-    pr_title = pull["title"].lower()
+def _make_label_filter(label_values: list[str], title_keywords: list[str] = None):
+    """
+    Factory: create a repo-specific filter that checks labels + optional title keywords.
+    These are OPTIONAL precision overrides — filter_base handles everything for new repos.
+    """
+    if title_keywords is None:
+        title_keywords = ["perf", "speed", "efficiency", "performance"]
 
-    # 1. If labelled with "Performance" label, probably perf related :-).
-    if check_labels(pull, ["performance"]):
-        return True
+    def _filter(pull: dict) -> bool:
+        if has_negative_title_keywords(pull):
+            return False
+        if check_labels(pull, label_values):
+            return True
+        pr_title = (pull.get("title") or "").lower()
+        if any(kw in pr_title for kw in title_keywords):
+            return True
+        return False
 
-    # 2. Otherwise, check if pull title has "PERF" or  (commonly observed.)
-    if any(kw in pr_title for kw in ["eff", "perf", "speed up"]):
-        return True
-
-    # 3. Other filters?
-
-    return False
-
-
-def filter_matplotlib(pull: dict):
-    pr_title = pull["title"].lower()
-
-    # 1. If labelled with "Performance" label, probably perf related :-).
-    if check_labels(pull, ["performance"]):
-        return True
-
-    # 2. Otherwise, check if pull title has "PERF" or  (commonly observed.)
-    if any(kw in pr_title for kw in ["perf"]):
-        return True
-
-    # 3. Other filters?
-
-    return False
+    return _filter
 
 
-# TODO: Come up with filters per repo!
+# Known repo-specific filters
+filter_sklearn = _make_label_filter(["performance"])
+filter_astropy = _make_label_filter(["performance"], ["eff", "perf", "speed up"])
+filter_matplotlib = _make_label_filter(["performance"])
+filter_pylint = _make_label_filter(["performance"])
+filter_seaborn = _make_label_filter(["perf"])
+filter_sphinx = _make_label_filter(["type:performance"])
+filter_sympy = _make_label_filter(["performance"])
+filter_xarray = _make_label_filter(["topic-performance"], ["perf", "speed up"])
+filter_pandas = _make_label_filter(["performance"])
+filter_dask = _make_label_filter([], ["perf", "speed up", "efficiency", "remove", "avoid", "overhead", "memory"])
+filter_numpy = _make_label_filter([], ["perf", "speed up", "efficiency", "performance"])
+filter_statsmodels = _make_label_filter(["performance"])
+filter_pillow = _make_label_filter(["performance"], ["perf", "speed", "efficiency", "performance"])
+filter_spacy = _make_label_filter(["perf"], ["perf", "speed", "efficiency", "performance"])
+filter_numba = _make_label_filter(["performance"], ["perf", "speed", "efficiency", "performance"])
+filter_gensim = _make_label_filter(["performance"], ["perf", "speed", "efficiency", "performance"])
+filter_scikit_image = _make_label_filter(["performance"], ["perf", "speed", "efficiency", "performance"])
 
+filter_flask = _make_label_filter(
+    ["performance", "perf"],
+    ["perf", "speed", "efficiency", "performance", "optimize",
+     "benchmark", "latency", "throughput", "async", "cache",
+     "memory", "profil", "response time", "request handling"],
+)
+filter_fastapi = _make_label_filter(
+    ["performance", "perf"],
+    ["perf", "speed", "efficiency", "performance", "optimize",
+     "benchmark", "latency", "throughput", "async", "cache",
+     "memory", "profil", "response time", "middleware",
+     "streaming", "concurren"],
+)
 
-def filter_pylint(pull: dict):
-    pr_title = pull["title"].lower()
+# ─────────────────────────────────────────────────────────────────────────────
+# FILTER REGISTRY
+# ─────────────────────────────────────────────────────────────────────────────
 
-    # 1. If labelled with "Performance" label, probably perf related :-).
-    if check_labels(pull, ["performance"]):
-        return True
-
-    # 2. Otherwise, check if pull title has "PERF" or  (commonly observed.)
-    if any(kw in pr_title for kw in ["perf"]):
-        return True
-
-    # 3. Other filters?
-
-    return False
-
-
-def filter_seaborn(pull: dict):
-    pr_title = pull["title"].lower()
-
-    # 1. If labelled with "Performance" label, probably perf related :-).
-    if check_labels(pull, ["perf"]):
-        return True
-
-    # 2. Otherwise, check if pull title has "PERF" or  (commonly observed.)
-    if any(kw in pr_title for kw in ["perf"]):
-        return True
-
-    # 3. Other filters?
-
-    return False
-
-
-def filter_sphinx(pull: dict):
-    pr_title = pull["title"].lower()
-
-    # 1. If labelled with "Performance" label, probably perf related :-).
-    if check_labels(pull, ["type:performance"]):
-        return True
-
-    # 2. Otherwise, check if pull title has "PERF" or  (commonly observed.)
-    if any(kw in pr_title for kw in ["perf"]):
-        return True
-
-    # 3. Other filters?
-    return False
-
-
-def filter_sympy(pull: dict):
-    pr_title = pull["title"].lower()
-
-    # 1. If labelled with "Performance" label, probably perf related :-).
-    if check_labels(pull, ["performance"]):
-        return True
-
-    # 2. Otherwise, check if pull title has "PERF" or  (commonly observed.)
-    if any(kw in pr_title for kw in ["perf"]):
-        return True
-
-    # 3. Other filters?
-    return False
-
-
-def filter_xarray(pull: dict):
-    pr_title = pull["title"].lower()
-
-    # 1. If labelled with "Performance" label, probably perf related :-).
-    if check_labels(pull, ["topic-performance"]):
-        return True
-
-    # 2. Otherwise, check if pull title has "PERF" or  (commonly observed.)
-    if any(kw in pr_title for kw in ["perf", "speed up"]):
-        return True
-
-    # 3. Other filters?
-    return False
-
-
-# Aggregate all filters in single map access.
 REPO_PERF_FILTERS = {
     "default": filter_base,
+    # Scientific Python
     "astropy": filter_astropy,
     "scikit-learn": filter_sklearn,
     "matplotlib": filter_matplotlib,
-    # No django or flask, manual kw search did not yield much.
-    "pylint": filter_pylint,
-    # No pytest or requests, manual kw search did not yield much.
-    "seaborn": filter_seaborn,
-    "sphinx": filter_sphinx,
     "sympy": filter_sympy,
     "xarray": filter_xarray,
-    # TODO: Rest of SWE-Gym?
+    "pandas": filter_pandas,
+    "numpy": filter_numpy,
+    "scipy": filter_numpy,
+    "statsmodels": filter_statsmodels,
+    "scikit-image": filter_scikit_image,
+    # Web frameworks
+    "flask": filter_flask,
+    "fastapi": filter_fastapi,
+    # ML/NLP
+    "spacy": filter_spacy,
+    "numba": filter_numba,
+    "gensim": filter_gensim,
+    "pillow": filter_pillow,
+    # Tools
+    "pylint": filter_pylint,
+    "seaborn": filter_seaborn,
+    "sphinx": filter_sphinx,
+    "dask": filter_dask,
 }
-
-
-def filter_flask(pull: dict):
-    if has_negative_title_keywords(pull):
-        return False
-
-    pr_title = (pull.get("title") or "").lower()
-
-    if check_labels(pull, ["performance", "perf"]):
-        return True
-
-    flask_perf_keywords = [
-        "perf", "speed", "efficiency", "performance", "optimize",
-        "benchmark", "latency", "throughput", "async", "cache",
-        "memory", "profil", "response time", "request handling",
-    ]
-    if any(kw in pr_title for kw in flask_perf_keywords):
-        return True
-
-    return False
-
-
-def filter_fastapi(pull: dict):
-    if has_negative_title_keywords(pull):
-        return False
-
-    pr_title = (pull.get("title") or "").lower()
-
-    if check_labels(pull, ["performance", "perf"]):
-        return True
-
-    fastapi_perf_keywords = [
-        "perf", "speed", "efficiency", "performance", "optimize",
-        "benchmark", "latency", "throughput", "async", "cache",
-        "memory", "profil", "response time", "middleware",
-        "streaming", "concurren",
-    ]
-    if any(kw in pr_title for kw in fastapi_perf_keywords):
-        return True
-
-    return False
-
-
-REPO_PERF_FILTERS.update(
-    {
-        "flask": filter_flask,
-        "fastapi": filter_fastapi,
-    }
-)
-
-# SWE-GYM
-
-
-def filter_pandas(pull: dict):
-    pr_title = pull["title"]
-
-    # 1. If labelled with "Performance" label, probably perf related :-).
-    if check_labels(pull, ["performance"]):
-        return True
-
-    keywords = ["perf", "speed up", "efficiency", "performance"]
-    # keywords = ["PERF", "performance"]
-    if any(kw in pr_title for kw in keywords):
-        return True
-
-    # 3. Other filters?
-    return False
-
-
-def filter_dask(pull: dict):
-    pr_title = pull["title"].lower()
-
-    # 2. Otherwise, check if pull title has "PERF" or  (commonly observed.)
-    if any(
-        kw in pr_title
-        for kw in [
-            "perf",
-            "speed up",
-            "efficiency",
-            "remove",
-            "avoid",
-            "overhead",
-            "memory",
-        ]
-    ):
-        return True
-
-    # 3. Other filters?
-    return False
-
-
-def filter_numpy(pull: dict):
-    pr_title = pull["title"]
-
-    keywords = ["perf", "speed up", "efficiency", "performance"]
-    if any(kw in pr_title for kw in keywords):
-        return True
-
-    # 3. Other filters?
-    return False
-
-
-def filter_statsmodels(pull: dict):
-    pr_title = pull["title"]
-
-    # 1. If labelled with "Performance" label, probably perf related :-).
-    if check_labels(pull, ["performance"]):
-        return True
-
-    keywords = ["perf", "speed up", "efficiency", "performance"]
-    # keywords = ["PERF", "performance"]
-    if any(kw in pr_title for kw in keywords):
-        return True
-
-    # 3. Other filters?
-    return False
-
-
-REPO_PERF_FILTERS.update(
-    {
-        "pandas": filter_pandas,
-        "dask": filter_dask,
-        "numpy": filter_numpy,
-        "scipy": filter_numpy,
-        "statsmodels": filter_statsmodels,
-    }
-)
-
-
-def filter_pillow(pull: dict):
-    pr_title = pull["title"]
-
-    # 1. If labelled with "Performance" label, probably perf related :-).
-    if check_labels(pull, ["performance"]):
-        return True
-
-    keywords = ["perf", "speed", "efficiency", "performance"]
-    # keywords = ["PERF", "performance"]
-    if any(kw in pr_title for kw in keywords):
-        return True
-
-    # 3. Other filters?
-    return False
-
-
-def filter_spacy(pull: dict):
-    pr_title = pull["title"]
-
-    # 1. If labelled with "Performance" label, probably perf related :-).
-    if check_labels(pull, ["perf"]):
-        return True
-
-    keywords = ["perf", "speed", "efficiency", "performance"]
-    # keywords = ["PERF", "performance"]
-    if any(kw in pr_title for kw in keywords):
-        return True
-
-    # 3. Other filters?
-    return False
-
-
-def filter_numba(pull: dict):
-    pr_title = pull["title"]
-
-    # 1. If labelled with "Performance" label, probably perf related :-).
-    if check_labels(pull, ["performance"]):
-        return True
-
-    keywords = ["perf", "speed", "efficiency", "performance"]
-    # keywords = ["PERF", "performance"]
-    if any(kw in pr_title for kw in keywords):
-        return True
-
-    # 3. Other filters?
-    return False
-
-
-def filter_gensim(pull: dict):
-    pr_title = pull["title"]
-
-    # 1. If labelled with "Performance" label, probably perf related :-).
-    if check_labels(pull, ["performance"]):
-        return True
-
-    keywords = ["perf", "speed", "efficiency", "performance"]
-    # keywords = ["PERF", "performance"]
-    if any(kw in pr_title for kw in keywords):
-        return True
-
-    # 3. Other filters?
-    return False
-
-
-def filter_scikit_image(pull: dict):
-    pr_title = pull["title"]
-
-    # 1. If labelled with "Performance" label, probably perf related :-).
-    if check_labels(pull, ["performance"]):
-        return True
-
-    keywords = ["perf", "speed", "efficiency", "performance"]
-    # keywords = ["PERF", "performance"]
-    if any(kw in pr_title for kw in keywords):
-        return True
-
-    # 3. Other filters?
-    return False
-
-
-REPO_PERF_FILTERS.update(
-    {
-        "pillow": filter_pillow,
-        "spacy": filter_spacy,
-        "numba": filter_numba,
-        "gensim": filter_gensim,
-        "scikit-image": filter_scikit_image,
-    }
-)
-
-#

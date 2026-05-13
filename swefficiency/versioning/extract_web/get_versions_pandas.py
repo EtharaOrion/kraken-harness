@@ -76,7 +76,7 @@ for match in matches:
     try:
         date_obj = datetime.strptime(date_string, date_format)
         times.append((date_obj.strftime("%Y-%m-%d"), version))
-    except:
+    except (ValueError, TypeError):
         continue
 times = sorted(times, key=lambda x: x[0])[::-1]
 

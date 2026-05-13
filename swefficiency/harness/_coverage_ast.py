@@ -238,7 +238,7 @@ def process_file(python_file, depth=0, line_start=None, line_end=None):
             dependent_names = name.goto(
                 follow_builtin_imports=False, follow_imports=True
             )
-        except:
+        except Exception:
             continue
 
         for dn in dependent_names:

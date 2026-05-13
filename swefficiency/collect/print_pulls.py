@@ -15,7 +15,11 @@
 # limitations under the License.
 
 
-"""Given the `<owner/name>` of a GitHub repo, this script writes the raw information for all the repo's PRs to a single `.jsonl` file."""
+"""Given the `<owner/name>` of a GitHub repo, this script writes the raw information for all the repo's PRs to a single `.jsonl` file.
+
+Supports resume: if output file already exists, counts existing lines and skips
+that many PRs before writing new ones (append mode).
+"""
 
 from __future__ import annotations
 
@@ -36,18 +40,30 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def count_existing_lines(filepath: str) -> int:
+    """Count lines in existing file for resume support."""
+    if not os.path.exists(filepath):
+        return 0
+    with open(filepath) as f:
+        return sum(1 for _ in f)
+
+
 def log_all_pulls(
     repo: Repo,
     output: str,
     max_pulls: int = None,
     cutoff_date: str = None,
+    resume: bool = True,
 ) -> None:
     """
-    Iterate over all pull requests in a repository and log them to a file
+    Iterate over all pull requests in a repository and log them to a file.
 
     Args:
         repo (Repo): repository object
         output (str): output file name
+        max_pulls (int): max PRs to fetch
+        cutoff_date (str): stop fetching PRs older than this date
+        resume (bool): if True and output exists, append new PRs only
     """
     cutoff_date = (
         datetime.strptime(cutoff_date, "%Y%m%d").strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -55,14 +71,34 @@ def log_all_pulls(
         else None
     )
 
-    with open(output, "w") as file:
+    # Resume support: skip already-fetched PRs
+    existing_count = 0
+    write_mode = "w"
+    if resume and os.path.exists(output):
+        existing_count = count_existing_lines(output)
+        if existing_count > 0:
+            write_mode = "a"
+            logger.info(
+                f"[{repo.owner}/{repo.name}] Resuming from {existing_count} existing PRs"
+            )
+
+    with open(output, write_mode) as file:
         for i_pull, pull in enumerate(repo.get_all_pulls()):
+            # Skip already-fetched PRs when resuming
+            if i_pull < existing_count:
+                continue
+
             setattr(pull, "resolved_issues", repo.extract_resolved_issues(pull))
             print(json.dumps(obj2dict(pull)), end="\n", flush=True, file=file)
-            if max_pulls is not None and i_pull >= max_pulls:
+
+            effective_count = i_pull + 1
+            if max_pulls is not None and effective_count >= max_pulls:
                 break
             if cutoff_date is not None and pull.created_at < cutoff_date:
                 break
+
+    total = count_existing_lines(output)
+    logger.info(f"[{repo.owner}/{repo.name}] Total PRs in file: {total}")
 
 
 def main(
@@ -71,6 +107,7 @@ def main(
     token: Optional[str] = None,
     max_pulls: int = None,
     cutoff_date: str = None,
+    resume: bool = True,
 ):
     """
     Logic for logging all pull requests in a repository
@@ -79,12 +116,15 @@ def main(
         repo_name (str): name of the repository
         output (str): output file name
         token (str, optional): GitHub token
+        max_pulls (int): max PRs to fetch
+        cutoff_date (str): cutoff date YYYYMMDD
+        resume (bool): resume from existing file if present
     """
     if token is None:
         token = os.environ.get("GITHUB_TOKEN")
     owner, repo = repo_name.split("/")
     repo = Repo(owner, repo, token=token)
-    log_all_pulls(repo, output, max_pulls=max_pulls, cutoff_date=cutoff_date)
+    log_all_pulls(repo, output, max_pulls=max_pulls, cutoff_date=cutoff_date, resume=resume)
 
 
 if __name__ == "__main__":
@@ -101,5 +141,17 @@ if __name__ == "__main__":
         help="Cutoff date for PRs to consider in format YYYYMMDD",
         default=None,
     )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Disable resume mode (overwrite existing file)",
+    )
     args = parser.parse_args()
-    main(**vars(args))
+    main(
+        repo_name=args.repo_name,
+        output=args.output,
+        token=args.token,
+        max_pulls=args.max_pulls,
+        cutoff_date=args.cutoff_date,
+        resume=not args.no_resume,
+    )
