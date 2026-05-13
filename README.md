@@ -2,7 +2,7 @@
 <div align="center">
   <img src="docs/assets/logos/kraken.png" alt="Kraken Logo" width="500"/>
 </div>
-  <p><em>Evaluation framework for benchmarking LLM coding agents on real-world performance optimization</em></p>
+  <p><em>An RL environment for training LLM coding agents on real-world performance optimization</em></p>
   <p>
     <a href="https://arxiv.org/abs/2511.06090"><img src="https://img.shields.io/badge/Paper-arXiv%3A2511.06090-b31b1b?logo=arxiv&logoColor=white" alt="Paper"></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-lightgrey.svg" alt="License"></a>
@@ -11,7 +11,7 @@
 
 ---
 
-Kraken is a repository-level RL environment for training LLM coding agents on **performance optimization**. Each task provides an agent with a full codebase snapshot, a targeted performance workload to speed up, and a set of correctness tests that must remain green. The agent is scored using the **Harmonic Speedup Ratio (HSR)**, jointly measuring correctness and runtime efficiency.
+Kraken is a repository-level RL environment for training LLM coding agents on **performance optimization**. Each task provides an agent with a full codebase snapshot, a targeted performance workload to speed up, and a set of correctness tests that must remain green. The agent receives a reward based on the **Harmonic Speedup Ratio (HSR)**, jointly reflecting correctness and runtime efficiency.
 
 ## Table of Contents
 
@@ -31,7 +31,7 @@ Kraken is a repository-level RL environment for training LLM coding agents on **
 
 Kraken frames *pass-to-pass* performance engineering as an RL problem: start from a codebase and a slow workload, improve runtime, and don't break behavior. The focus is on investigation (profiling/localization) and correctness-preserving edits — mirroring how performance engineers work day-to-day.
 
-Unlike traditional coding benchmarks that measure only functional correctness, Kraken jointly rewards **correctness and efficiency**. An agent that breaks tests receives zero reward, regardless of speed.
+Unlike traditional coding tasks that measure only functional correctness, Kraken jointly rewards **correctness and efficiency**. An agent that breaks tests receives zero reward, regardless of speed.
 
 ### Key Features
 
@@ -160,7 +160,7 @@ python scripts/inference/custom.py \
   --var cursor_cli_args="--max-steps 75"
 ```
 
-Each instance produces a git patch at `logs/run_inference/<run_id>/<instance_id>/patch.diff`, ready for scoring via `swefficiency eval`.
+Each instance produces a git patch at `logs/run_inference/<run_id>/<instance_id>/patch.diff`, ready for reward computation via `swefficiency eval`.
 
 ---
 
