@@ -421,6 +421,53 @@ def push_multiarch_to_ecr(
     return ecr_tag
 
 
+def try_pull_from_ecr(
+    client: docker.DockerClient,
+    image_name: str,
+    ecr_registry: str | None = None,
+    ecr_repo: str | None = None,
+) -> bool:
+    """
+    Try to pull image_name from ECR and tag it locally.
+
+    Controlled by env SWEFF_ECR_PULL_FIRST (default on if ECR_REGISTRY set).
+    Returns True if pull succeeded, False otherwise (incl. ECR not configured).
+    """
+    if os.environ.get("SWEFF_ECR_PULL_FIRST", "1").lower() in ("0", "false", "no"):
+        return False
+
+    ecr_registry = ecr_registry or os.environ.get("ECR_REGISTRY", "")
+    if not ecr_registry:
+        return False
+
+    ecr_repo = ecr_repo or os.environ.get("ECR_REPO", "swefficiency-images")
+    tag_part = image_name.replace(":", "-").replace("/", "-")
+    ecr_uri = f"{ecr_registry}/{ecr_repo}:{tag_part}"
+
+    try:
+        print(f"[ECR] Trying pull: {ecr_uri}")
+        client.images.pull(ecr_uri)
+        image = client.images.get(ecr_uri)
+        if ":" in image_name:
+            repo_part, tag_only = image_name.rsplit(":", 1)
+            image.tag(repo_part, tag=tag_only)
+        else:
+            image.tag(image_name)
+        print(f"[ECR] OK pull: {image_name} <- {ecr_uri}")
+        return True
+    except docker.errors.NotFound:
+        return False
+    except docker.errors.APIError as e:
+        msg = str(e).lower()
+        if any(t in msg for t in ("not found", "manifest unknown", "401", "403", "unauthorized")):
+            return False
+        print(f"[ECR] Pull failed for {ecr_uri}: {e}")
+        return False
+    except Exception as e:
+        print(f"[ECR] Pull unexpected error for {ecr_uri}: {e}")
+        return False
+
+
 def build_base_images(
     client: docker.DockerClient,
     dataset: list,
@@ -465,6 +512,10 @@ def build_base_images(
         except docker.errors.ImageNotFound:
             pass
 
+        # ECR pull-first: try registry before building from scratch.
+        if not force_rebuild and try_pull_from_ecr(client, image_name):
+            continue
+
         print(f"Building base image ({image_name})")
         if multiarch:
             ecr_tag = push_multiarch_to_ecr(image_name) if push_to_ecr else None
@@ -494,6 +545,7 @@ def build_base_images(
 def get_env_configs_to_build(
     client: docker.DockerClient,
     dataset: list,
+    skip_ecr_pull: bool = False,
 ):
     """
     Returns a dictionary of image names to build scripts and dockerfiles for environment images.
@@ -536,6 +588,9 @@ def get_env_configs_to_build(
                 image_exists = False
         except docker.errors.ImageNotFound:
             pass
+        # ECR pull-first: try registry before queueing for build.
+        if not skip_ecr_pull and not image_exists and try_pull_from_ecr(client, test_spec.env_image_key):
+            image_exists = True
         if not image_exists:
             # Add the environment image to the list of images to build
             image_scripts[test_spec.env_image_key] = {
@@ -573,7 +628,7 @@ def build_env_images(
         for key in env_image_keys:
             remove_image(client, key, "quiet")
     build_base_images(client, dataset, force_rebuild, multiarch=multiarch, push_to_ecr=push_to_ecr)
-    configs_to_build = get_env_configs_to_build(client, dataset)
+    configs_to_build = get_env_configs_to_build(client, dataset, skip_ecr_pull=force_rebuild)
     if len(configs_to_build) == 0:
         print("No environment images need to be built.")
         return [], []

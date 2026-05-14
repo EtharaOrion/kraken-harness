@@ -126,6 +126,36 @@ if [[ -f "$SCRIPT_DIR/.env" ]]; then
     set +a
 fi
 
+# ─── Raise FD limit ──────────────────────────────────────────────────────────
+# Long-running pipelines open many sockets (HTTP) + files concurrently. Default
+# macOS/Linux soft limit is often 1024, which is too low for parallel Docker
+# builds + LLM HTTP pools. Try to raise to SWEFF_MIN_FDS (default 4096); warn if
+# we can't (some sandboxes disallow raising even within hard limits).
+raise_fd_limit() {
+    local target="${SWEFF_MIN_FDS:-4096}"
+    local current
+    current=$(ulimit -n 2>/dev/null || echo 0)
+    if [[ "$current" -ge "$target" ]]; then
+        echo "FD limit: $current (>= $target, ok)"
+        return 0
+    fi
+    if ulimit -n "$target" 2>/dev/null; then
+        echo "FD limit: raised from $current to $(ulimit -n)"
+        return 0
+    fi
+    local hard
+    hard=$(ulimit -Hn 2>/dev/null || echo 0)
+    if [[ "$hard" -gt "$current" ]] && ulimit -n "$hard" 2>/dev/null; then
+        echo "FD limit: raised from $current to $hard (capped by hard limit)"
+        return 0
+    fi
+    echo "WARNING: FD limit is $current (< $target). Long runs may exhaust FDs." >&2
+    echo "  Raise with: ulimit -n $target" >&2
+    echo "  On macOS:   sudo launchctl limit maxfiles $target $target" >&2
+    return 0
+}
+
+
 # ─── Validate prerequisites ──────────────────────────────────────────────────
 check_prereqs() {
     local missing=()
@@ -945,6 +975,7 @@ main() {
     [[ -n "$STOP_AFTER" ]] && echo "  Stop after:  $STOP_AFTER"
     [[ -n "$STAGES" ]]     && echo "  Stages:      $STAGES"
 
+    raise_fd_limit
     check_prereqs
 
     if $USE_HELICONE; then

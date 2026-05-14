@@ -25,7 +25,7 @@ import argparse
 import logging
 import os
 import traceback
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from concurrent.futures.process import BrokenProcessPool
 
 from dotenv import load_dotenv
@@ -41,6 +41,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+CHUNK_TIMEOUT_S = int(os.environ.get("SWEFF_CHUNK_TIMEOUT_S", "14400"))
 
 def load_repos_from_file(repos_file: str) -> list[str]:
     """
@@ -234,34 +235,55 @@ def main(
             executor.submit(construct_data_files, data): data["repos"]
             for data in data_pooled
         }
-        for future in as_completed(future_to_repos):
-            chunk_repos = future_to_repos[future]
-            try:
-                future.result()
-            except BrokenProcessPool as e:
-                logger.error(f"Worker died handling repos {chunk_repos!r}: {e}")
+        try:
+            for future in as_completed(future_to_repos, timeout=CHUNK_TIMEOUT_S):
+                chunk_repos = future_to_repos[future]
+                try:
+                    future.result()
+                except BrokenProcessPool as e:
+                    logger.error(f"Worker died handling repos {chunk_repos!r}: {e}")
+                    for repo in chunk_repos:
+                        write_to_dlq(
+                            "task_pipeline_worker_died.jsonl",
+                            {
+                                "repo": repo,
+                                "stage": "construct_data_files",
+                                "error_type": "BrokenProcessPool",
+                                "error": str(e),
+                            },
+                        )
+                except Exception as e:
+                    tb = traceback.format_exc()
+                    logger.error(f"Uncaught error in chunk {chunk_repos!r}: {e}")
+                    for repo in chunk_repos:
+                        write_to_dlq(
+                            "task_pipeline_chunk_failures.jsonl",
+                            {
+                                "repo": repo,
+                                "stage": "construct_data_files",
+                                "error_type": type(e).__name__,
+                                "error": str(e),
+                                "traceback": tb,
+                            },
+                        )
+        except FuturesTimeoutError:
+            pending = [f for f in future_to_repos if not f.done()]
+            logger.error(
+                f"ProcessPool overall timeout after {CHUNK_TIMEOUT_S}s; "
+                f"{len(pending)} stuck chunk(s) covering "
+                f"{sum(len(future_to_repos[f]) for f in pending)} repos"
+            )
+            for future in pending:
+                future.cancel()
+                chunk_repos = future_to_repos[future]
                 for repo in chunk_repos:
                     write_to_dlq(
-                        "task_pipeline_worker_died.jsonl",
+                        "task_pipeline_stuck.jsonl",
                         {
                             "repo": repo,
                             "stage": "construct_data_files",
-                            "error_type": "BrokenProcessPool",
-                            "error": str(e),
-                        },
-                    )
-            except Exception as e:
-                tb = traceback.format_exc()
-                logger.error(f"Uncaught error in chunk {chunk_repos!r}: {e}")
-                for repo in chunk_repos:
-                    write_to_dlq(
-                        "task_pipeline_chunk_failures.jsonl",
-                        {
-                            "repo": repo,
-                            "stage": "construct_data_files",
-                            "error_type": type(e).__name__,
-                            "error": str(e),
-                            "traceback": tb,
+                            "error_type": "TimeoutError",
+                            "error": f"chunk did not complete within {CHUNK_TIMEOUT_S}s",
                         },
                     )
 

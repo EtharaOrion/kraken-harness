@@ -289,7 +289,7 @@ class TestMainPipeline:
         return [c.args[1] for c in mock_executor.submit.call_args_list]
 
     # D1: Basic execution with single token
-    @patch("swefficiency.collect.get_tasks_pipeline.as_completed", new=lambda fs: iter([]))
+    @patch("swefficiency.collect.get_tasks_pipeline.as_completed", new=lambda fs, *a, **kw: iter([]))
     @patch("swefficiency.collect.get_tasks_pipeline.ProcessPoolExecutor")
     @patch("swefficiency.collect.get_tasks_pipeline.os.getenv")
     def test_d1_single_token(self, mock_getenv, MockExecutor):
@@ -302,7 +302,7 @@ class TestMainPipeline:
         assert mock_executor.submit.called
 
     # D1: Multiple tokens → executor sized to token count
-    @patch("swefficiency.collect.get_tasks_pipeline.as_completed", new=lambda fs: iter([]))
+    @patch("swefficiency.collect.get_tasks_pipeline.as_completed", new=lambda fs, *a, **kw: iter([]))
     @patch("swefficiency.collect.get_tasks_pipeline.ProcessPoolExecutor")
     @patch("swefficiency.collect.get_tasks_pipeline.os.getenv")
     def test_d1_multiple_tokens(self, mock_getenv, MockExecutor):
@@ -328,7 +328,7 @@ class TestMainPipeline:
             main(["org/repo"], "/tmp/prs", "/tmp/tasks")
 
     # D1: max_pulls and cutoff_date forwarded
-    @patch("swefficiency.collect.get_tasks_pipeline.as_completed", new=lambda fs: iter([]))
+    @patch("swefficiency.collect.get_tasks_pipeline.as_completed", new=lambda fs, *a, **kw: iter([]))
     @patch("swefficiency.collect.get_tasks_pipeline.ProcessPoolExecutor")
     @patch("swefficiency.collect.get_tasks_pipeline.os.getenv")
     def test_d1_params_forwarded(self, mock_getenv, MockExecutor):
@@ -344,7 +344,7 @@ class TestMainPipeline:
         assert data_args[0]["cutoff_date"] == "20240101"
 
     # D7: Repos split across tokens correctly
-    @patch("swefficiency.collect.get_tasks_pipeline.as_completed", new=lambda fs: iter([]))
+    @patch("swefficiency.collect.get_tasks_pipeline.as_completed", new=lambda fs, *a, **kw: iter([]))
     @patch("swefficiency.collect.get_tasks_pipeline.ProcessPoolExecutor")
     @patch("swefficiency.collect.get_tasks_pipeline.os.getenv")
     def test_d7_repos_split_across_tokens(self, mock_getenv, MockExecutor):
@@ -362,7 +362,7 @@ class TestMainPipeline:
         assert sorted(all_repos) == sorted(repos)
 
     # D4: Token with trailing comma
-    @patch("swefficiency.collect.get_tasks_pipeline.as_completed", new=lambda fs: iter([]))
+    @patch("swefficiency.collect.get_tasks_pipeline.as_completed", new=lambda fs, *a, **kw: iter([]))
     @patch("swefficiency.collect.get_tasks_pipeline.ProcessPoolExecutor")
     @patch("swefficiency.collect.get_tasks_pipeline.os.getenv")
     def test_d4_token_trailing_comma(self, mock_getenv, MockExecutor):
@@ -375,7 +375,7 @@ class TestMainPipeline:
         MockExecutor.assert_called_once_with(max_workers=3)
 
     # D1: Paths are absolutified
-    @patch("swefficiency.collect.get_tasks_pipeline.as_completed", new=lambda fs: iter([]))
+    @patch("swefficiency.collect.get_tasks_pipeline.as_completed", new=lambda fs, *a, **kw: iter([]))
     @patch("swefficiency.collect.get_tasks_pipeline.ProcessPoolExecutor")
     @patch("swefficiency.collect.get_tasks_pipeline.os.getenv")
     def test_d1_paths_absolutified(self, mock_getenv, MockExecutor):
