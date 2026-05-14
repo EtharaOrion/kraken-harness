@@ -25,12 +25,13 @@ import argparse
 import logging
 import os
 import traceback
-from multiprocessing import Pool
+import concurrent.futures
 
 from dotenv import load_dotenv
 
 from swefficiency.collect.build_dataset import main as build_dataset
 from swefficiency.collect.print_pulls import main as print_pulls
+from swefficiency.collect.utils import write_to_dlq
 
 load_dotenv()
 
@@ -143,6 +144,16 @@ def construct_data_files(data: dict):
             print("Here is the full traceback:")
             traceback.print_exc()
             print("-" * 80)
+            write_to_dlq(
+                "task_pipeline_repo_failures.jsonl",
+                {
+                    "repo": repo,
+                    "stage": "construct_data_files",
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                    "traceback": traceback.format_exc(),
+                },
+            )
 
 
 def main(
@@ -213,8 +224,45 @@ def main(
         for repos_chunk, token in zip(data_task_lists, tokens)
     ]
 
-    with Pool(len(tokens)) as p:
-        p.map(construct_data_files, data_pooled)
+    # ProcessPoolExecutor instead of Pool.map: surfaces BrokenProcessPool
+    # on worker death and lets surviving chunks complete. Per-repo failures
+    # are handled inside construct_data_files; this outer net catches
+    # SIGKILL/OOM/crash scenarios and DLQs the affected chunk's repos.
+    with concurrent.futures.ProcessPoolExecutor(max_workers=len(tokens)) as executor:
+        future_to_repos = {
+            executor.submit(construct_data_files, data): data["repos"]
+            for data in data_pooled
+        }
+        for future in concurrent.futures.as_completed(future_to_repos):
+            chunk_repos = future_to_repos[future]
+            try:
+                future.result()
+            except concurrent.futures.process.BrokenProcessPool as e:
+                logger.error(f"Worker died handling repos {chunk_repos!r}: {e}")
+                for repo in chunk_repos:
+                    write_to_dlq(
+                        "task_pipeline_worker_died.jsonl",
+                        {
+                            "repo": repo,
+                            "stage": "construct_data_files",
+                            "error_type": "BrokenProcessPool",
+                            "error": str(e),
+                        },
+                    )
+            except Exception as e:
+                tb = traceback.format_exc()
+                logger.error(f"Uncaught error in chunk {chunk_repos!r}: {e}")
+                for repo in chunk_repos:
+                    write_to_dlq(
+                        "task_pipeline_chunk_failures.jsonl",
+                        {
+                            "repo": repo,
+                            "stage": "construct_data_files",
+                            "error_type": type(e).__name__,
+                            "error": str(e),
+                            "traceback": tb,
+                        },
+                    )
 
 
 if __name__ == "__main__":

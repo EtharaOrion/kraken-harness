@@ -154,9 +154,25 @@ def main(
     all_output = output + ".all"
     seen_prs = set()
 
-    # Continue where we left off if output file already exists
-    if os.path.exists(all_output):
-        with open(all_output) as f:
+    # Resume: prefer cheap .seen_prs side-file (one instance_id per line)
+    # over O(n) JSON re-parse of all_output. JSON re-parse is kept as a
+    # fallback to bootstrap .seen_prs on first resume so subsequent
+    # resumes are O(n) line-reads with no json.loads per row.
+    seen_prs_path = all_output + ".seen_prs"
+    if os.path.exists(seen_prs_path):
+        with open(seen_prs_path) as f:
+            for line in f:
+                iid = line.strip()
+                if iid:
+                    seen_prs.add(iid)
+        logger.info(
+            f"Loaded {len(seen_prs)} seen PR ids from {seen_prs_path}"
+        )
+    elif os.path.exists(all_output):
+        logger.info(
+            f"Bootstrapping {seen_prs_path} from {all_output} (one-time cost)"
+        )
+        with open(all_output) as f, open(seen_prs_path, "w") as sp:
             for line in f:
                 pr = json.loads(line)
                 if "instance_id" not in pr:
@@ -165,6 +181,7 @@ def main(
                     ).replace("/", "__")
                 instance_id = pr["instance_id"]
                 seen_prs.add(instance_id)
+                print(instance_id, file=sp)
                 if is_valid_instance(pr):
                     completed += 1
                     if has_test_patch(pr):
@@ -175,7 +192,7 @@ def main(
 
     # Write to .all file for all PRs
     write_mode_all = "w" if not os.path.exists(all_output) else "a"
-    with open(all_output, write_mode_all) as all_output:
+    with open(all_output, write_mode_all) as all_output, open(seen_prs_path, "a") as seen_prs_file:
         # Write to output file for PRs with test suites
         write_mode = "w" if not os.path.exists(output) else "a"
         with open(output, write_mode) as output:
@@ -228,6 +245,7 @@ def main(
                     print(
                         json.dumps(instance), end="\n", flush=True, file=all_output
                     )  # write all instances to a separate file
+                    print(instance["instance_id"], file=seen_prs_file, flush=True)
                     completed += 1
                     if has_test_patch(instance):
                         # If has test suite, write to output file

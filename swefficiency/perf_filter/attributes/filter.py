@@ -292,20 +292,45 @@ def main(args):
         "instances_path": str(args.instances_path),
     }
 
-    with open(str(output_path), "w") as output:
+    # Checkpoint: if a processed-ids ledger exists, resume by skipping
+    # already-handled instances. Output is opened append-only in that case
+    # so passing rows aren't duplicated. The ledger stores one instance_id
+    # per line for cheap O(n) reload (no JSON parse).
+    processed_ledger = Path(str(output_path) + ".processed_ids")
+    processed_ids = set()
+    if processed_ledger.exists():
+        with open(processed_ledger) as _f:
+            for _line in _f:
+                _iid = _line.strip()
+                if _iid:
+                    processed_ids.add(_iid)
+        logger.info(
+            f"Resume: loaded {len(processed_ids):,} processed ids from {processed_ledger.name}"
+        )
+        metrics["resumed_from"] = len(processed_ids)
+
+    output_mode = "a" if processed_ids else "w"
+    with open(str(output_path), output_mode) as output, open(processed_ledger, "a") as ledger:
         for instance in utils.stream_jsonl(args.instances_path):
             metrics["total"] += 1
+
+            iid = instance.get("instance_id")
+            if iid and iid in processed_ids:
+                continue
 
             result = apply_filter(instance, pr_lookup, use_extended=use_extended)
 
             if result.passed:
                 metrics["passed"] += 1
-                print(json.dumps(instance), file=output, flush=False)
+                print(json.dumps(instance), file=output, flush=True)
             else:
                 if result.reason in metrics["rejected"]:
                     metrics["rejected"][result.reason] += 1
                 else:
                     metrics["rejected"][result.reason] = 1
+
+            if iid:
+                print(iid, file=ledger, flush=True)
 
             # Progress log every 10k
             if metrics["total"] % 10000 == 0:
