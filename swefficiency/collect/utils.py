@@ -14,9 +14,13 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
+import threading
 import time
+from pathlib import Path
 from typing import Callable, Iterator, Optional
 
 import requests
@@ -29,6 +33,44 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# Rate-limit ceiling: 12 retries * 5min = 1 hour max per stuck token.
+# Beyond this, the token is treated as permanently revoked.
+MAX_RATE_LIMIT_RETRIES = int(os.environ.get("SWEFF_MAX_RATE_LIMIT_RETRIES", "12"))
+RATE_LIMIT_SLEEP_SECONDS = int(os.environ.get("SWEFF_RATE_LIMIT_SLEEP", str(60 * 5)))
+MAX_HTTP_RETRIES = int(os.environ.get("SWEFF_MAX_HTTP_RETRIES", "8"))
+
+# DLQ (dead-letter queue): structured failure log for autonomous pipeline runs.
+# When a recoverable failure happens, we write a JSONL record here so the run
+# completes and humans can triage afterwards instead of silently dropping data.
+_DLQ_DIR = Path(os.environ.get("SWEFF_DLQ_DIR", "artifacts/dlq"))
+_DLQ_LOCK = threading.Lock()
+
+
+class TokenStuckError(Exception):
+    """Raised when a GitHub token appears revoked or permanently rate-limited."""
+
+
+class PatchFetchError(Exception):
+    """Raised when a patch cannot be fetched from GitHub after retries."""
+
+
+def write_to_dlq(filename: str, record: dict) -> None:
+    """Append a failure record to a dead-letter queue file (thread-safe).
+
+    Args:
+        filename: bare filename (e.g. 'patch_fetch_failures.jsonl').
+        record: arbitrary JSON-serializable dict describing the failure.
+    """
+    record.setdefault("ts", time.time())
+    try:
+        with _DLQ_LOCK:
+            _DLQ_DIR.mkdir(parents=True, exist_ok=True)
+            with (_DLQ_DIR / filename).open("a") as f:
+                f.write(json.dumps(record) + "\n")
+    except Exception as exc:
+        # DLQ write must never crash the pipeline. Surface to stderr only.
+        logger.error(f"DLQ write failed for {filename}: {exc}")
 
 
 class Repo:
@@ -61,7 +103,11 @@ class Repo:
 
     def call_api(self, func: Callable, **kwargs) -> dict | None:
         """
-        API call wrapper with rate limit handling (checks every 5 minutes if rate limit is reset)
+        API call wrapper with bounded rate limit handling.
+
+        Sleeps up to MAX_RATE_LIMIT_RETRIES * RATE_LIMIT_SLEEP_SECONDS (default
+        1 hour) for a stuck token before raising TokenStuckError. This prevents
+        a single revoked token from hanging the entire pipeline.
 
         Args:
             func (callable): API function to call
@@ -69,23 +115,49 @@ class Repo:
         Return:
             values (dict): response object of `func`
         """
-        while True:
+        call_attempts = 0
+        while call_attempts < MAX_RATE_LIMIT_RETRIES:
             try:
-                values = func(**kwargs)
-                return values
-            except HTTP403ForbiddenError as e:
-                while True:
-                    rl = self.api.rate_limit.get()
+                return func(**kwargs)
+            except HTTP403ForbiddenError:
+                for attempt in range(MAX_RATE_LIMIT_RETRIES):
+                    try:
+                        rl = self.api.rate_limit.get()
+                        remaining = rl.resources.core.remaining
+                    except Exception as exc:
+                        logger.warning(
+                            f"[{self.owner}/{self.name}] rate_limit.get() failed: {exc}"
+                        )
+                        remaining = 0
                     logger.info(
                         f"[{self.owner}/{self.name}] Rate limit exceeded for token {self.token[:10]}, "
-                        f"waiting for 5 minutes, remaining calls: {rl.resources.core.remaining}"
+                        f"attempt {attempt + 1}/{MAX_RATE_LIMIT_RETRIES}, remaining calls: {remaining}"
                     )
-                    if rl.resources.core.remaining > 0:
+                    if remaining > 0:
                         break
-                    time.sleep(60 * 5)
-            except HTTP404NotFoundError as e:
+                    time.sleep(RATE_LIMIT_SLEEP_SECONDS)
+                else:
+                    write_to_dlq(
+                        "token_stuck.jsonl",
+                        {
+                            "repo": f"{self.owner}/{self.name}",
+                            "token_prefix": self.token[:10] if self.token else None,
+                            "reason": "call_api rate-limit exhausted",
+                        },
+                    )
+                    raise TokenStuckError(
+                        f"Token {self.token[:10] if self.token else '<none>'} appears revoked: "
+                        f"rate limit never reset after {MAX_RATE_LIMIT_RETRIES} retries"
+                    )
+                call_attempts += 1
+            except HTTP404NotFoundError:
                 logger.info(f"[{self.owner}/{self.name}] Resource not found {kwargs}")
                 return None
+        # call_attempts exhausted (e.g. repeated 403s without rate-limit recovery)
+        raise TokenStuckError(
+            f"call_api gave up after {MAX_RATE_LIMIT_RETRIES} attempts for "
+            f"{self.owner}/{self.name}: {func.__name__}"
+        )
 
     def extract_resolved_issues(self, pull: dict) -> list[str]:
         """
@@ -172,21 +244,47 @@ class Repo:
                 if num_pages is not None and page >= num_pages:
                     break
                 page += 1
-            except Exception as e:
-                # Rate limit handling
-                logger.error(
-                    f"[{self.owner}/{self.name}] Error processing page {page} "
+            except (HTTP403ForbiddenError, requests.exceptions.HTTPError) as e:
+                # Rate-limit path: bounded retry, then DLQ + raise.
+                logger.warning(
+                    f"[{self.owner}/{self.name}] HTTP/rate-limit error on page {page} "
                     f"w/ token {self.token[:10]} - {e}"
                 )
-                while True:
-                    rl = self.api.rate_limit.get()
-                    if rl.resources.core.remaining > 0:
+                for attempt in range(MAX_RATE_LIMIT_RETRIES):
+                    try:
+                        rl = self.api.rate_limit.get()
+                        remaining = rl.resources.core.remaining
+                    except Exception as inner:
+                        logger.warning(
+                            f"[{self.owner}/{self.name}] rate_limit.get() failed: {inner}"
+                        )
+                        remaining = 0
+                    if remaining > 0:
                         break
                     logger.info(
                         f"[{self.owner}/{self.name}] Waiting for rate limit reset "
-                        f"for token {self.token[:10]}, checking again in 5 minutes"
+                        f"for token {self.token[:10]} (attempt {attempt + 1}/{MAX_RATE_LIMIT_RETRIES})"
                     )
-                    time.sleep(60 * 5)
+                    time.sleep(RATE_LIMIT_SLEEP_SECONDS)
+                else:
+                    write_to_dlq(
+                        "token_stuck.jsonl",
+                        {
+                            "repo": f"{self.owner}/{self.name}",
+                            "token_prefix": self.token[:10] if self.token else None,
+                            "page": page,
+                            "reason": "get_all_loop rate-limit exhausted",
+                        },
+                    )
+                    raise TokenStuckError(
+                        f"Token {self.token[:10] if self.token else '<none>'} appears revoked"
+                    )
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                # Network-level failures: short backoff, do not exhaust the rate-limit budget.
+                logger.warning(
+                    f"[{self.owner}/{self.name}] Network error on page {page}: {e}; backing off 30s"
+                )
+                time.sleep(30)
         if not quiet:
             logger.info(
                 f"[{self.owner}/{self.name}] Processed {(page-1)*per_page + len(values)} values"
@@ -332,42 +430,58 @@ def _extract_hints(pull: dict, repo: Repo, issue_number: int) -> list[str]:
     return comments
 
 
-def send_request_with_rate_limit_handling(url, headers=None, params=None):
-    retries = 0
-    backoff = 60  # Start with 60 seconds
+def send_request_with_rate_limit_handling(url, headers=None, params=None, timeout: int = 30):
+    """GET with bounded retries on rate-limit and transient errors.
 
-    while True:
-        response = requests.get(url, headers=headers, params=params)
-        if response.status_code in [200, 201]:
+    Raises:
+        PatchFetchError: when MAX_HTTP_RETRIES is exhausted.
+        requests.HTTPError: on non-rate-limit HTTP errors (4xx other than 403/429, 5xx).
+    """
+    backoff = 60  # secondary-rate-limit exponential backoff
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(MAX_HTTP_RETRIES):
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=timeout)
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            last_exc = e
+            wait = min(60, 5 * (2 ** attempt))
+            logger.warning(f"Network error fetching {url}: {e}; retry in {wait}s")
+            time.sleep(wait)
+            continue
+
+        if response.status_code in (200, 201):
             return response.text
 
-        if response.status_code in [403, 429]:
-            error = response.text.lower()
+        if response.status_code in (403, 429):
+            error = (response.text or "").lower()
             retry_after = response.headers.get("retry-after")
             remaining = response.headers.get("x-ratelimit-remaining")
             reset = response.headers.get("x-ratelimit-reset")
 
-            # If Retry-After is present
             if retry_after:
-                time.sleep(int(retry_after))
-            # If no remaining requests and reset is set
+                sleep_for = min(int(retry_after), RATE_LIMIT_SLEEP_SECONDS)
             elif remaining == "0" and reset:
-                wait = int(reset) - int(time.time())
-                time.sleep(max(0, wait))
-            # If secondary rate limit is mentioned
+                sleep_for = max(0, min(int(reset) - int(time.time()), RATE_LIMIT_SLEEP_SECONDS))
             elif "secondary rate limit" in error:
-                time.sleep(backoff)
-                backoff *= 2  # exponential backoff
+                sleep_for = backoff
+                backoff = min(backoff * 2, RATE_LIMIT_SLEEP_SECONDS)
             else:
-                time.sleep(60)  # default wait
-
-            retries += 1
+                sleep_for = 60
+            logger.info(
+                f"Rate limited on {url} (status {response.status_code}, "
+                f"attempt {attempt + 1}/{MAX_HTTP_RETRIES}); sleeping {sleep_for}s"
+            )
+            time.sleep(sleep_for)
+            last_exc = requests.HTTPError(f"{response.status_code} on {url}")
             continue
 
-        # Other non-rate limit errors
+        # Non-recoverable HTTP error
         response.raise_for_status()
 
-    raise Exception("Too many retries due to rate limiting.")
+    raise PatchFetchError(
+        f"Failed to fetch {url} after {MAX_HTTP_RETRIES} retries: {last_exc}"
+    )
 
 
 def extract_patches(pull: dict, repo: Repo) -> tuple[str, str]:
@@ -389,8 +503,21 @@ def extract_patches(pull: dict, repo: Repo) -> tuple[str, str]:
     }
     try:
         patch = send_request_with_rate_limit_handling(pull["url"], headers=headers)
-    except Exception as e:
-        return "", ""
+    except (PatchFetchError, requests.exceptions.RequestException, requests.exceptions.HTTPError) as e:
+        # Surface the failure to the DLQ so it can be retried/triaged later,
+        # then return None sentinels so the caller can distinguish 'fetch
+        # failed' from 'PR genuinely has empty patch'.
+        logger.error(f"Patch fetch failed for {pull.get('url')}: {e}")
+        write_to_dlq(
+            "patch_fetch_failures.jsonl",
+            {
+                "pull_url": pull.get("url"),
+                "pull_number": pull.get("number"),
+                "error": str(e),
+                "error_type": type(e).__name__,
+            },
+        )
+        return None, None
 
     patch_test = ""
     patch_fix = ""

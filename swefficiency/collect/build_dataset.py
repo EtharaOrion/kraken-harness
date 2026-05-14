@@ -31,6 +31,7 @@ from swefficiency.collect.utils import (
     Repo,
     extract_patches,
     extract_problem_statement_and_hints,
+    write_to_dlq,
 )
 from swefficiency.perf_filter.attributes.filter import is_perf_pr
 
@@ -42,17 +43,15 @@ logger = logging.getLogger(__name__)
 
 def create_instance(repo: Repo, pull: dict) -> dict:
     """
-    Create a single task instance from a pull request, where task instance is:
+    Create a single task instance from a pull request.
 
-    {
-        repo (str): owner/repo this task instance is from,
-        pull_number (int): number of PR this task instance is from,
-        base_commit (str): SHA of the base commit PR is based on,
-        patch (str): reference solution as .patch (apply to base commit),
-        test_patch (str): test suite as .patch (apply to base commit),
-    }
+    extract_patches() returns (None, None) on fetch failure (distinct from
+    ("", "") meaning the PR genuinely has no diff). We preserve the None
+    sentinels in the output dict and tag fetch_failed=True so downstream
+    metrics can distinguish data-loss from empty PRs.
     """
     patch, test_patch = extract_patches(pull, repo)
+    fetch_failed = patch is None and test_patch is None
     problem_statement, hints = extract_problem_statement_and_hints(pull, repo)
 
     return {
@@ -63,8 +62,9 @@ def create_instance(repo: Repo, pull: dict) -> dict:
         ),
         "issue_numbers": pull["resolved_issues"],
         "base_commit": pull["base"]["sha"],
-        "patch": patch,
-        "test_patch": test_patch,
+        "patch": patch if patch is not None else "",
+        "test_patch": test_patch if test_patch is not None else "",
+        "patch_fetch_failed": fetch_failed,
         "problem_statement": problem_statement,
         "hints_text": hints,
         "created_at": pull["created_at"],
@@ -150,6 +150,7 @@ def main(
     with_tests = 0
     total_instances = 0
     filtered_out = 0
+    fetch_failed_count = 0
     all_output = output + ".all"
     seen_prs = set()
 
@@ -212,6 +213,16 @@ def main(
                         continue
 
                 instance = create_instance(repo, pull)
+                if instance.get("patch_fetch_failed"):
+                    fetch_failed_count += 1
+                    write_to_dlq(
+                        "build_dataset_fetch_failed.jsonl",
+                        {
+                            "instance_id": instance["instance_id"],
+                            "repo": instance["repo"],
+                            "pull_number": instance["pull_number"],
+                        },
+                    )
                 if is_valid_instance(instance):
                     # If valid, write to .all output file
                     print(
@@ -224,7 +235,8 @@ def main(
                         with_tests += 1
     logger.info(
         f"[{', '.join(repos.keys())}] Total instances: {total_instances}, "
-        f"completed: {completed}, with tests: {with_tests}"
+        f"completed: {completed}, with tests: {with_tests}, "
+        f"patch_fetch_failed: {fetch_failed_count} (see artifacts/dlq/)"
     )
     if filter_early:
         logger.info(

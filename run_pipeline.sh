@@ -158,15 +158,61 @@ check_prereqs() {
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 log() { echo -e "\n══════════════════════════════════════════════════════════"; echo "  $1"; echo "══════════════════════════════════════════════════════════"; }
 step() { echo -e "\n── $1 ──"; }
+
+# Per-stage hard timeout (default 8h). Override via SWEFF_STAGE_TIMEOUT env.
+# Stages run on a single host; a hang here blocks the whole 10k pipeline,
+# so we wrap every python subprocess with `timeout` when available.
+STAGE_TIMEOUT="${SWEFF_STAGE_TIMEOUT:-28800}"
+TIMEOUT_BIN="$(command -v timeout || command -v gtimeout || true)"
+if [[ -z "$TIMEOUT_BIN" ]]; then
+    echo "WARNING: 'timeout' not found on PATH; stage hangs will NOT be bounded." >&2
+fi
+
 run_cmd() {
     if $DRY_RUN; then
         echo "[DRY-RUN] $*"
+        return 0
+    fi
+    if [[ -n "$TIMEOUT_BIN" ]]; then
+        "$TIMEOUT_BIN" --kill-after=60 "$STAGE_TIMEOUT" "$@"
+        local rc=$?
+        if [[ $rc -eq 124 || $rc -eq 137 ]]; then
+            echo "ERROR: stage timed out after ${STAGE_TIMEOUT}s: $*" >&2
+            return 124
+        fi
+        return $rc
     else
         "$@"
     fi
 }
 
 count_lines() { wc -l < "$1" | tr -d ' '; }
+
+# Concatenate JSONL files with strict line-count validation. Aborts on mismatch.
+# Replaces previous 'cat ... 2>/dev/null || true' anti-pattern that silently
+# dropped files on any read error.
+safe_concat_jsonl() {
+    local out="$1"; shift
+    local sources=("$@")
+    local expected=0 actual=0
+    : > "$out"
+    for src in "${sources[@]}"; do
+        if [[ ! -f "$src" ]]; then
+            echo "ERROR: safe_concat_jsonl: missing input $src" >&2
+            return 1
+        fi
+        local n
+        n=$(count_lines "$src")
+        expected=$((expected + n))
+        cat "$src" >> "$out"
+    done
+    actual=$(count_lines "$out")
+    if [[ "$expected" -ne "$actual" ]]; then
+        echo "ERROR: safe_concat_jsonl line-count mismatch: expected $expected, got $actual in $out" >&2
+        return 1
+    fi
+    echo "  merged $actual lines from ${#sources[@]} file(s) into $out"
+}
 
 ensure_dir() { mkdir -p "$@"; }
 
@@ -285,12 +331,22 @@ stage_perf_filter() {
     if [[ "$REPO_SLUG" == "multi" ]]; then
         # Concatenate all task instance files into one for filtering
         local merged_tasks="$TASKS_DIR/_all_task_instances.jsonl"
-        cat "$TASKS_DIR"/*task-instances*.jsonl > "$merged_tasks" 2>/dev/null || true
+        local task_files=( "$TASKS_DIR"/*task-instances*.jsonl )
+        if [[ ! -e "${task_files[0]}" ]]; then
+            echo "ERROR: no task-instances files in $TASKS_DIR" >&2
+            exit 1
+        fi
+        safe_concat_jsonl "$merged_tasks" "${task_files[@]}" || exit 1
         TASKS_FILE="$merged_tasks"
 
         # Run filter on each PR file and merge results
         local all_prs_merged="$PRS_DIR/_all_prs.jsonl"
-        cat "$PRS_DIR"/*prs*.jsonl > "$all_prs_merged" 2>/dev/null || true
+        local pr_files=( "$PRS_DIR"/*prs*.jsonl )
+        if [[ ! -e "${pr_files[0]}" ]]; then
+            echo "ERROR: no prs files in $PRS_DIR" >&2
+            exit 1
+        fi
+        safe_concat_jsonl "$all_prs_merged" "${pr_files[@]}" || exit 1
         run_cmd python -m swefficiency.perf_filter.attributes.filter \
             --prs_path "$all_prs_merged" \
             --instances_path "$TASKS_FILE" \
