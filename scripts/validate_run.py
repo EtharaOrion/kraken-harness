@@ -308,6 +308,69 @@ def check_dataset(dataset_path: Optional[Path]) -> CheckResult:
 
 
 # ---------------------------------------------------------------------------
+# C++ toolchain checks (opt-in via --cpp)
+# ---------------------------------------------------------------------------
+
+_CPP_TOOLS_REQUIRED = ("g++", "cmake", "ninja", "ccache", "gcov", "lcov", "gcovr")
+
+
+def check_cpp_toolchain() -> CheckResult:
+    """Verify host has C++17 build and coverage tooling.
+
+    The Docker base image (``sweb.base.cpp:latest``) carries all of these.
+    This check is for hosts running tests directly or to fail fast before a
+    10k-instance run.
+    """
+    missing = [name for name in _CPP_TOOLS_REQUIRED if shutil.which(name) is None]
+    if missing:
+        return _warn(
+            "cpp_toolchain",
+            f"missing: {', '.join(missing)}",
+            "Bundled in cpp Docker base image; only required for host-side runs.",
+            "Ubuntu: apt-get install gcc-12 g++-12 cmake ninja-build ccache lcov gcovr",
+        )
+    try:
+        proc = subprocess.run(
+            ["g++", "--version"], capture_output=True, text=True, timeout=5
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return _warn("cpp_toolchain", f"g++ probe failed: {e}")
+    import re as _re
+    match = _re.search(r"\b(\d+)\.\d+\.\d+\b", proc.stdout)
+    if not match:
+        return _warn("cpp_toolchain", "could not parse g++ version output")
+    major = int(match.group(1))
+    if major < 9:
+        return _fail(
+            "cpp_toolchain",
+            f"g++ major version {major} too old (need >= 9 for C++17).",
+            "Install gcc-12: apt-get install gcc-12 g++-12.",
+        )
+    return _ok("cpp_toolchain", f"g++ {major}.x, all tools present")
+
+
+def check_cpp_libraries() -> CheckResult:
+    """Probe for GoogleTest 1.14+ and Google Benchmark 1.8+ headers."""
+    gtest_paths = ("/usr/include/gtest/gtest.h", "/usr/local/include/gtest/gtest.h")
+    bench_paths = (
+        "/usr/include/benchmark/benchmark.h",
+        "/usr/local/include/benchmark/benchmark.h",
+    )
+    missing = []
+    if not any(Path(p).exists() for p in gtest_paths):
+        missing.append("GoogleTest")
+    if not any(Path(p).exists() for p in bench_paths):
+        missing.append("Google Benchmark")
+    if missing:
+        return _warn(
+            "cpp_libraries",
+            f"host missing: {', '.join(missing)}",
+            "Bundled in cpp Docker base image; only required for host-side runs.",
+        )
+    return _ok("cpp_libraries", "GoogleTest + Google Benchmark headers present")
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 
@@ -325,6 +388,11 @@ def run_checks(args: argparse.Namespace) -> Tuple[List[CheckResult], int]:
         ("cost_state", lambda: check_cost_state(args.run_id)),
         ("dataset", lambda: check_dataset(Path(args.dataset) if args.dataset else None)),
     ]
+    if getattr(args, "cpp", False):
+        checks.extend([
+            ("cpp_toolchain", check_cpp_toolchain),
+            ("cpp_libraries", check_cpp_libraries),
+        ])
     results: List[CheckResult] = []
     for _, fn in checks:
         try:
@@ -380,6 +448,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         type=int,
         default=int(os.environ.get("SWEFF_MIN_FDS", "4096")),
         help="Minimum soft RLIMIT_NOFILE.",
+    )
+    parser.add_argument(
+        "--cpp",
+        action="store_true",
+        help="Also check C++ build/coverage toolchain (gcc-12, cmake, ninja, lcov, gcovr, GoogleTest, Google Benchmark).",
     )
     parser.add_argument(
         "--strict",
