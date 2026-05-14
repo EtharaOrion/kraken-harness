@@ -7,14 +7,18 @@ across worker processes.
 
 from swefficiency.cache.sqlite_cache import (
     NS_REPO_SPECS,
+    NS_REPO_SPECS_CPP,
     NS_VERSION,
+    NS_VERSION_CPP,
     SqliteKVCache,
     get_default_cache,
 )
 
 __all__ = [
     "NS_REPO_SPECS",
+    "NS_REPO_SPECS_CPP",
     "NS_VERSION",
+    "NS_VERSION_CPP",
     "SqliteKVCache",
     "get_default_cache",
 ]
