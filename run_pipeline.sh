@@ -32,8 +32,8 @@ set -euo pipefail
 #   --help                  Show this help
 #
 # Stages (in execution order):
-#   scrape, perf_filter, versioning, detect_specs, workload,
-#   eval, pred_eval, report, inference
+#   scrape, perf_filter, versioning, detect_specs, coverage, flaky_filter,
+#   workload, eval, significance_filter, pred_eval, report, inference
 ###############################################################################
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -58,6 +58,7 @@ TIMEOUT=1800
 START_FROM=""
 STOP_AFTER=""
 STAGES=""
+FLAKY_RUNS=10
 
 # ─── Parse args ───────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -80,6 +81,7 @@ while [[ $# -gt 0 ]]; do
         --stop-after)   STOP_AFTER="$2"; shift 2 ;;
         --stages)       STAGES="$2"; shift 2 ;;
         --filter-early) FILTER_EARLY=true; shift ;;
+        --flaky-runs)   FLAKY_RUNS="$2"; shift 2 ;;
         --help)
             sed -n '/^# Usage:/,/^###/p' "$0" | head -n -1
             exit 0
@@ -173,7 +175,7 @@ find_jsonl() {
     find "$dir" -name "$pattern" -type f 2>/dev/null | head -1
 }
 
-ORDERED_STAGES=(scrape perf_filter versioning detect_specs workload eval pred_eval report inference)
+ORDERED_STAGES=(scrape perf_filter versioning detect_specs coverage flaky_filter workload eval significance_filter pred_eval report inference)
 
 validate_stage_name() {
     local name="$1"
@@ -383,6 +385,146 @@ stage_detect_specs() {
 }
 
 ###############################################################################
+# STAGE 4.5: Coverage Detection (Paper Stage III)
+###############################################################################
+stage_coverage() {
+    log "STAGE 4.5: Coverage Detection (Paper Stage III)"
+
+    local dataset_to_use="${ENRICHED_FILE:-${VERSIONED_FILE:-$DATASET}}"
+    if [[ -n "$DATASET" ]]; then
+        dataset_to_use="$DATASET"
+    fi
+
+    echo "  Dataset:  $dataset_to_use ($(count_lines "$dataset_to_use") instances)"
+    echo "  Workers:  $MAX_WORKERS"
+
+    local coverage_run_id="${RUN_ID}_coverage"
+    local coverage_eval_dir="$SCRIPT_DIR/logs/run_evaluation/${coverage_run_id}"
+
+    step "Running coverage detection (Docker-based)..."
+    run_cmd python swefficiency/harness/run_validation.py \
+        --dataset_name "$dataset_to_use" \
+        --run_id "$coverage_run_id" \
+        --max_workers "$MAX_WORKERS" \
+        --max_build_workers "$MAX_WORKERS" \
+        --timeout "$TIMEOUT" \
+        --use_ecr_images false \
+        --run_perf false \
+        --run_correctness false \
+        --run_coverage true \
+        --allow_test_patch \
+        --multiarch $MULTIARCH
+
+    local gold_dir="$coverage_eval_dir/gold"
+    if [[ ! -d "$gold_dir" ]]; then
+        # Fallback: find subdirectory containing actual eval artifacts (not just any dir)
+        gold_dir=$(find "$coverage_eval_dir" -mindepth 2 -maxdepth 2 -name "covering_tests.txt" -exec dirname {} \; 2>/dev/null | head -1 | xargs dirname 2>/dev/null || true)
+        # If still nothing, try any subdirectory (last resort)
+        if [[ -z "$gold_dir" || ! -d "$gold_dir" ]]; then
+            gold_dir=$(find "$coverage_eval_dir" -mindepth 1 -maxdepth 1 -type d -not -name ".*" 2>/dev/null | head -1 || true)
+        fi
+    fi
+
+    if [[ -z "$gold_dir" || ! -d "$gold_dir" ]]; then
+        echo "ERROR: Coverage run produced no output at $coverage_eval_dir"
+        exit 1
+    fi
+
+    local ct_count
+    ct_count=$(find "$gold_dir" -name "covering_tests.txt" 2>/dev/null | wc -l | tr -d ' ')
+    echo "  → Coverage found for $ct_count instances"
+
+    ensure_dir "$FILTERED_DIR"
+    COVERAGE_FILTERED="$FILTERED_DIR/${REPO_SLUG}-coverage-filtered.jsonl"
+
+    step "Merging coverage into dataset and filtering..."
+    run_cmd python scripts/merge_coverage.py \
+        --dataset "$dataset_to_use" \
+        --eval_dir "$gold_dir" \
+        --output "$COVERAGE_FILTERED"
+
+    if [[ -f "$COVERAGE_FILTERED" ]]; then
+        echo "  → $(count_lines "$COVERAGE_FILTERED") instances with coverage (paper: ~11.2% retention)"
+        ENRICHED_FILE="$COVERAGE_FILTERED"
+    else
+        echo "ERROR: Coverage filtering failed."
+        exit 1
+    fi
+}
+
+###############################################################################
+# STAGE 4.6: Flaky Test Detection (Paper Stage V — test stability)
+# NOTE: Paper requires N=10 correctness runs per instance. At scale (10k+),
+#   this is ~100k container runs. The harness skips already-built images
+#   (resume mode), so subsequent runs reuse Docker images. Scale horizontally
+#   with MAX_WORKERS to parallelize.  Reduce FLAKY_RUNS to 3-5 for screening.
+###############################################################################
+# STAGE 4.6: Flaky Test Detection (Paper Stage V — test stability)
+###############################################################################
+stage_flaky_filter() {
+    log "STAGE 4.6: Flaky Test Detection ($FLAKY_RUNS runs, Paper Stage V)"
+
+    local dataset_to_use="${COVERAGE_FILTERED:-${ENRICHED_FILE:-$DATASET}}"
+    if [[ -n "$DATASET" ]]; then
+        dataset_to_use="$DATASET"
+    fi
+
+    echo "  Dataset:  $dataset_to_use ($(count_lines "$dataset_to_use") instances)"
+    echo "  Runs:     $FLAKY_RUNS"
+    echo "  Workers:  $MAX_WORKERS"
+
+    local flaky_dirs=()
+
+    for i in $(seq 1 "$FLAKY_RUNS"); do
+        local run_id="${RUN_ID}_flaky_${i}"
+        local flaky_eval_dir="$SCRIPT_DIR/logs/run_evaluation/${run_id}"
+
+        step "Flaky run $i/$FLAKY_RUNS..."
+        run_cmd python swefficiency/harness/run_validation.py \
+            --dataset_name "$dataset_to_use" \
+            --run_id "$run_id" \
+            --max_workers "$MAX_WORKERS" \
+            --max_build_workers "$MAX_WORKERS" \
+            --timeout "$TIMEOUT" \
+            --use_ecr_images false \
+            --run_perf false \
+            --run_correctness true \
+            --run_coverage false \
+            --multiarch $MULTIARCH
+
+        local gold_dir="$flaky_eval_dir/gold"
+        if [[ ! -d "$gold_dir" ]]; then
+            gold_dir=$(find "$flaky_eval_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1 || true)
+        fi
+        if [[ -n "$gold_dir" && -d "$gold_dir" ]]; then
+            flaky_dirs+=("$gold_dir")
+        fi
+    done
+
+    if [[ ${#flaky_dirs[@]} -lt 3 ]]; then
+        echo "WARNING: Only ${#flaky_dirs[@]} flaky runs succeeded. Skipping flaky filter."
+        return
+    fi
+
+    ensure_dir "$FILTERED_DIR"
+    FLAKY_FILTERED="$FILTERED_DIR/${REPO_SLUG}-flaky-filtered.jsonl"
+
+    step "Filtering flaky tests..."
+    run_cmd python scripts/flaky_test_filter.py \
+        --dataset "$dataset_to_use" \
+        --eval_dirs "${flaky_dirs[@]}" \
+        --output "$FLAKY_FILTERED" \
+        --min_runs 3
+
+    if [[ -f "$FLAKY_FILTERED" ]]; then
+        echo "  → $(count_lines "$FLAKY_FILTERED") instances after flaky filter"
+        ENRICHED_FILE="$FLAKY_FILTERED"
+    else
+        echo "WARNING: Flaky filter failed. Continuing with unfiltered dataset."
+    fi
+}
+
+###############################################################################
 # STAGE 7: Workload Generation (LLM-based)
 ###############################################################################
 stage_workload() {
@@ -514,6 +656,45 @@ stage_eval() {
             echo "ERROR: No gold eval output. Check logs."
             exit 1
         fi
+    fi
+}
+
+###############################################################################
+# STAGE 8.5a: Significance Filter (Paper Stage V — μ_pre - μ_post > 2σ_post)
+###############################################################################
+stage_significance_filter() {
+    log "STAGE 8.5a: Statistical Significance Filter (Paper Stage V)"
+
+    local dataset_to_use="${FINAL_DATASET:-${ENRICHED_FILE:-$DATASET}}"
+    if [[ -n "$DATASET" ]]; then
+        dataset_to_use="$DATASET"
+    fi
+
+    GOLD_DIR="$EVAL_DIR/gold"
+    if [[ ! -d "$GOLD_DIR" ]]; then
+        GOLD_DIR=$(find "$EVAL_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1 || true)
+    fi
+
+    if [[ -z "$GOLD_DIR" || ! -d "$GOLD_DIR" ]]; then
+        echo "ERROR: No gold eval output for significance filter. Run eval first."
+        exit 1
+    fi
+
+    ensure_dir "$FINAL_DIR"
+    SIGNIFICANT_DATASET="$FINAL_DIR/${REPO_SLUG}-significant.jsonl"
+
+    step "Applying 2σ significance filter..."
+    run_cmd python scripts/significance_filter.py \
+        --dataset "$dataset_to_use" \
+        --eval_dir "$GOLD_DIR" \
+        --output "$SIGNIFICANT_DATASET" \
+        --sigma 2.0
+
+    if [[ -f "$SIGNIFICANT_DATASET" ]]; then
+        echo "  → $(count_lines "$SIGNIFICANT_DATASET") statistically significant instances"
+        FINAL_DATASET="$SIGNIFICANT_DATASET"
+    else
+        echo "WARNING: Significance filter failed. Continuing with unfiltered dataset."
     fi
 }
 
@@ -741,11 +922,23 @@ main() {
         [[ ! -d "$PRED_DIR" ]] && { echo "ERROR: --start-from report but no pred eval at $PRED_DIR"; exit 1; }
     fi
 
+    # ── Initialize intermediate variables for --start-from resume ──
+    if ! should_run_stage "coverage"; then
+        COVERAGE_FILTERED=$(find_jsonl "$FILTERED_DIR" "${REPO_SLUG}*coverage-filtered*.jsonl")
+        [[ -n "$COVERAGE_FILTERED" ]] && ENRICHED_FILE="$COVERAGE_FILTERED"
+    fi
+    if ! should_run_stage "flaky_filter"; then
+        FLAKY_FILTERED=$(find_jsonl "$FILTERED_DIR" "${REPO_SLUG}*flaky-filtered*.jsonl")
+        [[ -n "$FLAKY_FILTERED" ]] && ENRICHED_FILE="$FLAKY_FILTERED"
+    fi
+
     # ── Stage-gated execution ──
     should_run_stage "scrape" && ! $SKIP_SCRAPE && [[ -z "$DATASET" ]] && stage_scrape
     should_run_stage "perf_filter" && ! $SKIP_SCRAPE && [[ -z "$DATASET" ]] && stage_perf_filter
     should_run_stage "versioning" && ! $SKIP_SCRAPE && [[ -z "$DATASET" ]] && stage_versioning
     should_run_stage "detect_specs" && ! $SKIP_SCRAPE && [[ -z "$DATASET" ]] && stage_detect_specs
+    should_run_stage "coverage" && ! $SKIP_SCRAPE && [[ -z "$DATASET" ]] && stage_coverage
+    should_run_stage "flaky_filter" && ! $SKIP_SCRAPE && [[ -z "$DATASET" ]] && stage_flaky_filter
 
     export _ENRICHED="${ENRICHED_FILE:-}"
     export _FINAL="${FINAL_DATASET:-}"
@@ -758,6 +951,7 @@ main() {
     fi
 
     should_run_stage "eval" && stage_eval
+    should_run_stage "significance_filter" && stage_significance_filter
     should_run_stage "pred_eval" && stage_pred_eval
     should_run_stage "report" && stage_report
     should_run_stage "inference" && stage_inference
