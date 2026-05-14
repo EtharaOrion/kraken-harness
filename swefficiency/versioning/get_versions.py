@@ -122,7 +122,41 @@ def _find_version_in_text(text: str, instance: dict) -> str:
             return result.replace(" ", "")
 
 
+def _get_version_cache_safe():
+    """Return the default SQLite cache, or None if disabled/unavailable."""
+    if os.environ.get("SWEFF_DISABLE_CACHE"):
+        return None
+    try:
+        from swefficiency.cache.sqlite_cache import get_default_cache
+        return get_default_cache()
+    except Exception as exc:
+        logger.debug("Version cache disabled: %s", exc)
+        return None
+
+
 def get_version(instance, is_build=False, path_repo=None):
+    """Cached lookup of an instance's repo version.
+
+    Cache is keyed by (repo, base_commit) — different instances at the same
+    base_commit share the same detected version, so this collapses many
+    GitHub/filesystem reads into a single lookup. Cache is bypassed when
+    SWEFF_DISABLE_CACHE is set or when base_commit is missing.
+    """
+    repo = instance.get("repo", "")
+    base_commit = instance.get("base_commit", "")
+    cache = _get_version_cache_safe() if base_commit else None
+    cache_key = (repo, base_commit)
+    if cache is not None:
+        cached = cache.get("version", cache_key)
+        if cached:
+            return cached
+    version = _get_version_impl(instance, is_build=is_build, path_repo=path_repo)
+    if cache is not None and version:
+        cache.set("version", cache_key, version)
+    return version
+
+
+def _get_version_impl(instance, is_build=False, path_repo=None):
     """
     Function for looking up the version of a task instance.
 

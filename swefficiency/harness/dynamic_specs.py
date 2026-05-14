@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_DYNAMIC_SPECS_CACHE: dict[tuple[str, str, str], dict] = {}
+_DYNAMIC_SPECS_CACHE: dict[tuple[str, str], dict] = {}
 _CACHE_LOCK = threading.Lock()
 
 
@@ -38,10 +38,10 @@ def get_or_create_specs(
         if version in repo_specs:
             return repo_specs[version]
 
-    # Use instance_id in cache key: instances sharing the same (repo, version)
-    # may have different install_cmd / test_cmd_override fields.
-    instance_id = instance.get("instance_id", "")
-    cache_key = (repo, version, instance_id)
+    # Cache by (repo, version) only — instances sharing a repo@version share
+    # the same auto-detected specs because they come from the same base_commit's
+    # tree via detect_repo_specs.py. Keying by instance_id gave ~zero hit rate.
+    cache_key = (repo, version)
     with _CACHE_LOCK:
         if cache_key in _DYNAMIC_SPECS_CACHE:
             return _DYNAMIC_SPECS_CACHE[cache_key]

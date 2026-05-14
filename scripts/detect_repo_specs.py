@@ -27,6 +27,11 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
+from swefficiency.cache.sqlite_cache import (
+    NS_REPO_SPECS,
+    SqliteKVCache,
+    get_default_cache,
+)
 
 # TOML parsing: prefer stdlib tomllib (3.11+), fallback to tomli, then regex
 try:
@@ -585,13 +590,14 @@ def process_repo_group(
     repo: str,
     base_commit: str,
     clone_dir: Path,
-    cache: dict[str, dict[str, Any]],
+    cache: SqliteKVCache,
 ) -> dict[str, Any] | None:
     """Clone repo, checkout commit, detect specs. Returns specs dict or None on failure."""
-    cache_key = f"{repo}@{base_commit}"
-    if cache_key in cache:
-        log.info("Cache hit for %s", cache_key)
-        return cache[cache_key]
+    cache_key = (repo, base_commit)
+    cached_specs = cache.get(NS_REPO_SPECS, cache_key)
+    if cached_specs is not None:
+        log.info("Cache hit for %s@%s", repo, base_commit[:8])
+        return cached_specs
 
     dest = clone_dir / repo.replace("/", "__") / base_commit[:12]
     cloned = False
@@ -609,7 +615,7 @@ def process_repo_group(
             return None
 
         specs = detect_all_specs(dest, repo)
-        cache[cache_key] = specs
+        cache.set(NS_REPO_SPECS, cache_key, specs)
         log.info("Detected specs for %s: python=%s install=%s", cache_key,
                  specs["python_version"], specs["install_cmd"])
         return specs
@@ -680,30 +686,6 @@ def write_jsonl(instances: list[dict[str, Any]], output_path: str) -> None:
     log.info("Wrote %d instances to %s", len(instances), out)
 
 
-def load_cache(cache_file: str) -> dict[str, dict[str, Any]]:
-    """Load specs cache from a JSON file."""
-    path = Path(cache_file)
-    if path.exists():
-        try:
-            with open(path, encoding="utf-8") as f:
-                data = json.load(f)
-            log.info("Loaded %d cached specs from %s", len(data), path)
-            return data
-        except (json.JSONDecodeError, OSError) as exc:
-            log.warning("Failed to load cache %s: %s", path, exc)
-    return {}
-
-
-def save_cache(cache: dict[str, dict[str, Any]], cache_file: str) -> None:
-    """Save specs cache to a JSON file."""
-    path = Path(cache_file)
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(cache, f, indent=2, ensure_ascii=False)
-        log.info("Saved %d specs to cache %s", len(cache), path)
-    except OSError as exc:
-        log.warning("Failed to save cache: %s", exc)
-
 
 # ---------------------------------------------------------------------------
 # Validation
@@ -750,8 +732,6 @@ def main() -> None:
                         help="Print detections without writing")
     parser.add_argument("--validate", action="store_true",
                         help="Validate existing JSONL has required fields")
-    parser.add_argument("--cache-file", default=".specs_cache.json",
-                        help="Cache file for detections")
     parser.add_argument("--license-filter", nargs="*",
                         default=["MIT", "MIT-0", "Apache-2.0", "BSD-3-Clause",
                                  "BSD-2-Clause", "ISC"],
@@ -780,7 +760,7 @@ def main() -> None:
         sys.exit(0 if ok else 1)
 
     # Load cache
-    cache = load_cache(args.cache_file)
+    cache = get_default_cache()
 
     # Group instances by (repo, base_commit)
     groups: dict[tuple[str, str], list[int]] = defaultdict(list)
@@ -821,8 +801,6 @@ def main() -> None:
                     log.exception("Worker error for %s", key)
                     specs_map[key] = None
 
-    # Save cache
-    save_cache(cache, args.cache_file)
 
     # Apply specs to instances and collect stats
     enriched = 0
