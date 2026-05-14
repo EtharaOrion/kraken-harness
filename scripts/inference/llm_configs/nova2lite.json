@@ -1,0 +1,10 @@
+{
+    "model": "bedrock/converse/arn:aws:bedrock:us-east-1:426628337772:application-inference-profile/a0q672msxd5z",
+    "aws_region_name": "us-east-1",
+    "drop_params": true,
+    "reasoning_effort": null,
+    "enable_encrypted_reasoning": false,
+    "extended_thinking_budget": null,
+    "input_cost_per_token": 0.00000006,
+    "output_cost_per_token": 0.00000024
+}
