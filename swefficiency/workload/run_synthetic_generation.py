@@ -30,6 +30,8 @@ from tqdm import tqdm
 from swefficiency.harness.constants import SWEfficiencyInstance
 from swefficiency.harness.utils import load_swefficiency_dataset
 from swefficiency.observability import helicone_metadata, safe_completion_cost, setup_helicone
+from swefficiency.workload.cost_tracker import CostLimitExceeded, CostTracker
+from swefficiency.workload.rate_limiter import get_default_bucket
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -137,6 +139,7 @@ def _fetch_file_with_retry(url: str) -> Optional[str]:
 def worker_function(
     datum: SWEfficiencyInstance,
     run_id: str,
+    cost_tracker: Optional[CostTracker] = None,
 ):
     output_file = WORKLOAD_GENERATION_DIR / run_id / f"{datum['instance_id']}.py"
     output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -189,6 +192,7 @@ def worker_function(
     response = None
     last_error = None
     for attempt in range(MAX_LLM_RETRIES):
+        get_default_bucket().acquire()
         try:
             model_name = os.environ.get(
                 "WORKLOAD_MODEL",
@@ -262,6 +266,11 @@ def worker_function(
     total_tokens = getattr(usage, "total_tokens", 0) if usage else 0
 
     cost_usd = safe_completion_cost(response)
+    if cost_tracker is not None:
+        try:
+            cost_tracker.add(cost_usd)
+        except CostLimitExceeded:
+            raise
 
     with open(output_file, "w") as f:
         if code_block_content:
@@ -300,6 +309,12 @@ def main(
     WORKLOAD_GENERATION_DIR.mkdir(parents=True, exist_ok=True)
     output_dir = WORKLOAD_GENERATION_DIR / run_id
     output_dir.mkdir(parents=True, exist_ok=True)
+    cost_tracker = CostTracker.for_run(run_id=run_id)
+    if cost_tracker.cap_usd is not None:
+        logger.info(
+            "LLM cost cap: $%.2f (prior spend $%.4f)",
+            cost_tracker.cap_usd, cost_tracker.total,
+        )
     output_path = output_dir / "workload_generation.json"
 
     # Filter dataset by instance_ids if provided
@@ -342,7 +357,7 @@ def main(
     failed = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(worker_function, datum, run_id): datum["instance_id"]
+            executor.submit(worker_function, datum, run_id, cost_tracker): datum["instance_id"]
             for datum in dataset
         }
         for future in tqdm(
@@ -354,6 +369,14 @@ def main(
                 results.append(result)
                 if result.get("error"):
                     failed.append(instance_id)
+            except CostLimitExceeded as e:
+                logger.error(
+                    f"[{instance_id}] Cost cap hit ({e}). Cancelling remaining work."
+                )
+                for pending in futures:
+                    pending.cancel()
+                failed.append(instance_id)
+                break
             except Exception as e:
                 logger.error(f"[{instance_id}] Unhandled exception: {e}")
                 failed.append(instance_id)
