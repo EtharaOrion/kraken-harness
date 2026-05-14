@@ -1,7 +1,16 @@
-"""Conftest: pre-register swefficiency as a namespace to bypass heavy __init__.py imports."""
+"""Conftest: pre-register swefficiency as a namespace to bypass heavy __init__.py imports.
 
+Also disables the persistent version cache so HTTP-mock based tests are not
+short-circuited by entries from earlier real-network runs.
+"""
+
+import os
 import sys
 import types
+
+# Disable the SQLite version cache for the entire versioning test suite.
+# Production callers can still opt in via the same env var.
+os.environ.setdefault("SWEFF_DISABLE_CACHE", "1")
 
 # Only do this if swefficiency hasn't been imported yet
 if "swefficiency" not in sys.modules:

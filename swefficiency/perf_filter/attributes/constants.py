@@ -208,7 +208,15 @@ def filter_base(pull: dict, keywords=None, use_extended: bool = False):
 
 
 def filter_content(issue_text: str, keywords=None, use_extended: bool = False) -> bool:
-    """Check if issue/problem statement text contains performance keywords."""
+    """Check if issue/problem statement text contains performance keywords.
+
+    Matches in two ways so short keywords that would false-positive as
+    substrings (e.g. ``fast`` inside ``FastAPI`` or ``breakfast``) still get
+    counted when they appear as standalone words:
+
+    * Substring match against ``keywords`` (default PAPER_PERF_KEYWORDS).
+    * Word-boundary regex match against ``WORD_BOUNDARY_KEYWORDS``.
+    """
     if not issue_text:
         return False
 
@@ -216,7 +224,12 @@ def filter_content(issue_text: str, keywords=None, use_extended: bool = False) -
         keywords = EXTENDED_PERF_KEYWORDS if use_extended else PAPER_PERF_KEYWORDS
 
     issue_text_lower = remove_markdown_comments(issue_text.lower())
-    return any(kw in issue_text_lower for kw in keywords)
+    if any(kw in issue_text_lower for kw in keywords):
+        return True
+    return any(
+        re.search(r"\b" + re.escape(kw) + r"\b", issue_text_lower)
+        for kw in WORD_BOUNDARY_KEYWORDS
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

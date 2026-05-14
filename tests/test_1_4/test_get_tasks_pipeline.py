@@ -273,32 +273,45 @@ class TestConstructDataFiles:
 
 
 class TestMainPipeline:
+    # Helpers --------------------------------------------------------------
+    @staticmethod
+    def _setup_executor_mock(MockExecutor):
+        """Wire MockExecutor as a context manager that records submit calls."""
+        mock_executor = MagicMock()
+        MockExecutor.return_value.__enter__ = MagicMock(return_value=mock_executor)
+        MockExecutor.return_value.__exit__ = MagicMock(return_value=False)
+        mock_executor.submit.return_value = MagicMock()
+        return mock_executor
+
+    @staticmethod
+    def _submitted_data(mock_executor):
+        """Return the list of second-positional args passed to executor.submit."""
+        return [c.args[1] for c in mock_executor.submit.call_args_list]
+
     # D1: Basic execution with single token
-    @patch("swefficiency.collect.get_tasks_pipeline.Pool")
+    @patch("swefficiency.collect.get_tasks_pipeline.as_completed", new=lambda fs: iter([]))
+    @patch("swefficiency.collect.get_tasks_pipeline.ProcessPoolExecutor")
     @patch("swefficiency.collect.get_tasks_pipeline.os.getenv")
-    def test_d1_single_token(self, mock_getenv, MockPool):
+    def test_d1_single_token(self, mock_getenv, MockExecutor):
         mock_getenv.return_value = "token1"
-        mock_pool = MagicMock()
-        MockPool.return_value.__enter__ = MagicMock(return_value=mock_pool)
-        MockPool.return_value.__exit__ = MagicMock(return_value=False)
+        mock_executor = self._setup_executor_mock(MockExecutor)
 
         main(["org/repo"], "/tmp/prs", "/tmp/tasks")
 
-        MockPool.assert_called_once_with(1)
-        mock_pool.map.assert_called_once()
+        MockExecutor.assert_called_once_with(max_workers=1)
+        assert mock_executor.submit.called
 
-    # D1: Multiple tokens → Pool with correct size
-    @patch("swefficiency.collect.get_tasks_pipeline.Pool")
+    # D1: Multiple tokens → executor sized to token count
+    @patch("swefficiency.collect.get_tasks_pipeline.as_completed", new=lambda fs: iter([]))
+    @patch("swefficiency.collect.get_tasks_pipeline.ProcessPoolExecutor")
     @patch("swefficiency.collect.get_tasks_pipeline.os.getenv")
-    def test_d1_multiple_tokens(self, mock_getenv, MockPool):
+    def test_d1_multiple_tokens(self, mock_getenv, MockExecutor):
         mock_getenv.return_value = "tok1,tok2,tok3"
-        mock_pool = MagicMock()
-        MockPool.return_value.__enter__ = MagicMock(return_value=mock_pool)
-        MockPool.return_value.__exit__ = MagicMock(return_value=False)
+        self._setup_executor_mock(MockExecutor)
 
         main(["org/a", "org/b", "org/c"], "/tmp/prs", "/tmp/tasks")
 
-        MockPool.assert_called_once_with(3)
+        MockExecutor.assert_called_once_with(max_workers=3)
 
     # D8: Missing GITHUB_TOKENS raises
     @patch("swefficiency.collect.get_tasks_pipeline.os.getenv")
@@ -315,69 +328,65 @@ class TestMainPipeline:
             main(["org/repo"], "/tmp/prs", "/tmp/tasks")
 
     # D1: max_pulls and cutoff_date forwarded
-    @patch("swefficiency.collect.get_tasks_pipeline.Pool")
+    @patch("swefficiency.collect.get_tasks_pipeline.as_completed", new=lambda fs: iter([]))
+    @patch("swefficiency.collect.get_tasks_pipeline.ProcessPoolExecutor")
     @patch("swefficiency.collect.get_tasks_pipeline.os.getenv")
-    def test_d1_params_forwarded(self, mock_getenv, MockPool):
+    def test_d1_params_forwarded(self, mock_getenv, MockExecutor):
         mock_getenv.return_value = "tok1"
-        mock_pool = MagicMock()
-        MockPool.return_value.__enter__ = MagicMock(return_value=mock_pool)
-        MockPool.return_value.__exit__ = MagicMock(return_value=False)
+        mock_executor = self._setup_executor_mock(MockExecutor)
 
         main(
             ["org/repo"], "/tmp/prs", "/tmp/tasks", max_pulls=10, cutoff_date="20240101"
         )
 
-        data_arg = mock_pool.map.call_args[0][1]
-        assert data_arg[0]["max_pulls"] == 10
-        assert data_arg[0]["cutoff_date"] == "20240101"
+        data_args = self._submitted_data(mock_executor)
+        assert data_args[0]["max_pulls"] == 10
+        assert data_args[0]["cutoff_date"] == "20240101"
 
     # D7: Repos split across tokens correctly
-    @patch("swefficiency.collect.get_tasks_pipeline.Pool")
+    @patch("swefficiency.collect.get_tasks_pipeline.as_completed", new=lambda fs: iter([]))
+    @patch("swefficiency.collect.get_tasks_pipeline.ProcessPoolExecutor")
     @patch("swefficiency.collect.get_tasks_pipeline.os.getenv")
-    def test_d7_repos_split_across_tokens(self, mock_getenv, MockPool):
+    def test_d7_repos_split_across_tokens(self, mock_getenv, MockExecutor):
         mock_getenv.return_value = "tok1,tok2"
-        mock_pool = MagicMock()
-        MockPool.return_value.__enter__ = MagicMock(return_value=mock_pool)
-        MockPool.return_value.__exit__ = MagicMock(return_value=False)
+        mock_executor = self._setup_executor_mock(MockExecutor)
 
         repos = ["org/a", "org/b", "org/c"]
         main(repos, "/tmp/prs", "/tmp/tasks")
 
-        data_arg = mock_pool.map.call_args[0][1]
-        assert len(data_arg) == 2
+        data_args = self._submitted_data(mock_executor)
+        assert len(data_args) == 2
         all_repos = []
-        for d in data_arg:
+        for d in data_args:
             all_repos.extend(d["repos"])
         assert sorted(all_repos) == sorted(repos)
 
     # D4: Token with trailing comma
-    @patch("swefficiency.collect.get_tasks_pipeline.Pool")
+    @patch("swefficiency.collect.get_tasks_pipeline.as_completed", new=lambda fs: iter([]))
+    @patch("swefficiency.collect.get_tasks_pipeline.ProcessPoolExecutor")
     @patch("swefficiency.collect.get_tasks_pipeline.os.getenv")
-    def test_d4_token_trailing_comma(self, mock_getenv, MockPool):
+    def test_d4_token_trailing_comma(self, mock_getenv, MockExecutor):
         mock_getenv.return_value = "tok1,tok2,"
-        mock_pool = MagicMock()
-        MockPool.return_value.__enter__ = MagicMock(return_value=mock_pool)
-        MockPool.return_value.__exit__ = MagicMock(return_value=False)
+        self._setup_executor_mock(MockExecutor)
 
         main(["org/repo"], "/tmp/prs", "/tmp/tasks")
 
-        # Trailing comma creates empty string token → Pool(3)
-        MockPool.assert_called_once_with(3)
+        # Trailing comma creates empty string token → executor sized to 3.
+        MockExecutor.assert_called_once_with(max_workers=3)
 
     # D1: Paths are absolutified
-    @patch("swefficiency.collect.get_tasks_pipeline.Pool")
+    @patch("swefficiency.collect.get_tasks_pipeline.as_completed", new=lambda fs: iter([]))
+    @patch("swefficiency.collect.get_tasks_pipeline.ProcessPoolExecutor")
     @patch("swefficiency.collect.get_tasks_pipeline.os.getenv")
-    def test_d1_paths_absolutified(self, mock_getenv, MockPool):
+    def test_d1_paths_absolutified(self, mock_getenv, MockExecutor):
         mock_getenv.return_value = "tok1"
-        mock_pool = MagicMock()
-        MockPool.return_value.__enter__ = MagicMock(return_value=mock_pool)
-        MockPool.return_value.__exit__ = MagicMock(return_value=False)
+        mock_executor = self._setup_executor_mock(MockExecutor)
 
         main(["org/repo"], "relative/prs", "relative/tasks")
 
-        data_arg = mock_pool.map.call_args[0][1]
-        assert os.path.isabs(data_arg[0]["path_prs"])
-        assert os.path.isabs(data_arg[0]["path_tasks"])
+        data_args = self._submitted_data(mock_executor)
+        assert os.path.isabs(data_args[0]["path_prs"])
+        assert os.path.isabs(data_args[0]["path_tasks"])
 
 
 

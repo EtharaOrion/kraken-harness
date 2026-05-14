@@ -608,7 +608,7 @@ class TestGetAllLoop:
         r = self._setup_repo(mock_ghapi_cls)
         func = MagicMock(
             side_effect=[
-                Exception("rate limit"),
+                requests.exceptions.HTTPError("rate limit"),
                 ["a"],
                 [],
             ]
@@ -1168,6 +1168,7 @@ class TestSendRequestWithRateLimitHandling:
             "https://api.github.com/test",
             headers={"Authorization": "Bearer token"},
             params=None,
+            timeout=30,
         )
 
     @patch("swefficiency.collect.utils.requests.get")
@@ -1185,6 +1186,7 @@ class TestSendRequestWithRateLimitHandling:
             "https://api.github.com/test",
             headers=None,
             params={"page": 1, "per_page": 50},
+            timeout=30,
         )
 
     @patch("swefficiency.collect.utils.requests.get")
@@ -1199,6 +1201,7 @@ class TestSendRequestWithRateLimitHandling:
             "https://api.github.com/test",
             headers=None,
             params=None,
+            timeout=30,
         )
 
     @patch("swefficiency.collect.utils.requests.get")
@@ -1331,13 +1334,14 @@ class TestExtractPatches:
 
     @patch("swefficiency.collect.utils.send_request_with_rate_limit_handling")
     def test_d8_request_exception_returns_empty(self, mock_send):
-        # D8: exception during request returns ("", "")
-        mock_send.side_effect = Exception("Network error")
+        # D8: a RequestException is caught, DLQ'd, and (None, None) returned
+        # so callers can distinguish 'fetch failed' from 'empty patch'.
+        mock_send.side_effect = requests.exceptions.RequestException("Network error")
         repo = _mock_repo()
         pull = _make_pull_dict()
         fix, test = extract_patches(pull, repo)
-        assert fix == ""
-        assert test == ""
+        assert fix is None
+        assert test is None
 
     @patch("swefficiency.collect.utils.send_request_with_rate_limit_handling")
     def test_d1_e2e_test_directory(self, mock_send):

@@ -140,19 +140,27 @@ def get_version(instance, is_build=False, path_repo=None):
     Cache is keyed by (repo, base_commit) — different instances at the same
     base_commit share the same detected version, so this collapses many
     GitHub/filesystem reads into a single lookup. Cache is bypassed when
-    SWEFF_DISABLE_CACHE is set or when base_commit is missing.
+    SWEFF_DISABLE_CACHE is set, when the cache fails to initialize, or when
+    repo/base_commit are not both non-empty strings.
+
+    The shape of ``instance`` is intentionally validated by bracket access
+    so callers that pass None, a string, or a missing key see the same
+    TypeError/KeyError the original implementation produced.
     """
-    repo = instance.get("repo", "")
-    base_commit = instance.get("base_commit", "")
-    cache = _get_version_cache_safe() if base_commit else None
-    cache_key = (repo, base_commit)
+    repo = instance["repo"]
+    base_commit = instance["base_commit"]
+    can_cache = (
+        isinstance(repo, str) and repo
+        and isinstance(base_commit, str) and base_commit
+    )
+    cache = _get_version_cache_safe() if can_cache else None
     if cache is not None:
-        cached = cache.get("version", cache_key)
+        cached = cache.get("version", (repo, base_commit))
         if cached:
             return cached
     version = _get_version_impl(instance, is_build=is_build, path_repo=path_repo)
     if cache is not None and version:
-        cache.set("version", cache_key, version)
+        cache.set("version", (repo, base_commit), version)
     return version
 
 

@@ -25,7 +25,8 @@ import argparse
 import logging
 import os
 import traceback
-import concurrent.futures
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 
 from dotenv import load_dotenv
 
@@ -228,16 +229,16 @@ def main(
     # on worker death and lets surviving chunks complete. Per-repo failures
     # are handled inside construct_data_files; this outer net catches
     # SIGKILL/OOM/crash scenarios and DLQs the affected chunk's repos.
-    with concurrent.futures.ProcessPoolExecutor(max_workers=len(tokens)) as executor:
+    with ProcessPoolExecutor(max_workers=len(tokens)) as executor:
         future_to_repos = {
             executor.submit(construct_data_files, data): data["repos"]
             for data in data_pooled
         }
-        for future in concurrent.futures.as_completed(future_to_repos):
+        for future in as_completed(future_to_repos):
             chunk_repos = future_to_repos[future]
             try:
                 future.result()
-            except concurrent.futures.process.BrokenProcessPool as e:
+            except BrokenProcessPool as e:
                 logger.error(f"Worker died handling repos {chunk_repos!r}: {e}")
                 for repo in chunk_repos:
                     write_to_dlq(
