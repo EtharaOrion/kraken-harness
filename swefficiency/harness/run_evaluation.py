@@ -21,7 +21,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import docker
-import jso
+import json
+import threading
 from tqdm import tqdm
 
 from swefficiency.harness.constants import (
@@ -55,6 +56,23 @@ from swefficiency.harness.test_spec import (
     parse_perf_output,
 )
 from swefficiency.harness.utils import load_swefficiency_dataset, str2bool
+
+
+# Global Docker client singleton.
+# docker.from_env() opens a new socket per call; with hundreds of concurrent
+# workers this exhausts the daemon's connection budget. One shared client is
+# thread-safe for the SDK methods we use (per docker-py docs) and avoids the leak.
+_DOCKER_CLIENT = None
+_DOCKER_CLIENT_LOCK = threading.Lock()
+
+
+def get_docker_client():
+    global _DOCKER_CLIENT
+    if _DOCKER_CLIENT is None:
+        with _DOCKER_CLIENT_LOCK:
+            if _DOCKER_CLIENT is None:
+                _DOCKER_CLIENT = docker.from_env()
+    return _DOCKER_CLIENT
 
 
 class EvaluationError(Exception):
@@ -348,7 +366,7 @@ def run_instances(
         run_id (str): Run ID
         timeout (int): Timeout for running tests
     """
-    client = docker.from_env()
+    client = get_docker_client()
     test_specs = list(map(make_test_spec, instances))
 
     # print number of existing instance images
@@ -623,7 +641,7 @@ def main(
     # set open file limit
     assert len(run_id) > 0, "Run ID must be provided"
     resource.setrlimit(resource.RLIMIT_NOFILE, (open_file_limit, open_file_limit))
-    client = docker.from_env()
+    client = get_docker_client()
 
     # load predictions as map of instance_id to prediction
     if predictions_path == "gold":

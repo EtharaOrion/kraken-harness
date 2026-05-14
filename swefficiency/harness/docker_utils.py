@@ -29,6 +29,18 @@ from docker.models.containers import Container
 HEREDOC_DELIMITER = "EOF_1399519320"  # different from dataset HEREDOC_DELIMITERs!
 
 
+# Module-level lock guarding list_images. docker-py's images.list() iterates
+# the daemon's image table; concurrent calls from many workers occasionally
+# return partial/duplicated results or trip 500s from the daemon.
+_LIST_IMAGES_LOCK = threading.Lock()
+
+
+# How many times to retry transient docker daemon errors during
+# cleanup_container's remove step.
+_CLEANUP_REMOVE_RETRIES = 3
+_CLEANUP_REMOVE_BACKOFF_S = 2.0
+
+
 def copy_to_container(container: Container, src: Path, dst: Path):
     """
     Copy a file from local to a docker container
@@ -186,16 +198,33 @@ def cleanup_container(client, container, logger):
                 f"{traceback.format_exc()}"
             )
 
-    # Attempt to remove the container
-    try:
-        log_info(f"Attempting to remove container {container.name}...")
-        container.remove(force=True)
-        log_info(f"Container {container.name} removed.")
-    except Exception as e:
+    # Attempt to remove the container, retrying transient daemon errors.
+    last_remove_error = None
+    for attempt in range(_CLEANUP_REMOVE_RETRIES):
+        try:
+            log_info(
+                f"Attempting to remove container {container.name}"
+                f" (attempt {attempt + 1}/{_CLEANUP_REMOVE_RETRIES})..."
+            )
+            container.remove(force=True)
+            log_info(f"Container {container.name} removed.")
+            last_remove_error = None
+            break
+        except Exception as e:
+            last_remove_error = e
+            if attempt + 1 < _CLEANUP_REMOVE_RETRIES:
+                log_error(
+                    f"Failed to remove container {container.name}"
+                    f" (attempt {attempt + 1}/{_CLEANUP_REMOVE_RETRIES}): {e}."
+                    f" Retrying in {_CLEANUP_REMOVE_BACKOFF_S:.1f}s..."
+                )
+                time.sleep(_CLEANUP_REMOVE_BACKOFF_S)
+    if last_remove_error is not None:
         if raise_error:
-            raise e
+            raise last_remove_error
         log_error(
-            f"Failed to remove container {container.name}: {e}\n"
+            f"Failed to remove container {container.name} after"
+            f" {_CLEANUP_REMOVE_RETRIES} attempts: {last_remove_error}\n"
             f"{traceback.format_exc()}"
         )
 
@@ -303,9 +332,12 @@ def find_dependent_images(client: docker.DockerClient, image_name: str):
 def list_images(client: docker.DockerClient):
     """
     List all images from the Docker client.
+
+    Thread-safe: guarded by _LIST_IMAGES_LOCK because concurrent images.list()
+    calls can race in the docker daemon at high worker counts.
     """
-    # don't use this in multi-threaded context
-    return {tag for i in client.images.list(all=True) for tag in i.tags}
+    with _LIST_IMAGES_LOCK:
+        return {tag for i in client.images.list(all=True) for tag in i.tags}
 
 
 def clean_images(
