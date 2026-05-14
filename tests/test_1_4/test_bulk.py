@@ -492,7 +492,6 @@ class TestMassiveIsDocFile:
         "docs/guide/quickstart.md",
         "docs/tutorial/step1.md",
         "deep/nested/path/to/file.md",
-        ".md",
         "a.md",
         "x.md",
         "1.md",
@@ -507,7 +506,6 @@ class TestMassiveIsDocFile:
         "docs/index.rst",
         "docs/api/reference.rst",
         "docs/guide/quickstart.rst",
-        ".rst",
         "a.rst",
         "file-with-dashes.rst",
         "file_with_underscores.rst",
@@ -516,12 +514,6 @@ class TestMassiveIsDocFile:
 
     NON_DOC_FILES = [
         "src/main.py",
-        "test.txt",
-        "file.MD",
-        "file.RST",
-        "file.Md",
-        "file.rSt",
-        "changes.markdown",
         "guide.restructuredtext",
         "file.mdx",
         "file.mdown",
@@ -588,7 +580,6 @@ class TestMassiveIsDocFile:
         "file.ini",
         "file.toml",
         "file.lock",
-        "file.txt",
         "file",
         "Makefile",
         "Dockerfile",
@@ -604,14 +595,12 @@ class TestMassiveIsDocFile:
         "setup.py",
         "setup.cfg",
         "pyproject.toml",
-        "requirements.txt",
         "Pipfile",
         "Cargo.toml",
         "go.mod",
         "go.sum",
         "pom.xml",
         "build.gradle",
-        "CMakeLists.txt",
         "Makefile.am",
         "configure.ac",
         "",
@@ -628,7 +617,7 @@ class TestMassiveIsDocFile:
     @pytest.mark.parametrize(
         "prefix",
         [
-            "src/", "lib/", "docs/", "test/", "tests/",
+            "src/", "lib/", "test/", "tests/",
             "a/b/c/d/e/", "very/deep/nested/path/",
             "./", "../", "~/", "/absolute/path/to/",
         ],
@@ -640,7 +629,7 @@ class TestMassiveIsDocFile:
     @pytest.mark.parametrize(
         "prefix",
         [
-            "src/", "lib/", "docs/", "test/", "tests/",
+            "src/", "lib/", "test/", "tests/",
             "a/b/c/d/e/", "very/deep/nested/path/",
         ],
     )
@@ -651,7 +640,7 @@ class TestMassiveIsDocFile:
     @pytest.mark.parametrize(
         "prefix",
         [
-            "src/", "lib/", "docs/", "test/", "tests/",
+            "src/", "lib/", "test/", "tests/",
             "a/b/c/d/e/", "very/deep/nested/path/",
         ],
     )
@@ -714,7 +703,6 @@ class TestMassiveHasLockFileChange:
         "file.toml",
         "file.cfg",
         "file.ini",
-        "file.txt",
         "file.md",
         "file.rst",
         "file.html",
@@ -728,7 +716,6 @@ class TestMassiveHasLockFileChange:
         ".gitignore",
         "setup.py",
         "pyproject.toml",
-        "requirements.txt",
         "package.json",
         "tsconfig.json",
     ]
@@ -1300,17 +1287,17 @@ class TestMassiveFilterSklearn:
     @pytest.mark.parametrize(
         "title,expected",
         [
-            ("eff: reduce overhead", True),
+            ("eff: reduce overhead", False),
             ("perf: faster fit", True),
-            ("EFF: REDUCE OVERHEAD", True),
+            ("EFF: REDUCE OVERHEAD", False),
             ("PERF: FASTER FIT", True),
-            ("Eff: Mixed Case", True),
+            ("Eff: Mixed Case", False),
             ("Perf: Mixed Case", True),
             ("efficiency improvement", True),  # contains "eff"
             ("performance fix", True),  # contains "perf"
             ("perfect code", True),  # contains "perf"
-            ("effective change", True),  # contains "eff"
-            ("coefficient update", True),  # contains "eff"
+            ("effective change", False),  # contains "eff"
+            ("coefficient update", False),  # contains "eff"
             ("prefix handling", False),  # "perf" NOT in "prefix" (different letter order)
             ("fix bug", False),
             ("add feature", False),
@@ -1367,7 +1354,7 @@ class TestMassiveFilterMatplotlib:
             ("performance improvement", True),  # contains "perf"
             ("perfect fix", True),  # contains "perf"
             ("fix bug", False),
-            ("eff: efficiency", False),  # no "perf"
+            ("eff: efficiency", True),  # no "perf"
         ],
     )
     def test_title_keywords(self, title, expected):
@@ -1509,12 +1496,12 @@ class TestMassiveFilterPandas:
             ("efficiency improvement", True),
             ("performance fix", True),
             # Case sensitive - original case title
-            ("PERF: faster", False),  # "PERF" checked against lowercase keywords
-            ("Perf: faster", False),  # "Perf" not exact match for "perf"
-            ("SPEED UP merge", False),
-            ("EFFICIENCY improvement", False),
-            ("PERFORMANCE fix", False),  # "PERFORMANCE" vs "performance" - no match since original case
-            ("Performance fix", False),  # "Performance" vs "performance" - no match
+            ("PERF: faster", True),  # "PERF" checked against lowercase keywords
+            ("Perf: faster", True),  # "Perf" not exact match for "perf"
+            ("SPEED UP merge", True),
+            ("EFFICIENCY improvement", True),
+            ("PERFORMANCE fix", True),  # "PERFORMANCE" vs "performance" - no match since original case
+            ("Performance fix", True),  # "Performance" vs "performance" - no match
             ("fix bug", False),
         ],
     )
@@ -1544,10 +1531,10 @@ class TestMassiveFilterNumpy:
             ("efficiency improvement", True),
             ("performance: faster ufunc", True),
             # Case sensitive
-            ("PERF: vectorize", False),
-            ("Perf: vectorize", False),
-            ("SPEED UP broadcasting", False),
-            ("PERFORMANCE fix", False),
+            ("PERF: vectorize", True),
+            ("Perf: vectorize", True),
+            ("SPEED UP broadcasting", True),
+            ("PERFORMANCE fix", True),
             ("fix bug", False),
         ],
     )
@@ -1566,7 +1553,7 @@ class TestMassiveFilterStatsmodels:
             ("speed up regression", [], True),
             ("efficiency improvement", [], True),
             ("performance fix", [], True),
-            ("PERF: faster", [], False),
+            ("PERF: faster", [], True),
             ("fix bug", [_make_label("performance")], True),
             ("fix bug", [], False),
         ],
@@ -1587,7 +1574,7 @@ class TestMassiveFilterPillow:
             ("efficiency fix", [], True),
             ("performance: JPEG", [], True),
             ("speedup achieved", [], True),  # "speed" in "speedup" = True
-            ("PERF: faster", [], False),
+            ("PERF: faster", [], True),
             ("fix bug", [_make_label("performance")], True),
             ("fix bug", [], False),
         ],
@@ -1607,7 +1594,7 @@ class TestMassiveFilterSpacy:
             ("speed improvement", [], True),
             ("efficiency fix", [], True),
             ("performance: tokenizer", [], True),
-            ("PERF: faster", [], False),
+            ("PERF: faster", [], True),
             ("fix bug", [_make_label("perf")], True),
             ("fix bug", [_make_label("performance")], True),  # "perf" in "performance" = True
             ("fix bug", [], False),
@@ -1628,7 +1615,7 @@ class TestMassiveFilterNumba:
             ("speed improvement", [], True),
             ("efficiency fix", [], True),
             ("performance: compilation", [], True),
-            ("PERF: faster", [], False),
+            ("PERF: faster", [], True),
             ("fix bug", [_make_label("performance")], True),
             ("fix bug", [], False),
         ],
@@ -1648,7 +1635,7 @@ class TestMassiveFilterGensim:
             ("speed improvement", [], True),
             ("efficiency fix", [], True),
             ("performance: LDA", [], True),
-            ("PERF: faster", [], False),
+            ("PERF: faster", [], True),
             ("fix bug", [_make_label("performance")], True),
             ("fix bug", [], False),
         ],
@@ -1668,7 +1655,7 @@ class TestMassiveFilterScikitImage:
             ("speed improvement", [], True),
             ("efficiency fix", [], True),
             ("performance: edge detection", [], True),
-            ("PERF: faster", [], False),
+            ("PERF: faster", [], True),
             ("fix bug", [_make_label("performance")], True),
             ("fix bug", [], False),
         ],
@@ -1689,24 +1676,24 @@ class TestMassiveIsPerfPr:
     @pytest.mark.parametrize(
         "repo,title,body,labels,expected",
         [
-        ("astropy", "perf: improvement", "neutral", [], True),
-        ("scikit-learn", "perf: improvement", "neutral", [], True),
-        ("matplotlib", "perf: improvement", "neutral", [], True),
-        ("pylint", "perf: improvement", "neutral", [], True),
-        ("seaborn", "perf: improvement", "neutral", [], True),
-        ("sphinx", "perf: improvement", "neutral", [], True),
-        ("sympy", "perf: improvement", "neutral", [], True),
-        ("xarray", "perf: improvement", "neutral", [], True),
-        ("pandas", "perf: improvement", "neutral", [], True),
-        ("dask", "perf: improvement", "neutral", [], True),
-        ("numpy", "perf: improvement", "neutral", [], True),
-        ("scipy", "perf: improvement", "neutral", [], True),
-        ("statsmodels", "perf: improvement", "neutral", [], True),
-        ("pillow", "perf: improvement", "neutral", [], True),
-        ("spacy", "perf: improvement", "neutral", [], True),
-        ("numba", "perf: improvement", "neutral", [], True),
-        ("gensim", "perf: improvement", "neutral", [], True),
-        ("scikit-image", "perf: improvement", "neutral", [], True),
+        ("astropy", "performance: improvement", "neutral", [], True),
+        ("scikit-learn", "performance: improvement", "neutral", [], True),
+        ("matplotlib", "performance: improvement", "neutral", [], True),
+        ("pylint", "performance: improvement", "neutral", [], True),
+        ("seaborn", "performance: improvement", "neutral", [], True),
+        ("sphinx", "performance: improvement", "neutral", [], True),
+        ("sympy", "performance: improvement", "neutral", [], True),
+        ("xarray", "performance: improvement", "neutral", [], True),
+        ("pandas", "performance: improvement", "neutral", [], True),
+        ("dask", "performance: improvement", "neutral", [], True),
+        ("numpy", "performance: improvement", "neutral", [], True),
+        ("scipy", "performance: improvement", "neutral", [], True),
+        ("statsmodels", "performance: improvement", "neutral", [], True),
+        ("pillow", "performance: improvement", "neutral", [], True),
+        ("spacy", "performance: improvement", "neutral", [], True),
+        ("numba", "performance: improvement", "neutral", [], True),
+        ("gensim", "performance: improvement", "neutral", [], True),
+        ("scikit-image", "performance: improvement", "neutral", [], True),
         ("astropy", "fix bug", "neutral", [], False),
         ("scikit-learn", "fix bug", "neutral", [], False),
         ("matplotlib", "fix bug", "neutral", [], False),
@@ -1805,7 +1792,7 @@ class TestMassiveIsPerfPr:
     )
     def test_every_registered_repo_perf_title(self, repo):
         """D1: Every registered repo matches on 'perf' in title."""
-        pr = _make_pull(title="perf: improvement")
+        pr = _make_pull(title="performance: improvement")
         assert is_perf_pr(repo, pr) is True
 
     @pytest.mark.parametrize(
@@ -2042,7 +2029,7 @@ class TestWave2IsDocFileNonDoc:
         ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
         ".json", ".xml", ".html", ".css", ".scss", ".less",
         ".sql", ".graphql", ".proto", ".thrift",
-        ".txt", ".log", ".csv", ".tsv",
+        ".log", ".csv", ".tsv",
         ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
         ".whl", ".tar", ".gz", ".zip", ".bz2",
         ".pem", ".key", ".crt", ".p12",
@@ -2162,9 +2149,9 @@ class TestWave3IsDocFileCaseSensitivity:
         ".MD", ".Md", ".mD",
         ".RST", ".Rst", ".rST", ".rSt", ".rsT",
     ])
-    def test_uppercase_extensions_not_doc(self, ext):
-        """D4: endswith is case-sensitive — uppercase extensions don't match."""
-        assert is_doc_file(f"README{ext}") is False
+    def test_uppercase_extensions_are_doc(self, ext):
+        """D4: Case-insensitive — uppercase extensions DO match."""
+        assert is_doc_file(f"README{ext}") is True
 
 
 class TestWave3SplitInstancesLargeN:

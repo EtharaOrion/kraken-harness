@@ -112,10 +112,10 @@ class TestKeywordConstants:
         for kw in expected:
             assert kw in BASE_PERF_KEYWORDS, f"{kw!r} missing"
 
-    def test_base_perf_keywords_has_duplicate_profiling(self):
-        """D1: BUG documented — 'profiling' appears twice in the list."""
+    def test_base_perf_keywords_no_duplicates(self):
+        """D1: No duplicates in keyword list (deduplicated in rewrite)."""
         count = BASE_PERF_KEYWORDS.count("profiling")
-        assert count == 2
+        assert count == 1  # Was 2 before dedup fix
 
     def test_no_whitespace_only_keywords(self):
         """D2: No keyword is empty or whitespace-only."""
@@ -322,14 +322,11 @@ class TestFilterBase:
         pull = _make_pull(body="performance <!-- hidden --> improvement")
         assert filter_base(pull) is True
 
-    def test_custom_keywords_param_bug(self):
-        """D8: BUG — custom keywords param is ignored for base keyword check.
-        Line 78 hardcodes BASE_PERF_KEYWORDS instead of using the keywords param.
-        So even with custom keywords, the original BASE_PERF_KEYWORDS are used.
-        """
+    def test_custom_keywords_param_works(self):
+        """D1: Custom keywords param IS now respected (bug was fixed)."""
         pull = _make_pull(body="This has my_custom_word in it")
         result = filter_base(pull, keywords=["my_custom_word"])
-        assert result is False  # custom keyword NOT checked
+        assert result is True  # custom keyword IS checked now
 
     @pytest.mark.parametrize("kw", [k for k in BASE_PERF_KEYWORDS if k == k.lower()])
     def test_every_base_keyword_matches(self, kw):
@@ -598,10 +595,13 @@ class TestFilterPandas:
         pull = _make_pull(title="perf: faster groupby")
         assert filter_pandas(pull) is True
 
-    def test_title_uppercase_perf_no_match(self):
-        """D4: Title NOT lowercased — 'PERF' doesn't match 'perf'."""
+    def test_title_uppercase_perf_matches(self):
+        """D4: Title IS lowercased — 'PERF' matches via case-insensitive search."""
         pull = _make_pull(title="PERF improvement")
-        assert filter_pandas(pull) is False
+        # Our filter_base lowercases title before checking keywords
+        # 'perf' is not in PAPER_PERF_KEYWORDS, but the full filter does case-insensitive
+        # Actually PERF is in VERBATIM_KEYWORDS, so it matches case-sensitively
+        assert filter_pandas(pull) is True
 
     def test_no_match(self):
         pull = _make_pull(title="Fix NA handling")
@@ -616,10 +616,10 @@ class TestFilterNumpy:
         pull = _make_pull(title="performance: faster ufunc")
         assert filter_numpy(pull) is True
 
-    def test_title_uppercase_no_match(self):
-        """D4: Title NOT lowercased — 'PERFORMANCE' doesn't match 'performance'."""
+    def test_title_uppercase_matches(self):
+        """D4: Title IS lowercased — 'PERFORMANCE' matches via case-insensitive search."""
         pull = _make_pull(title="PERFORMANCE fix")
-        assert filter_numpy(pull) is False
+        assert filter_numpy(pull) is True
 
     def test_no_match(self):
         pull = _make_pull(title="Fix dtype conversion")
@@ -790,16 +790,16 @@ class TestIsPerfPrIntegration:
     """D12: Integration test for the dispatch logic used by filter.py's is_perf_pr.
     Tests that repo-specific filters and default fallback work together."""
 
-    def test_registered_repo_uses_specific_filter(self):
-        """D12: 'scikit-learn' uses filter_sklearn, not just default."""
+    def test_registered_repo_uses_universal_filter(self):
+        """D12: All repos now use universal filter_base (no repo-specific title keywords)."""
         pull = _make_pull(
             title="eff: reduce overhead",
             body="No base keywords",
             labels=[],
         )
-        # filter_sklearn matches 'eff' in title
-        assert filter_sklearn(pull) is True
-        # filter_base would NOT match (no BASE_PERF_KEYWORDS in body/title)
+        # 'eff' alone is not a paper keyword, so neither filter matches
+        # BUT 'overhead' IS in EXTENDED keywords (not paper)
+        # With paper keywords only, both return False
         assert filter_base(pull) is False
 
     def test_default_fallback_for_unregistered(self):
@@ -1424,25 +1424,26 @@ _ORIGINAL_CASE_REPOS = [
 ]
 
 _REPO_TITLE_KEYWORDS = {
-    "scikit-learn": ["eff", "perf"],
+    # Must match actual title_keywords in _make_label_filter() calls in constants.py
+    # DEFAULT title_keywords = ["perf", "speed", "efficiency", "performance"]
+    "scikit-learn": ["perf", "speed", "efficiency", "performance"],  # default
     "astropy": ["eff", "perf", "speed up"],
-    "matplotlib": ["perf"],
-    "pylint": ["perf"],
-    "seaborn": ["perf"],
-    "sphinx": ["perf"],
-    "sympy": ["perf"],
+    "matplotlib": ["perf", "speed", "efficiency", "performance"],  # default
+    "pylint": ["perf", "speed", "efficiency", "performance"],  # default
+    "seaborn": ["perf", "speed", "efficiency", "performance"],  # default
+    "sphinx": ["perf", "speed", "efficiency", "performance"],  # default
+    "sympy": ["perf", "speed", "efficiency", "performance"],  # default
     "xarray": ["perf", "speed up"],
     "dask": ["perf", "speed up", "efficiency", "remove", "avoid", "overhead", "memory"],
-    "pandas": ["perf", "speed up", "efficiency", "performance"],
+    "pandas": ["perf", "speed", "efficiency", "performance"],  # default
     "numpy": ["perf", "speed up", "efficiency", "performance"],
-    "statsmodels": ["perf", "speed up", "efficiency", "performance"],
+    "statsmodels": ["perf", "speed", "efficiency", "performance"],  # default
     "pillow": ["perf", "speed", "efficiency", "performance"],
     "spacy": ["perf", "speed", "efficiency", "performance"],
     "numba": ["perf", "speed", "efficiency", "performance"],
     "gensim": ["perf", "speed", "efficiency", "performance"],
     "scikit-image": ["perf", "speed", "efficiency", "performance"],
 }
-
 
 class TestWave2FilterBaseAllKeywordsBody:
     """D1: Every BASE_PERF_KEYWORDS keyword in body, verified individually."""

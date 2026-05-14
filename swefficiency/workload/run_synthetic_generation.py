@@ -141,22 +141,26 @@ def worker_function(
     output_file = WORKLOAD_GENERATION_DIR / run_id / f"{datum['instance_id']}.py"
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
-    # Resume: skip if output already exists and is non-empty
+    # Resume: skip if output already exists, is non-empty, and is NOT a poisoned file
     if output_file.exists() and output_file.stat().st_size > 0:
-        logger.info(f"[{datum['instance_id']}] Already generated, skipping (resume)")
-        return {
-            "instance_id": datum["instance_id"],
-            "run_id": run_id,
-            "workload": output_file.read_text(),
-            "workload_generation_cost": {
-                "model": "cached",
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-                "cost_usd": 0.0,
-            },
-            "resumed": True,
-        }
+        content_check = output_file.read_text(errors='replace')[:100]
+        if content_check.startswith('# WARNING: No code block extracted'):
+            logger.info(f"[{datum['instance_id']}] Found poisoned workload, regenerating")
+        else:
+            logger.info(f"[{datum['instance_id']}] Already generated, skipping (resume)")
+            return {
+                "instance_id": datum["instance_id"],
+                "run_id": run_id,
+                "workload": output_file.read_text(),
+                "workload_generation_cost": {
+                    "model": "cached",
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                    "cost_usd": 0.0,
+                },
+                "resumed": True,
+            }
 
     # Get relevant files from the patch.
     patch = datum["patch"]
@@ -323,6 +327,16 @@ def main(
         return
 
     logger.info(f"Processing {len(dataset)} instances with {max_workers} workers")
+
+    # Cost estimation warning for large runs
+    if len(dataset) > 100:
+        est_cost_low = len(dataset) * 0.03  # ~$0.03/instance with Haiku
+        est_cost_high = len(dataset) * 0.15  # ~$0.15/instance with Opus
+        logger.warning(
+            f"Cost estimate for {len(dataset)} instances: "
+            f"${est_cost_low:.0f}-${est_cost_high:.0f} (depends on model). "
+            f"Set WORKLOAD_MODEL env var to control model choice."
+        )
 
     results = []
     failed = []

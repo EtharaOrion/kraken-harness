@@ -46,7 +46,7 @@ PAPER_PERF_KEYWORDS = [
     "optimization",
     "profiling",
     "accelerate",
-    "fast",          # NOTE: also in WORD_BOUNDARY_KEYWORDS for precision
+    # "fast" — moved to WORD_BOUNDARY_KEYWORDS only (substring match catches FastAPI, breakfast)
     "runtime",
     "efficiency",
     "benchmark",
@@ -68,6 +68,9 @@ PAPER_PERF_KEYWORDS = [
 # ─────────────────────────────────────────────────────────────────────────────
 # KEYWORDS — EXTENDED (for broader recall at scale)
 # ─────────────────────────────────────────────────────────────────────────────
+
+# Backward-compatible alias (tests and legacy code reference this name)
+BASE_PERF_KEYWORDS = PAPER_PERF_KEYWORDS
 # Additional keywords beyond the paper's 28, for catching implicit perf PRs.
 # Used when --extended-keywords flag is passed to the filter.
 EXTENDED_PERF_KEYWORDS = PAPER_PERF_KEYWORDS + [
@@ -121,8 +124,8 @@ NEGATIVE_TITLE_KEYWORDS = [
     "docs:",
     "doc:",
     "[docs]",
-    # Dependency management
-    "deprecat",
+    # Dependency management — NOTE: "deprecat" removed (too broad; perf PRs
+    # often deprecate slow paths). Caught instead by content exclusion + Criterion 3.
     # Release automation
     "release:",
     "[release]",

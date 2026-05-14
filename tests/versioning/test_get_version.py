@@ -1621,7 +1621,7 @@ class TestIntegrationGetVersionWithConstants:
         """Integration: tries paths in order, returns first successful match."""
         responses = []
         call_count = [0]
-        def side_effect(url):
+        def side_effect(url, **kwargs):
             resp = MagicMock()
             call_count[0] += 1
             if call_count[0] == 1:
@@ -1807,25 +1807,28 @@ class TestTypeCoercion:
 class TestConnectionFailures:
 
     @patch("swefficiency.versioning.get_versions.requests.get")
-    def test_get_version_connection_error_propagates(self, mock_get):
+    def test_get_version_connection_error_returns_none(self, mock_get):
+        """With retry logic, connection errors are retried then return None (graceful degradation)."""
         mock_get.side_effect = requests.exceptions.ConnectionError("Connection refused")
         inst = _make_instance()
-        with pytest.raises(requests.exceptions.ConnectionError):
-            get_version(inst)
+        result = get_version(inst)
+        assert result is None
 
     @patch("swefficiency.versioning.get_versions.requests.get")
-    def test_get_version_timeout_error_propagates(self, mock_get):
+    def test_get_version_timeout_error_returns_none(self, mock_get):
+        """With retry logic, timeout errors are retried then return None (graceful degradation)."""
         mock_get.side_effect = requests.exceptions.Timeout("Timed out")
         inst = _make_instance()
-        with pytest.raises(requests.exceptions.Timeout):
-            get_version(inst)
+        result = get_version(inst)
+        assert result is None
 
     @patch("swefficiency.versioning.get_versions.requests.get")
-    def test_get_version_ssl_error_propagates(self, mock_get):
+    def test_get_version_ssl_error_returns_none(self, mock_get):
+        """With retry logic, SSL errors are retried then return None (graceful degradation)."""
         mock_get.side_effect = requests.exceptions.SSLError("SSL failed")
         inst = _make_instance()
-        with pytest.raises(requests.exceptions.SSLError):
-            get_version(inst)
+        result = get_version(inst)
+        assert result is None
 
     @patch("swefficiency.versioning.get_versions.requests.get")
     def test_get_version_http_500_returns_none(self, mock_get):

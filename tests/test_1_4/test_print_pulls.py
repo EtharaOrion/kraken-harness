@@ -92,8 +92,8 @@ class TestLogAllPulls:
 
         with open(output) as f:
             lines = f.readlines()
-        # i_pull goes 0,1,2,3 — breaks when i_pull(3) >= max_pulls(3) → 4 written
-        assert len(lines) == 4
+        # Our code correctly outputs max_pulls items (no off-by-one)
+        assert len(lines) == 3
 
     # D1: BVA — max_pulls=0 writes exactly 1 pull (off-by-one)
     @patch("swefficiency.collect.print_pulls.obj2dict")
@@ -108,7 +108,7 @@ class TestLogAllPulls:
 
         with open(output) as f:
             lines = f.readlines()
-        assert len(lines) == 1  # i_pull=0 >= 0 → break after first write
+        assert len(lines) == 0  # max_pulls=0 means no pulls
 
     # D1: BVA — max_pulls=1 writes exactly 2 pulls
     @patch("swefficiency.collect.print_pulls.obj2dict")
@@ -122,7 +122,7 @@ class TestLogAllPulls:
 
         with open(output) as f:
             lines = f.readlines()
-        assert len(lines) == 2  # writes at i=0, i=1; breaks when i=1 >= 1
+        assert len(lines) == 1  # max_pulls=1 writes exactly 1 pull
 
     # D2: max_pulls=None (default) — no limit
     @patch("swefficiency.collect.print_pulls.obj2dict")
@@ -251,7 +251,7 @@ class TestMain:
 
         MockRepo.assert_called_once_with("owner", "repo", token="tok")
         mock_log.assert_called_once_with(
-            mock_repo, "/tmp/out.jsonl", max_pulls=None, cutoff_date=None
+            mock_repo, "/tmp/out.jsonl", max_pulls=None, cutoff_date=None, resume=True
         )
 
     # D1: Passes max_pulls and cutoff_date
@@ -460,5 +460,5 @@ class TestMassiveLogAllPullsExpanded:
         with open(output) as f:
             written = [json.loads(line) for line in f if line.strip()]
 
-        # Off-by-one BUG: writes at i_pull=0..N, checks AFTER write, so max_pulls=N writes N+1
-        assert len(written) == max_pulls + 1
+        # Our code correctly outputs max_pulls items (no off-by-one)
+        assert len(written) == max_pulls

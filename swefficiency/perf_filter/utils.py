@@ -27,7 +27,6 @@ import re
 from pathlib import Path
 from typing import Generator
 
-import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -70,17 +69,25 @@ def extract_edits(patch: str) -> list[tuple[str, str, str]]:
 
         # Parse source and dest from the header
         # Format: " a/path/file b/path/file"
-        parts = header_line.split()
-        if len(parts) < 2:
-            logger.debug(f"Skipping malformed diff header: {header_line[:100]}")
-            continue
+        # Note: paths may contain spaces, so we can't just split on whitespace
+        # Find the ' b/' separator (git uses ' a/' and ' b/' prefixes)
+        b_idx = header_line.find(' b/')
+        if b_idx == -1:
+            # Fallback: try simple split
+            parts = header_line.split()
+            if len(parts) < 2:
+                logger.debug(f"Skipping malformed diff header: {header_line[:100]}")
+                continue
+            source_path = parts[0]
+            dest_path = parts[1]
+        else:
+            source_path = header_line[:b_idx].strip()
+            dest_path = header_line[b_idx + 1:].strip()
 
-        # Extract paths, stripping a/ and b/ prefixes
-        source_path = parts[0]
-        dest_path = parts[1]
-        if source_path.startswith("a/"):
+        # Strip a/ and b/ prefixes
+        if source_path.startswith('a/'):
             source_path = source_path[2:]
-        if dest_path.startswith("b/"):
+        if dest_path.startswith('b/'):
             dest_path = dest_path[2:]
 
         # Handle special cases in remaining lines
@@ -114,6 +121,7 @@ def extract_edits(patch: str) -> list[tuple[str, str, str]]:
 def read_jsonl(jsonl_path: str, to_df=False):
     """Read JSONL file. Logs and counts errors instead of silently swallowing them."""
     if to_df:
+        import pandas as pd
         return pd.read_json(jsonl_path, lines=True)
 
     jsonl_items = []

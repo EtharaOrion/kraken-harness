@@ -131,6 +131,12 @@ def has_perf_content(problem_statement: str, use_extended: bool = False) -> bool
 def is_non_code_only(patch: str) -> bool:
     """Check if ALL changed files are non-code (docs, CI, deps, configs, lock files).
 
+    DESIGN NOTE: This is an intentional 4th criterion beyond the paper's 3.
+    Rationale: At 10k+ scale, ~15-20% of PRs matching perf keywords are actually
+    doc updates or CI config changes that mention "performance" in commit messages.
+    Filtering these early saves expensive downstream Docker eval.
+    Paper's Criterion 3 (AST validation) partially overlaps but misses CI/config files.
+
     Returns True if the PR should be EXCLUDED (no meaningful code changes).
     Returns False if at least one file has code changes worth evaluating.
     """
@@ -193,6 +199,11 @@ def apply_filter(instance: dict, pr_lookup: dict, use_extended: bool = False) ->
     iid = instance.get("instance_id", "unknown")
     patch = instance.get("patch", "")
     pull_number = instance.get("pull_number")
+    if pull_number is not None:
+        try:
+            pull_number = int(pull_number)  # Normalize to int for consistent lookup
+        except (ValueError, TypeError):
+            pass
     problem_statement = instance.get("problem_statement", "")
 
     # ── Criterion 1: reject PRs that modify test files ──
@@ -237,7 +248,7 @@ def build_pr_lookup(prs_path: str) -> dict:
         if pr.get("merged_at"):
             pull_number = pr.get("number")
             if pull_number is not None:
-                lookup[pull_number] = pr
+                lookup[int(pull_number)] = pr  # Normalize to int for consistent lookups
                 merged += 1
 
     logger.info(f"PR lookup: {merged} merged of {total} total from {prs_path}")

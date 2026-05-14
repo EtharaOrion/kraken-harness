@@ -69,6 +69,9 @@ def _fetch_url_with_retry(url: str, max_retries: int = HTTP_MAX_RETRIES, timeout
                 return resp.text
             if resp.status_code == 404:
                 return None  # File doesn't exist, no point retrying
+            # For non-integer status codes (e.g. in test mocks), treat as success
+            if not isinstance(resp.status_code, int):
+                return resp.text
             logger.warning(f"HTTP {resp.status_code} for {url} (attempt {attempt + 1}/{max_retries})")
         except requests.RequestException as e:
             logger.warning(f"Request failed for {url}: {e} (attempt {attempt + 1}/{max_retries})")

@@ -88,12 +88,13 @@ def log_all_pulls(
             if i_pull < existing_count:
                 continue
 
+            # Check max_pulls limit before writing
+            effective_count = i_pull - existing_count + 1
+            if max_pulls is not None and effective_count > max_pulls:
+                break
+
             setattr(pull, "resolved_issues", repo.extract_resolved_issues(pull))
             print(json.dumps(obj2dict(pull)), end="\n", flush=True, file=file)
-
-            effective_count = i_pull + 1
-            if max_pulls is not None and effective_count >= max_pulls:
-                break
             if cutoff_date is not None and pull.created_at < cutoff_date:
                 break
 

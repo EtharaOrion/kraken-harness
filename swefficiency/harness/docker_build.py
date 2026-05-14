@@ -656,11 +656,12 @@ def build_env_images(
                             failed.append(futures[future])
                             continue
 
-                    # # After each batch parallel completes, run docker system prune to free up space.
-                    # print("Pruning batched images to free up space...")
-                    # client.api.prune_containers()
-                    # client.api.prune_images()
-                    # client.api.prune_volumes()
+                    # After each batch completes, prune stopped containers and dangling images
+                    try:
+                        client.api.prune_containers()
+                        client.api.prune_images(filters={'dangling': True})
+                    except Exception:
+                        pass  # Non-fatal: pruning is best-effort
 
     # Show how many images failed to build
     if len(failed) == 0:

@@ -110,7 +110,7 @@ def construct_data_files(data: dict):
     )
     for repo in repos:
         repo = repo.strip(",").strip()
-        repo_name = repo.split("/")[1]
+        repo_name = repo.replace("/", "__")
         try:
             path_pr = os.path.join(path_prs, f"{repo_name}-prs.jsonl")
             if cutoff_date:
@@ -147,11 +147,11 @@ def construct_data_files(data: dict):
 
 def main(
     repos: list = None,
-    repos_file: str = None,
     path_prs: str = ".",
     path_tasks: str = ".",
     max_pulls: int = None,
     cutoff_date: str = None,
+    repos_file: str = None,
 ):
     """
     Spawns multiple threads given multiple GitHub tokens for collecting fine tuning data
