@@ -210,7 +210,9 @@ def main(
                 )
                 instance_id = instance_id.replace("/", "__")
                 if instance_id in seen_prs:
-                    seen_prs -= {instance_id}
+                    # Already processed on a prior run — skip. (Previously this
+                    # also did `seen_prs -= {instance_id}`, which removed the
+                    # entry so the very next resume reprocessed it as a dup.)
                     continue
                 if not is_valid_pull(pull):
                     continue

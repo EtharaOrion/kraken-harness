@@ -61,8 +61,11 @@ def parse_perf_summary(perf_summary: str) -> Dict[str, float]:
             "improvement": 0.0,
         }
 
+    # Positive improvement == faster after the patch (after_mean < before_mean).
+    # The operands were reversed, so every speedup was reported as a negative
+    # percentage and every regression as a positive one.
     improvement = (
-        (after_mean - before_mean) / before_mean * 100
+        (before_mean - after_mean) / before_mean * 100
         if before_mean != 0
         else 0.0
     )

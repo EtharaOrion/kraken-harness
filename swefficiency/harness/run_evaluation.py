@@ -289,9 +289,14 @@ def run_instance(
         postedit_runtime_mean, postedit_runtime_sd = parse_perf_output(
             post_edit_perf_output
         )
+        # Speedup must compare the two PARSED workload means. post_edit_perf_runtime
+        # is the wall-clock duration of the whole /perf.sh exec (Docker overhead
+        # included) — using it here mixed units and corrupted every metric.
         improvement = (
-            preedit_runtime_mean - post_edit_perf_runtime
-        ) / preedit_runtime_mean
+            (preedit_runtime_mean - postedit_runtime_mean) / preedit_runtime_mean
+            if preedit_runtime_mean
+            else 0.0
+        )
 
         perf_report = {
             "improvement": improvement,
