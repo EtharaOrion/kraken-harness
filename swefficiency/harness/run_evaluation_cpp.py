@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import traceback
 from argparse import ArgumentParser
@@ -85,16 +86,28 @@ class EvaluationErrorCpp(Exception):
 
 
 def _resolve_parse_gbench_path() -> Path:
-    """Locate the ``parse_gbench.py`` helper bundled with the repo."""
+    """Locate the ``parse_gbench.py`` helper bundled with the repo.
+
+    Tries, in order: the SWEFF_PARSE_GBENCH_PATH override, the editable-install
+    repo layout (parents[2]/scripts), and the current working directory — so
+    it resolves under editable installs, non-editable site-packages installs,
+    and direct script runs.
+    """
+    candidates: list[Path] = []
+    override = os.environ.get("SWEFF_PARSE_GBENCH_PATH")
+    if override:
+        candidates.append(Path(override))
     here = Path(__file__).resolve()
-    repo_root = here.parents[2]
-    candidate = repo_root / "scripts" / "parse_gbench.py"
-    if not candidate.exists():
-        raise FileNotFoundError(
-            f"scripts/parse_gbench.py not found at {candidate} — "
-            "required for cpp perf parsing"
-        )
-    return candidate
+    candidates.append(here.parents[2] / "scripts" / "parse_gbench.py")
+    candidates.append(Path.cwd() / "scripts" / "parse_gbench.py")
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(
+        "scripts/parse_gbench.py not found (looked in: "
+        + ", ".join(str(c) for c in candidates)
+        + ") — required for cpp perf parsing; set SWEFF_PARSE_GBENCH_PATH"
+    )
 
 
 # Cpp eval logs live under a cpp-specific dir so they never collide with the

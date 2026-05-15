@@ -24,6 +24,7 @@ import json
 import logging
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 logging.basicConfig(
@@ -312,6 +313,13 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.build_multiarch and not args.registry:
+        parser.error(
+            "--build-multiarch requires --registry: pushing an unqualified "
+            "image name (sweb.base.cpp:latest) targets docker.io/library and "
+            "will fail with 401/403"
+        )
+
     dataset = load_dataset(args.dataset)
     logger.info(f"Loaded {len(dataset)} cpp instances from {args.dataset}")
 
@@ -357,23 +365,26 @@ def main():
     logger.info("STAGE 2: Validating all C++ instance images")
     logger.info("=" * 60)
 
-    all_errors: list = []
-    for rec in dataset:
+    def _validate_one(rec: dict) -> list:
         iid = rec["instance_id"].lower()
         base_commit = rec["base_commit"]
         eval_image = f"sweb.eval.cpp.{iid}:latest"
-
         img_check = subprocess.run(
             ["docker", "image", "inspect", eval_image],
             capture_output=True,
             text=True,
         )
         if img_check.returncode != 0:
-            all_errors.append(f"[{iid}] Image {eval_image} not found locally")
-            continue
+            return [f"[{iid}] Image {eval_image} not found locally"]
+        return validate_image(iid, base_commit, eval_image)
 
-        errors = validate_image(iid, base_commit, eval_image)
-        all_errors.extend(errors)
+    # Validation is N independent docker invocations; run them in parallel.
+    # The build step already uses max_workers — the validate loop used to be
+    # serial (~3s/instance docker startup x 10k instances = hours).
+    all_errors: list = []
+    with ThreadPoolExecutor(max_workers=args.max_workers) as _val_exe:
+        for errs in _val_exe.map(_validate_one, dataset):
+            all_errors.extend(errs)
 
     if all_errors:
         logger.error(f"VALIDATION FAILED: {len(all_errors)} errors")

@@ -273,6 +273,22 @@ def _validate_compile_in_container(
                 instance_id, image,
             )
             return True, "image_not_available_skipped"
+        # Missing-header errors are inconclusive: the base validation image
+        # lacks the repo's own headers (/testbed) and any env-installed system
+        # packages — those exist only in the per-instance eval image. Treat
+        # them as a skip so a workload that would compile in real eval is not
+        # rejected (and we don't burn LLM retries on a phantom error).
+        missing_header_markers = (
+            "fatal error:",
+            "no such file or directory",
+            "file not found",
+        )
+        if any(marker in err_lower for marker in missing_header_markers):
+            logger.info(
+                "[%s] workload validation inconclusive (missing header at "
+                "base-image stage); deferring to eval", instance_id,
+            )
+            return True, "validation_inconclusive_missing_header"
         return False, err.strip()[-4000:]
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

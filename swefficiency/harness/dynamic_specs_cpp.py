@@ -92,8 +92,14 @@ def _synthesize_specs_cpp(instance: dict) -> dict[str, Any]:
             "test_cmd": instance.get("test_cmd") or instance.get("test_cmd_override"),
             "test_framework": instance.get("test_framework"),
         }
+    # install_cmd / build_cmd are intentionally NOT copied through: the Phase 1
+    # CMake path in test_spec_cpp (_cmake_configure_cmd / _cmake_build_cmd)
+    # builds those commands itself from cpp_standard + cmake_flags +
+    # build_system. A detected install_cmd would shadow that logic and drop the
+    # per-repo cmake_flags, so they stay unused until non-CMake build systems
+    # are supported.
     for key in ("cpp_standard", "min_cmake", "system_pkgs", "packages_source",
-                "cmake_flags", "pre_install_cmds", "install_cmd", "build_cmd",
+                "cmake_flags", "pre_install_cmds",
                 "test_cmd", "test_framework"):
         if key in repo_specs and repo_specs[key]:
             base[key] = repo_specs[key]

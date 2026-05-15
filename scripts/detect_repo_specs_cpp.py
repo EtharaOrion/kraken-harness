@@ -550,7 +550,7 @@ def main() -> None:
     parser.add_argument("--output", required=True, help="Output JSONL file path")
     parser.add_argument(
         "--clone-dir",
-        default="/tmp/repo_clones_cpp",
+        default="artifacts_cpp/clones",
         help="Directory for cloning repos",
     )
     parser.add_argument(

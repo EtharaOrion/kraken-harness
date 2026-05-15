@@ -509,7 +509,7 @@ def _workload_env_detect_block() -> list[str]:
                 *" -l$name "*) ;;
                 *) WORKLOAD_LIBS="$WORKLOAD_LIBS -l$name" ;;
             esac
-        done < <(find {BUILD_DIR} -maxdepth 3 -type f \\( -name 'lib*.a' -o -name 'lib*.so*' \\) 2>/dev/null)
+        done < <(find {BUILD_DIR} -maxdepth 6 -type f \\( -name 'lib*.a' -o -name 'lib*.so*' \\) 2>/dev/null)
         echo "WORKLOAD_INCLUDES=$WORKLOAD_INCLUDES"
         echo "WORKLOAD_LIBS=$WORKLOAD_LIBS"
         """

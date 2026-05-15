@@ -555,7 +555,7 @@ stage_workload() {
         --max_workers "$MAX_WORKERS"
 
     local wl_output
-    wl_output=$(find "logs/workload_generation_cpp/$RUN_ID" -name "workload_generation.json" -type f 2>/dev/null | head -1)
+    wl_output=$(find "logs/workload_generation_cpp/$RUN_ID" -name "workload_generation_cpp.json" -type f 2>/dev/null | head -1)
     if [[ -z "$wl_output" ]]; then
         wl_output=$(find "logs/workload_generation_cpp/$RUN_ID" -name "*.json" -type f 2>/dev/null | head -1)
     fi
