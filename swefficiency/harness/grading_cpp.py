@@ -20,7 +20,7 @@ empty test-status map (every test treated as missing → F2P=0).
 """
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from swefficiency.harness.constants import (
     APPLY_PATCH_FAIL,
@@ -36,7 +36,10 @@ from swefficiency.harness.constants import (
     ResolvedStatus,
     TestStatus,
 )
-from swefficiency.harness.log_parsers_cpp import MAP_REPO_TO_PARSER_CPP
+from swefficiency.harness.log_parsers_cpp import (
+    MAP_REPO_TO_PARSER_CPP,
+    parse_log_cpp_best_effort,
+)
 from swefficiency.harness.test_spec_cpp import TestSpecCpp
 
 
@@ -51,11 +54,25 @@ def test_failed(case: str, sm: dict[str, str]) -> bool:
     )
 
 
-def get_logs_eval_cpp(log_fp: str) -> tuple[dict[str, str], bool]:
-    """Parse C++ test output. Returns ``(status_map, patch_applied_ok)``."""
-    sample_id = str(Path(log_fp).parent.stem)
-    repo = "-".join(sample_id.replace("__", "/").split("-")[:-1])
-    log_parser = MAP_REPO_TO_PARSER_CPP[repo]
+def get_logs_eval_cpp(
+    log_fp: str,
+    repo: Optional[str] = None,
+) -> tuple[dict[str, str], bool]:
+    """Parse C++ test output. Returns ``(status_map, patch_applied_ok)``.
+
+    If ``repo`` is passed, route via :data:`MAP_REPO_TO_PARSER_CPP` directly.
+    If ``repo`` is None, fall back to reverse-engineering the repo from the
+    log path's parent dir (legacy; brittle for instance IDs with multiple
+    dashes such as ``owner__repo-pr-1234-5``).
+
+    Unknown repos route to :func:`parse_log_cpp_best_effort` instead of
+    raising ``KeyError`` (which is what the previous unguarded subscript did,
+    and what the dynamic discover stage would trigger on every unseen repo).
+    """
+    if repo is None:
+        sample_id = str(Path(log_fp).parent.stem)
+        repo = "-".join(sample_id.replace("__", "/").split("-")[:-1])
+    log_parser = MAP_REPO_TO_PARSER_CPP.get(repo, parse_log_cpp_best_effort)
 
     with open(log_fp) as f:
         content = f.read()
@@ -146,6 +163,7 @@ def get_eval_report_cpp(
     prediction: dict[str, str],
     log_path: str,
     include_tests_status: bool,
+    repo: Optional[str] = None,
 ) -> dict[str, Any]:
     """C++ analog of ``get_eval_report``."""
     report_map: dict[str, Any] = {}
@@ -162,7 +180,7 @@ def get_eval_report_cpp(
         return report_map
     report_map[instance_id]["patch_exists"] = True
 
-    eval_sm, found = get_logs_eval_cpp(log_path)
+    eval_sm, found = get_logs_eval_cpp(log_path, repo=repo or test_spec.repo)
     if not found:
         return report_map
     report_map[instance_id]["patch_successfully_applied"] = True

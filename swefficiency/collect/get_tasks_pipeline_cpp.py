@@ -121,8 +121,16 @@ def main(argv: Optional[list] = None) -> int:
         with open(args.repos_file, "r", encoding="utf-8") as f:
             for line in f:
                 stripped = line.strip()
-                if stripped and not stripped.startswith("#"):
-                    repos.append(stripped)
+                if not stripped or stripped.startswith("#"):
+                    continue
+                # Strip inline comments. discover_repos_cpp's `ranked` format
+                # emits lines like `owner/repo  # apache-2.0 | stars | PRs`,
+                # so we must drop everything from the first '#' onward.
+                repo_name = stripped.split("#", 1)[0].strip()
+                # And drop any trailing whitespace-delimited tokens.
+                repo_name = repo_name.split()[0] if repo_name else ""
+                if repo_name:
+                    repos.append(repo_name)
     else:
         repos = list(args.repos)
     if not repos:

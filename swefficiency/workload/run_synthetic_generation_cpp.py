@@ -255,6 +255,24 @@ def _validate_compile_in_container(
         if proc.returncode == 0:
             return True, "ok"
         err = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        # The base image may not be built yet when stage_workload runs before
+        # stage_eval. Treat 'image missing' as 'validation skipped' rather than
+        # 'compile failure' so we don't burn LLM budget retrying with phantom
+        # error messages.
+        err_lower = err.lower()
+        image_missing_markers = (
+            "unable to find image",
+            "pull access denied",
+            "no such image",
+            "manifest unknown",
+            "repository does not exist",
+        )
+        if any(marker in err_lower for marker in image_missing_markers):
+            logger.info(
+                "[%s] cpp validation image %r unavailable; skipping compile check",
+                instance_id, image,
+            )
+            return True, "image_not_available_skipped"
         return False, err.strip()[-4000:]
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

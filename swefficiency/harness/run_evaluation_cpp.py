@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import traceback
 from argparse import ArgumentParser
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -117,8 +118,11 @@ def run_instance_cpp(
     if not image_build_link.exists():
         try:
             image_build_link.symlink_to(build_dir.absolute(), target_is_directory=True)
-        except Exception:
-            pass
+        except (OSError, FileExistsError) as _symlink_err:
+            print(
+                f"warning: failed to create symlink {image_build_link} -> {build_dir}: {_symlink_err}",
+                file=sys.stderr,
+            )
     log_file = log_dir / "run_instance.log"
 
     report_path = log_dir / "report.json"
@@ -138,7 +142,10 @@ def run_instance_cpp(
 
         patch_file = Path(log_dir / "patch.diff")
         patch_file.write_text(pred["model_patch"] or "")
-        copy_to_container(container, patch_file, Path("/tmp/patch.diff"))
+        # patch.diff is intentionally NOT copied to the container yet. The
+        # pre-edit perf run below must measure the unpatched base. We copy the
+        # patch in only after pre-perf completes; until then `_apply_patch_block`
+        # sees no /tmp/patch.diff and falls through the `[ -s ... ]` test.
 
         if not test_spec.workload:
             raise EvaluationErrorCpp(
@@ -171,6 +178,11 @@ def run_instance_cpp(
                     log_obj,
                 )
         preedit_mean, preedit_sd = parse_perf_output(pre_perf_out)
+
+        # Now stage the patch into the container. eval.sh and the post-edit
+        # perf run both reset to base_commit and apply via _apply_patch_block,
+        # so they will see this file.
+        copy_to_container(container, patch_file, Path("/tmp/patch.diff"))
 
         val = container.exec_run(
             "git apply --allow-empty -v /tmp/patch.diff",
@@ -242,12 +254,25 @@ def run_instance_cpp(
             "post_edit_runtime_sd": postedit_sd,
         }
 
+        # Write perf_summary.txt so scripts/significance_filter.py (shared with
+        # the Python pipeline) can find the Before/After Mean/SD it expects.
+        # Without this file, every cpp instance is silently dropped by the
+        # significance filter as 'no perf data'.
+        perf_summary_path = log_dir / "perf_summary.txt"
+        perf_summary_path.write_text(
+            f"Before Mean: {preedit_mean}\n"
+            f"Before SD: {preedit_sd}\n"
+            f"After Mean: {postedit_mean}\n"
+            f"After SD: {postedit_sd}\n"
+        )
+
         log_obj.info(f"Grading cpp answer for {instance_id}...")
         report = get_eval_report_cpp(
             test_spec=test_spec,
             prediction=pred,
             log_path=str(test_output_path),
             include_tests_status=True,
+            repo=test_spec.repo,
         )
         log_obj.info(
             f"Result for {instance_id}: resolved={report[instance_id]['resolved']}"
@@ -322,7 +347,10 @@ def run_instances_cpp(
                 try:
                     fut.result()
                 except Exception:
-                    traceback.print_exc()
+                    print(
+                        f"[run_instances_cpp] worker raised:\n{traceback.format_exc()}",
+                        file=sys.stderr,
+                    )
                     continue
     print("All cpp instances run.")
 

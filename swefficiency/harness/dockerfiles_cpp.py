@@ -54,6 +54,10 @@ ENV http_proxy=${{http_proxy}} \
     no_proxy=${{no_proxy}} \
     NO_PROXY=${{NO_PROXY}}
 
+# Core toolchain. Must succeed unconditionally on every supported arch.
+# (Previously fused with the optional linux-perf install via `A || B && C`,
+#  whose precedence silently skipped the core toolchain on arches where
+#  linux-perf is unavailable, e.g., linux/arm64.)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     gcc-12 g++-12 \
@@ -61,14 +65,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake ninja-build make pkg-config \
     ccache \
     gcovr lcov \
-    linux-perf || apt-get install -y --no-install-recommends linux-tools-generic \
-    && apt-get install -y --no-install-recommends \
     git curl wget ca-certificates \
     libssl-dev libdw-dev libunwind-dev \
     libopenblas-dev liblapack-dev \
     python3 python3-minimal python3-pip \
     xz-utils unzip zip \
     locales \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Optional: perf profiling tools. linux-perf is missing on arm64 / older Ubuntu;
+# linux-tools-generic is the historical fallback; both may be unavailable in
+# minimal base images, so make the whole step best-effort.
+RUN apt-get update \
+    && (apt-get install -y --no-install-recommends linux-perf \
+        || apt-get install -y --no-install-recommends linux-tools-generic \
+        || true) \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 RUN locale-gen en_US.UTF-8 || true

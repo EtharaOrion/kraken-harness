@@ -476,14 +476,19 @@ def _workload_compile_cmd(specs: dict) -> str:
 
 
 def _workload_run_cmd() -> str:
+    # Write benchmark JSON via --benchmark_out=. Redirecting stdout+stderr to
+    # the JSON file (the prior `> {WORKLOAD_JSON_PATH} 2>&1` pattern) corrupts
+    # the JSON with console summary and any runtime warnings printed to stderr,
+    # which fails downstream parse_gbench.py silently.
     return (
         f"taskset -c 0 {WORKLOAD_BIN_PATH} "
-        "--benchmark_format=json "
+        f"--benchmark_out={WORKLOAD_JSON_PATH} "
+        "--benchmark_out_format=json "
         "--benchmark_repetitions=10 "
         "--benchmark_display_aggregates_only=true "
         "--benchmark_time_unit=s "
         "--benchmark_min_time=1.0s "
-        f"> {WORKLOAD_JSON_PATH} 2>&1 || true"
+        "> /dev/null 2>&1 || true"
     )
 
 

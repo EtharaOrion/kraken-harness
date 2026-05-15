@@ -337,7 +337,7 @@ stage_discover() {
 
     run_cmd python3 -m swefficiency.collect.discover_repos_cpp \
         --output "$DISCOVERY_OUTPUT" \
-        --format ranked \
+        --format simple \
         --min-stars "$DISCOVERY_MIN_STARS" \
         --min-prs "$DISCOVERY_MIN_PRS" \
         --max-repos "$DISCOVERY_MAX_REPOS"
