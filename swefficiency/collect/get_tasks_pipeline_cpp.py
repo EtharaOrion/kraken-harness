@@ -92,15 +92,41 @@ def _chunkify(repos: list, n: int) -> list:
 
 def main(argv: Optional[list] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repos", nargs="+", required=True,
-                        help="GitHub org/repo strings to process")
-    parser.add_argument("--pulls-dir", required=True, type=Path)
-    parser.add_argument("--output-dir", required=True, type=Path)
+    # Repo specification: exactly one of --repos or --repos-file is required.
+    # Flag names mirror the original Python pipeline's ``get_tasks_pipeline``
+    # bash-friendly underscore style so ``run_pipeline_cpp.sh`` can dispatch
+    # the cpp variant with the same flag shape as the Python variant.
+    src = parser.add_mutually_exclusive_group(required=True)
+    src.add_argument("--repos", nargs="+",
+                     help="GitHub org/repo strings to process")
+    src.add_argument("--repos-file", type=Path,
+                     help="File with one repo per line (#-comments allowed)")
+    parser.add_argument("--path_prs", required=True, type=Path,
+                        help="Directory for raw PR JSONL files")
+    parser.add_argument("--path_tasks", required=True, type=Path,
+                        help="Directory for task-instance JSONL files")
     parser.add_argument("--tokens", default=os.environ.get("GITHUB_TOKENS", ""),
                         help="Comma-separated GitHub tokens (one worker per token)")
     parser.add_argument("--no-resume", action="store_true")
-    parser.add_argument("--max-pulls", type=int, default=None)
+    parser.add_argument("--max_pulls", type=int, default=None)
+    parser.add_argument("--cutoff_date", default=None,
+                        help="ISO date string (YYYYMMDD); accepted for parity with the "
+                             "Python pipeline (Phase 1 reads all PRs; Phase 2 will wire "
+                             "this into construct_data_files_cpp).")
     args = parser.parse_args(argv)
+
+    # Resolve final repo list from either source.
+    if args.repos_file is not None:
+        repos = []
+        with open(args.repos_file, "r", encoding="utf-8") as f:
+            for line in f:
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#"):
+                    repos.append(stripped)
+    else:
+        repos = list(args.repos)
+    if not repos:
+        parser.error("No repos resolved (--repos or --repos-file produced empty list)")
 
     logging.basicConfig(
         level=os.environ.get("SWEFF_LOG_LEVEL", "INFO"),
@@ -109,14 +135,14 @@ def main(argv: Optional[list] = None) -> int:
 
     tokens = [t for t in args.tokens.split(",") if t.strip()]
     n_workers = max(1, len(tokens))
-    chunk_size = max(1, len(args.repos) // n_workers)
-    chunks = _chunkify(args.repos, chunk_size)
+    chunk_size = max(1, len(repos) // n_workers)
+    chunks = _chunkify(repos, chunk_size)
 
     data_pooled = [
         {
             "repos": chunk,
-            "pulls_dir": str(args.pulls_dir),
-            "output_dir": str(args.output_dir),
+            "pulls_dir": str(args.path_prs),
+            "output_dir": str(args.path_tasks),
             "resume": not args.no_resume,
             "max_pulls": args.max_pulls,
         }

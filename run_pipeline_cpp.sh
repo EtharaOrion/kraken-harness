@@ -84,7 +84,8 @@ while [[ $# -gt 0 ]]; do
         --stages)       STAGES="$2"; shift 2 ;;
         --flaky-runs)   FLAKY_RUNS="$2"; shift 2 ;;
         --help)
-            sed -n '/^# Usage:/,/^###/p' "$0" | head -n -1
+            # Use sed '$d' instead of GNU 'head -n -1' for macOS BSD compatibility.
+            sed -n '/^# Usage:/,/^###/p' "$0" | sed '$d'
             exit 0
             ;;
         *) echo "Unknown option: $1"; exit 1 ;;
@@ -133,6 +134,12 @@ raise_fd_limit() {
     local target="${SWEFF_MIN_FDS:-4096}"
     local current
     current=$(ulimit -n 2>/dev/null || echo 0)
+    # macOS reports 'unlimited' for very high soft limits; normalize to a huge
+    # int so the >= comparison below evaluates correctly under `set -u`.
+    if [[ "$current" == "unlimited" ]]; then
+        current=9999999
+    fi
+    [[ "$current" =~ ^[0-9]+$ ]] || current=0
     if [[ "$current" -ge "$target" ]]; then
         echo "FD limit: $current (>= $target, ok)"
         return 0
@@ -143,6 +150,10 @@ raise_fd_limit() {
     fi
     local hard
     hard=$(ulimit -Hn 2>/dev/null || echo 0)
+    if [[ "$hard" == "unlimited" ]]; then
+        hard=9999999
+    fi
+    [[ "$hard" =~ ^[0-9]+$ ]] || hard=0
     if [[ "$hard" -gt "$current" ]] && ulimit -n "$hard" 2>/dev/null; then
         echo "FD limit: raised from $current to $hard (capped by hard limit)"
         return 0
@@ -477,6 +488,11 @@ stage_workload() {
         exit 1
     fi
 
+    # Compile-validation is critical for shipping non-broken workloads;
+    # default to ON for pipeline runs so DLQ at workload_uncompilable_cpp.jsonl
+    # is actually reachable. Honour any user override.
+    export SWEFF_VALIDATE_CPP_WORKLOAD="${SWEFF_VALIDATE_CPP_WORKLOAD:-1}"
+
     step "Generating Google Benchmark workloads..."
     run_cmd python3 -m swefficiency.workload.run_synthetic_generation_cpp \
         --dataset_name "$ENRICHED_FILE" \
@@ -560,9 +576,9 @@ stage_eval() {
     step "Building cpp Docker images via build_and_validate_images_cpp..."
     local build_args=(
         --dataset "$dataset_to_use"
-        --workers "$MAX_WORKERS"
+        --max-workers "$MAX_WORKERS"
     )
-    $MULTIARCH && build_args+=(--multiarch)
+    $MULTIARCH && build_args+=(--build-multiarch)
     run_cmd python3 scripts/build_and_validate_images_cpp.py "${build_args[@]}" || {
         echo "WARNING: image build/validation reported errors; eval may fail for some instances."
     }
