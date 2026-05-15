@@ -46,6 +46,12 @@ CHUNK_TIMEOUT_S = int(os.environ.get("SWEFF_CHUNK_TIMEOUT_S", "14400"))
 
 def construct_data_files_cpp(data: dict) -> None:
     """Worker: build datasets for each repo in ``data['repos']``."""
+    # Each worker process gets its own GitHub token so the 5000/hr core rate
+    # limit is per-worker, not shared across all of them. Mutating os.environ
+    # is safe here: ProcessPoolExecutor workers are separate processes.
+    token = data.get("token")
+    if token:
+        os.environ["GITHUB_TOKEN"] = token
     output_dir = Path(data["output_dir"])
     for repo in data["repos"]:
         try:
@@ -153,8 +159,9 @@ def main(argv: Optional[list] = None) -> int:
             "output_dir": str(args.path_tasks),
             "resume": not args.no_resume,
             "max_pulls": args.max_pulls,
+            "token": tokens[i % len(tokens)] if tokens else "",
         }
-        for chunk in chunks
+        for i, chunk in enumerate(chunks)
     ]
 
     with ProcessPoolExecutor(max_workers=n_workers) as executor:

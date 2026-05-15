@@ -237,13 +237,16 @@ def search_repos(rotator: _TokenRotator, *, min_stars: int, max_repos: int,
             queries.append(_build_query(lic, min_stars, activity_months))
 
     found: dict[str, dict] = {}
-    for query in queries:
-        if len(found) >= max_repos:
-            break
-        logger.info("Searching: %s", query)
+    found_lock = threading.Lock()
+
+    def _run_query(query: str) -> None:
+        """Paginate one search query, merging hits into the shared dict."""
         page = 1
         per_page = 100
         while True:
+            with found_lock:
+                if len(found) >= max_repos:
+                    return
             resp = _gh_get(
                 f"{GITHUB_API}/search/repositories",
                 rotator,
@@ -261,26 +264,32 @@ def search_repos(rotator: _TokenRotator, *, min_stars: int, max_repos: int,
                     resp.status_code if resp is not None else "no-response",
                     (resp.text[:200] if resp is not None else ""),
                 )
-                break
+                return
             data = resp.json()
             items = data.get("items", [])
             if not items:
-                break
-            for repo in items:
-                full = repo.get("full_name", "")
-                if not full or full in found:
-                    continue
-                lname = full.lower()
-                if any(p in lname for p in EXCLUDE_NAME_PATTERNS):
-                    continue
-                found[full] = repo
-                if len(found) >= max_repos:
-                    break
+                return
+            with found_lock:
+                for repo in items:
+                    full = repo.get("full_name", "")
+                    if not full or full in found:
+                        continue
+                    lname = full.lower()
+                    if any(p in lname for p in EXCLUDE_NAME_PATTERNS):
+                        continue
+                    found[full] = repo
+                stop = len(found) >= max_repos
             total = data.get("total_count", 0)
-            if page * per_page >= min(total, 1000) or len(found) >= max_repos:
-                break
+            if stop or page * per_page >= min(total, 1000):
+                return
             page += 1
-            time.sleep(1.5)
+
+    # Queries run in parallel: each call rotates tokens and GitHub's secondary
+    # search rate limit is per-token, so N tokens give ~N x throughput. _gh_get
+    # already backs off on HTTP 403, so no blanket sleep between pages is needed.
+    logger.info("Searching %d license/topic queries...", len(queries))
+    with ThreadPoolExecutor(max_workers=max(1, rotator.size)) as exe:
+        list(exe.map(_run_query, queries))
     logger.info("Found %d unique candidate repos across all licenses/topics", len(found))
     return list(found.values())
 

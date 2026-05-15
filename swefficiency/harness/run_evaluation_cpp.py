@@ -41,7 +41,6 @@ from swefficiency.harness.constants import (
     APPLY_PATCH_PASS,
     INSTANCE_IMAGE_BUILD_DIR,
     KEY_INSTANCE_ID,
-    RUN_EVALUATION_LOG_DIR,
 )
 from swefficiency.harness.docker_build import (
     BuildImageError,
@@ -98,6 +97,13 @@ def _resolve_parse_gbench_path() -> Path:
     return candidate
 
 
+# Cpp eval logs live under a cpp-specific dir so they never collide with the
+# Python pipeline AND so run_pipeline_cpp.sh's EVAL_DIR (logs/run_evaluation_cpp)
+# matches where we actually write. The shared RUN_EVALUATION_LOG_DIR is
+# logs/run_evaluation, which the cpp pipeline driver does not look in.
+RUN_EVALUATION_LOG_DIR_CPP = Path("logs/run_evaluation_cpp")
+
+
 def run_instance_cpp(
     test_spec: TestSpecCpp,
     pred: dict,
@@ -110,7 +116,7 @@ def run_instance_cpp(
     """C++ analog of ``run_instance``."""
     instance_id = test_spec.instance_id
     model_name_or_path = pred.get("model_name_or_path", "None").replace("/", "__")
-    log_dir = RUN_EVALUATION_LOG_DIR / run_id / model_name_or_path / instance_id
+    log_dir = RUN_EVALUATION_LOG_DIR_CPP / run_id / model_name_or_path / instance_id
     log_dir.mkdir(parents=True, exist_ok=True)
 
     build_dir = INSTANCE_IMAGE_BUILD_DIR / test_spec.instance_image_key.replace(":", "__")
@@ -375,14 +381,19 @@ def main():
             if not line.strip():
                 continue
             pred = json.loads(line)
-            predictions[pred[KEY_INSTANCE_ID]] = pred
+            # make_test_spec_cpp lowercases instance_id for Docker-tag safety;
+            # key predictions the same way so lookups never silently miss.
+            predictions[pred[KEY_INSTANCE_ID].lower()] = pred
     else:
-        predictions = json.loads(args.predictions_path.read_text())
+        predictions = {
+            k.lower(): v
+            for k, v in json.loads(args.predictions_path.read_text()).items()
+        }
 
     dataset = load_swefficiency_dataset(args.dataset_name, args.split)
     if args.instance_ids:
-        wanted = set(args.instance_ids)
-        dataset = [i for i in dataset if i[KEY_INSTANCE_ID] in wanted]
+        wanted = {i.lower() for i in args.instance_ids}
+        dataset = [i for i in dataset if i[KEY_INSTANCE_ID].lower() in wanted]
 
     run_instances_cpp(
         predictions=predictions,

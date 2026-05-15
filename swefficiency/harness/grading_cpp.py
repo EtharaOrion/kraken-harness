@@ -149,6 +149,17 @@ def compute_pass_to_pass(report: dict[str, dict[str, Any]]) -> float:
 
 
 def get_resolution_status(report: dict[str, dict[str, Any]]) -> str:
+    f2p_total = (
+        len(report[FAIL_TO_PASS]["success"]) + len(report[FAIL_TO_PASS]["failure"])
+    )
+    p2p_total = (
+        len(report[PASS_TO_PASS]["success"]) + len(report[PASS_TO_PASS]["failure"])
+    )
+    if f2p_total == 0 and p2p_total == 0:
+        # Nothing was verifiable (e.g. the Phase 1 coverage stub leaves both
+        # test lists empty). compute_*_to_pass each return 1.0 for an empty
+        # list, which would otherwise mark the instance spuriously resolved.
+        return ResolvedStatus.NO.value
     f2p = compute_fail_to_pass(report)
     p2p = compute_pass_to_pass(report)
     if f2p == 1 and p2p == 1:
@@ -175,7 +186,10 @@ def get_eval_report_cpp(
         "resolved": False,
     }
 
-    if prediction.get("model_patch") is None:
+    # Treat an empty-string patch the same as a missing one. run_evaluation_cpp
+    # writes `model_patch or ""` to disk, so without this an empty patch would
+    # be graded as a real, successfully-applied patch.
+    if not prediction.get("model_patch"):
         report_map[instance_id]["patch_is_None"] = True
         return report_map
     report_map[instance_id]["patch_exists"] = True

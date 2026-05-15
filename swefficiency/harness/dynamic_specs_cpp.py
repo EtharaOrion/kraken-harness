@@ -74,8 +74,24 @@ def _synthesize_specs_cpp(instance: dict) -> dict[str, Any]:
     base_commit = instance.get("base_commit", "")
     base = _default_specs(repo)
 
-    # Detected via detect_repo_specs_cpp; merge if present on the instance.
+    # Detected via detect_repo_specs_cpp. That script writes enrichment fields
+    # onto the instance top level (there is no "repo_specs" subkey) and uses a
+    # couple of different field names. Normalize both here so detection results
+    # actually reach the build/test commands instead of being silently dropped.
     repo_specs = instance.get("repo_specs") or {}
+    if not repo_specs:
+        repo_specs = {
+            "cpp_standard": instance.get("cpp_standard"),
+            "min_cmake": instance.get("min_cmake") or instance.get("min_cmake_version"),
+            "system_pkgs": instance.get("system_pkgs"),
+            "packages_source": instance.get("packages_source"),
+            "cmake_flags": instance.get("cmake_flags"),
+            "pre_install_cmds": instance.get("pre_install_cmds"),
+            "install_cmd": instance.get("install_cmd"),
+            "build_cmd": instance.get("build_cmd"),
+            "test_cmd": instance.get("test_cmd") or instance.get("test_cmd_override"),
+            "test_framework": instance.get("test_framework"),
+        }
     for key in ("cpp_standard", "min_cmake", "system_pkgs", "packages_source",
                 "cmake_flags", "pre_install_cmds", "install_cmd", "build_cmd",
                 "test_cmd", "test_framework"):
