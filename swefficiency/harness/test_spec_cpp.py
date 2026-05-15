@@ -597,9 +597,10 @@ def make_test_spec_cpp(
     base_commit = instance["base_commit"]
     test_patch = instance.get("test_patch", "")
 
-    if repo not in MAP_REPO_TO_BUILD_SYSTEM_CPP:
-        raise NotImplementedError(f"Repo {repo!r} not in MAP_REPO_TO_BUILD_SYSTEM_CPP")
-
+    # No allow-list: dynamic_specs_cpp.get_or_create_specs_cpp synthesizes defaults
+    # for repos not in MAP_REPO_TO_BUILD_SYSTEM_CPP. Unknown repos get the standard
+    # cmake/ninja/ctest path; per-repo overrides (system_pkgs, test_flag) come from
+    # detect_repo_specs_cpp.py at enrichment time.
     build_timeout = BUILD_TIMEOUT_OVERRIDES_CPP.get(repo)
 
     def _from_json_or_obj(key: str) -> Any:

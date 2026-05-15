@@ -62,6 +62,11 @@ START_FROM=""
 STOP_AFTER=""
 STAGES=""
 FLAKY_RUNS=10
+DISCOVER=false
+DISCOVERY_OUTPUT=""
+DISCOVERY_MIN_STARS=500
+DISCOVERY_MIN_PRS=100
+DISCOVERY_MAX_REPOS=500
 
 # ─── Parse args ──────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -83,6 +88,11 @@ while [[ $# -gt 0 ]]; do
         --stop-after)   STOP_AFTER="$2"; shift 2 ;;
         --stages)       STAGES="$2"; shift 2 ;;
         --flaky-runs)   FLAKY_RUNS="$2"; shift 2 ;;
+        --discover)     DISCOVER=true; shift ;;
+        --discovery-output)    DISCOVERY_OUTPUT="$2"; shift 2 ;;
+        --discovery-min-stars) DISCOVERY_MIN_STARS="$2"; shift 2 ;;
+        --discovery-min-prs)   DISCOVERY_MIN_PRS="$2"; shift 2 ;;
+        --discovery-max-repos) DISCOVERY_MAX_REPOS="$2"; shift 2 ;;
         --help)
             # Use sed '$d' instead of GNU 'head -n -1' for macOS BSD compatibility.
             sed -n '/^# Usage:/,/^###/p' "$0" | sed '$d'
@@ -223,7 +233,7 @@ find_jsonl() {
 }
 
 # ─── Stage gating ────────────────────────────────────────────────────────────
-ORDERED_STAGES_CPP=(scrape perf_filter versioning detect_specs coverage flaky_filter workload eval significance_filter pred_eval report inference)
+ORDERED_STAGES_CPP=(discover scrape perf_filter versioning detect_specs coverage flaky_filter workload eval significance_filter pred_eval report inference)
 
 validate_stage_name() {
     local name="$1"
@@ -302,6 +312,51 @@ check_prereqs() {
     if [[ ${#cpp_missing[@]} -gt 0 ]]; then
         echo "INFO: Host missing C++ tools (${cpp_missing[*]}); Docker base image will provide them."
     fi
+}
+
+###############################################################################
+# STAGE 0: Discover C++ repos from GitHub (license-filtered, no hardcoded set)
+###############################################################################
+stage_discover() {
+    log "STAGE 0: Discovering open-source C++ repos from GitHub"
+
+    if [[ -z "${GITHUB_TOKEN:-}${GITHUB_TOKENS:-}" ]]; then
+        echo "ERROR: discover stage needs GITHUB_TOKEN or GITHUB_TOKENS."
+        exit 1
+    fi
+
+    ensure_dir "$ARTIFACTS_DIR"
+    if [[ -z "$DISCOVERY_OUTPUT" ]]; then
+        DISCOVERY_OUTPUT="$ARTIFACTS_DIR/discovered_cpp_repos.txt"
+    fi
+
+    step "Searching GitHub for C++ repos with allowed licenses..."
+    echo "  Licenses:  MIT, MIT-0, Apache-2.0, BSD-3-Clause, BSD-2-Clause, ISC"
+    echo "  Filters:   stars >= $DISCOVERY_MIN_STARS, PRs >= $DISCOVERY_MIN_PRS, max=$DISCOVERY_MAX_REPOS"
+    echo "  Output:    $DISCOVERY_OUTPUT"
+
+    run_cmd python3 -m swefficiency.collect.discover_repos_cpp \
+        --output "$DISCOVERY_OUTPUT" \
+        --format ranked \
+        --min-stars "$DISCOVERY_MIN_STARS" \
+        --min-prs "$DISCOVERY_MIN_PRS" \
+        --max-repos "$DISCOVERY_MAX_REPOS"
+
+    if [[ ! -f "$DISCOVERY_OUTPUT" ]]; then
+        echo "ERROR: discover_repos_cpp produced no output at $DISCOVERY_OUTPUT"
+        exit 1
+    fi
+
+    # Use awk to count non-comment, non-blank lines without shell-quoting hazards.
+    local n
+    n=$(awk 'NF && !/^#/' "$DISCOVERY_OUTPUT" | wc -l | tr -d ' ')
+    echo "  -> discovered $n repos"
+
+    # Auto-wire downstream stages to use this repos file.
+    REPOS_FILE="$DISCOVERY_OUTPUT"
+    REPO_SLUG="multi"
+    REPO_OWNER="multi"
+    echo "  -> REPOS_FILE auto-set to discovered list for subsequent stages"
 }
 
 ###############################################################################
@@ -778,6 +833,11 @@ main() {
     raise_fd_limit
     check_prereqs
 
+    # ── --discover convenience: opt-in shortcut to run STAGE 0 first ──
+    if $DISCOVER && [[ -z "$STAGES" && -z "$START_FROM" ]]; then
+        START_FROM="discover"
+    fi
+
     # ── Auto-discover intermediate files for resume ──
     if [[ -n "$DATASET" ]]; then
         echo "  Using provided dataset: $DATASET"
@@ -796,6 +856,7 @@ main() {
     fi
 
     # ── Stage-gated execution ──
+    should_run_stage "discover" && [[ -z "$DATASET" ]] && stage_discover
     should_run_stage "scrape" && ! $SKIP_SCRAPE && [[ -z "$DATASET" ]] && stage_scrape
     should_run_stage "perf_filter" && ! $SKIP_SCRAPE && [[ -z "$DATASET" ]] && stage_perf_filter
     should_run_stage "versioning" && ! $SKIP_SCRAPE && [[ -z "$DATASET" ]] && stage_versioning
