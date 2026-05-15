@@ -188,3 +188,11 @@ def get_dockerfile_instance_cpp(platform: str, env_image_name: str) -> str:
         "FROM --platform=" + platform + " {env_image_name}",
     )
     return template.format(env_image_name=env_image_name)
+
+
+def get_dockerfile_annotate_instance_cpp(platform: str, instance_image_name: str) -> str:
+    template = _DOCKERFILE_ANNOTATE_INSTANCE_CPP.replace(
+        "FROM {instance_image_name}",
+        "FROM --platform=" + platform + " {instance_image_name}",
+    )
+    return template.format(instance_image_name=instance_image_name)
