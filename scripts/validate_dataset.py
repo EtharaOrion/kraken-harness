@@ -130,11 +130,17 @@ def validate_instance(idx: int, record: dict) -> list[str]:
     if isinstance(test_patch, str) and test_patch and "diff" not in test_patch.lower():
         errors.append(f"[{iid}] test_patch doesn't look like a unified diff")
 
-    # workload should contain Python code
+    # workload should contain code matching the instance language. Phase 1 cpp
+    # pipeline emits Google Benchmark .cc — gate on language=='cpp'.
     workload = record.get("workload", "")
+    language = record.get("language", "python")
     if isinstance(workload, str) and workload:
-        if "def " not in workload and "import " not in workload:
-            errors.append(f"[{iid}] workload doesn't look like Python code")
+        if language == "cpp":
+            if "BENCHMARK" not in workload and "#include" not in workload:
+                errors.append(f"[{iid}] workload doesn't look like C++ Google Benchmark code")
+        else:
+            if "def " not in workload and "import " not in workload:
+                errors.append(f"[{iid}] workload doesn't look like Python code")
 
     return errors, warnings
 
