@@ -466,13 +466,55 @@ def make_meaningful_edit_script_list_cpp(
 
 
 def _workload_compile_cmd(specs: dict) -> str:
+    # WORKLOAD_INCLUDES + WORKLOAD_LIBS are set by `_workload_env_detect_block`
+    # at runtime so the compile adapts to whatever include / lib layout the
+    # discovered repo actually has (instead of assuming /testbed/include +
+    # /testbed/build/lib*).
     cxx_std = specs.get("cpp_standard", "17")
     return (
         f"g++ -O3 -std=c++{cxx_std} {WORKLOAD_SRC_PATH} "
-        f"-I{REPO_DIRECTORY}/include -I{BUILD_DIR} "
-        f"-L{BUILD_DIR} -lbenchmark -lpthread "
+        "$WORKLOAD_INCLUDES $WORKLOAD_LIBS "
+        "-lbenchmark -lpthread "
         f"-o {WORKLOAD_BIN_PATH}"
     )
+
+
+def _workload_env_detect_block() -> list[str]:
+    """Bash preamble that detects per-repo workload include + lib paths.
+
+    Probes /testbed for common header dirs (``include/``, ``inc/``, root) and
+    auto-links any ``lib*.a`` / ``lib*.so`` cmake produced under
+    ``/testbed/build`` (up to 3 levels deep). Sets two env vars used by
+    :func:`_workload_compile_cmd`:
+
+    * ``WORKLOAD_INCLUDES`` -- a chain of ``-I<dir>`` flags
+    * ``WORKLOAD_LIBS`` -- ``-L<build> -Wl,-rpath,<build>`` plus one ``-l<name>``
+      per discovered library.
+
+    Without this, the workload compile assumed every repo has ``/testbed/include``
+    and never linked the project's own libraries, which broke roughly a third
+    of dynamically-discovered repos.
+    """
+    block = textwrap.dedent(
+        f"""
+        WORKLOAD_INCLUDES="-I{BUILD_DIR}"
+        for d in {REPO_DIRECTORY}/include {REPO_DIRECTORY}/inc {REPO_DIRECTORY}; do
+            [ -d "$d" ] && WORKLOAD_INCLUDES="$WORKLOAD_INCLUDES -I$d"
+        done
+        WORKLOAD_LIBS="-L{BUILD_DIR} -Wl,-rpath,{BUILD_DIR}"
+        while IFS= read -r lib; do
+            [ -z "$lib" ] && continue
+            name=$(basename "$lib" | sed -E 's/^lib([^.]+)\\..*/\\1/')
+            case " $WORKLOAD_LIBS " in
+                *" -l$name "*) ;;
+                *) WORKLOAD_LIBS="$WORKLOAD_LIBS -l$name" ;;
+            esac
+        done < <(find {BUILD_DIR} -maxdepth 3 -type f \\( -name 'lib*.a' -o -name 'lib*.so*' \\) 2>/dev/null)
+        echo "WORKLOAD_INCLUDES=$WORKLOAD_INCLUDES"
+        echo "WORKLOAD_LIBS=$WORKLOAD_LIBS"
+        """
+    ).strip().splitlines()
+    return block
 
 
 def _workload_run_cmd() -> str:
@@ -516,6 +558,7 @@ def make_performance_script_list_cpp(
     ] + _apply_patch_block() + [
         _cmake_build_cmd(),
         f'[ -f {WORKLOAD_SRC_PATH} ] || (echo "Missing workload at {WORKLOAD_SRC_PATH}"; exit 1)',
+    ] + _workload_env_detect_block() + [
         _workload_compile_cmd(specs),
         _workload_run_cmd(),
         _emit_perf_sentinels_cmd(),
@@ -538,6 +581,7 @@ def make_performance_profiling_script_list_cpp(
     ] + _apply_patch_block() + [
         _cmake_build_cmd(),
         f'[ -f {WORKLOAD_SRC_PATH} ] || (echo "Missing workload"; exit 1)',
+    ] + _workload_env_detect_block() + [
         _workload_compile_cmd(specs),
         f"perf record -o /tmp/perf.data -- taskset -c 0 {WORKLOAD_BIN_PATH} "
         "--benchmark_repetitions=1 --benchmark_min_time=0.1s || true",

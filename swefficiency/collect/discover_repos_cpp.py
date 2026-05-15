@@ -51,7 +51,9 @@ import base64
 import json
 import logging
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -127,6 +129,36 @@ CPP_TOPICS = (
 
 
 # ---------------------------------------------------------------------------
+# Token rotation (multi-PAT round-robin for throughput at scale)
+# ---------------------------------------------------------------------------
+
+class _TokenRotator:
+    """Thread-safe round-robin over a list of GitHub PATs.
+
+    GitHub rate limits are per-token (5000/hr core, 30/min secondary on
+    ``/search/issues``), so N tokens deliver roughly N x discovery throughput.
+    The single-token path is a no-op rotator wrapping ``[token]``.
+    """
+
+    def __init__(self, tokens: list[str]) -> None:
+        if not tokens:
+            raise ValueError("at least one GitHub token required")
+        self._tokens = list(tokens)
+        self._idx = 0
+        self._lock = threading.Lock()
+
+    def next(self) -> str:
+        with self._lock:
+            tok = self._tokens[self._idx % len(self._tokens)]
+            self._idx += 1
+            return tok
+
+    @property
+    def size(self) -> int:
+        return len(self._tokens)
+
+
+# ---------------------------------------------------------------------------
 # HTTP helpers
 # ---------------------------------------------------------------------------
 
@@ -147,10 +179,11 @@ def _rate_limit_wait(response: requests.Response) -> None:
         time.sleep(sleep_for)
 
 
-def _gh_get(url: str, token: str, params: Optional[dict] = None,
+def _gh_get(url: str, rotator: _TokenRotator, params: Optional[dict] = None,
             max_retries: int = 3) -> Optional[requests.Response]:
-    headers = _get_headers(token)
+    """GET ``url`` rotating tokens per attempt (so retries try a fresh PAT)."""
     for attempt in range(max_retries):
+        headers = _get_headers(rotator.next())
         try:
             resp = requests.get(url, headers=headers, params=params, timeout=30)
         except requests.RequestException as e:
@@ -187,7 +220,7 @@ def _build_query(license_key: str, min_stars: int, activity_months: int,
     return " ".join(parts)
 
 
-def search_repos(token: str, *, min_stars: int, max_repos: int,
+def search_repos(rotator: _TokenRotator, *, min_stars: int, max_repos: int,
                  activity_months: int, topics: Optional[list] = None) -> list[dict]:
     """Fan out searches across allowed licenses and (optionally) topics.
 
@@ -213,7 +246,7 @@ def search_repos(token: str, *, min_stars: int, max_repos: int,
         while True:
             resp = _gh_get(
                 f"{GITHUB_API}/search/repositories",
-                token,
+                rotator,
                 params={
                     "q": query,
                     "sort": "stars",
@@ -256,9 +289,9 @@ def search_repos(token: str, *, min_stars: int, max_repos: int,
 # Per-repo validation
 # ---------------------------------------------------------------------------
 
-def fetch_license_content(token: str, owner: str, name: str) -> str:
+def fetch_license_content(rotator: _TokenRotator, owner: str, name: str) -> str:
     """Return decoded LICENSE content (lowercased), empty string on failure."""
-    resp = _gh_get(f"{GITHUB_API}/repos/{owner}/{name}/license", token)
+    resp = _gh_get(f"{GITHUB_API}/repos/{owner}/{name}/license", rotator)
     if resp is None or resp.status_code != 200:
         return ""
     try:
@@ -272,7 +305,7 @@ def fetch_license_content(token: str, owner: str, name: str) -> str:
         return ""
 
 
-def classify_license(repo: dict, token: str) -> Optional[str]:
+def classify_license(repo: dict, rotator: _TokenRotator) -> Optional[str]:
     """Return the allow-listed SPDX ID for this repo, or None if not allowed.
 
     The repo's metadata ``license.spdx_id`` is the first-line check. For
@@ -283,9 +316,8 @@ def classify_license(repo: dict, token: str) -> Optional[str]:
     if spdx in ALLOWED_SPDX_IDS - {"MIT-0"}:
         if spdx == "MIT":
             content = fetch_license_content(
-                token, repo["owner"]["login"], repo["name"]
+                rotator, repo["owner"]["login"], repo["name"]
             )
-            time.sleep(0.5)
             if content and any(m in content for m in MIT_ZERO_MARKERS):
                 return "MIT-0"
             return "MIT"
@@ -293,18 +325,18 @@ def classify_license(repo: dict, token: str) -> Optional[str]:
     return None
 
 
-def check_cmake_root(token: str, owner: str, name: str) -> bool:
+def check_cmake_root(rotator: _TokenRotator, owner: str, name: str) -> bool:
     """Return True iff CMakeLists.txt exists at repo root."""
     resp = _gh_get(
         f"{GITHUB_API}/repos/{owner}/{name}/contents/CMakeLists.txt",
-        token,
+        rotator,
     )
     return bool(resp is not None and resp.status_code == 200)
 
 
-def check_tests(token: str, owner: str, name: str) -> bool:
+def check_tests(rotator: _TokenRotator, owner: str, name: str) -> bool:
     """Heuristic: tests/ or test/ dir, or CTestTestfile.cmake, or ctest in CI."""
-    resp = _gh_get(f"{GITHUB_API}/repos/{owner}/{name}/contents/", token)
+    resp = _gh_get(f"{GITHUB_API}/repos/{owner}/{name}/contents/", rotator)
     if resp is None or resp.status_code != 200:
         return False
     try:
@@ -322,7 +354,7 @@ def check_tests(token: str, owner: str, name: str) -> bool:
     if ".github" in names:
         wf = _gh_get(
             f"{GITHUB_API}/repos/{owner}/{name}/contents/.github/workflows",
-            token,
+            rotator,
         )
         if wf is not None and wf.status_code == 200:
             try:
@@ -339,10 +371,10 @@ def check_tests(token: str, owner: str, name: str) -> bool:
     return False
 
 
-def count_merged_prs(token: str, owner: str, name: str) -> int:
+def count_merged_prs(rotator: _TokenRotator, owner: str, name: str) -> int:
     resp = _gh_get(
         f"{GITHUB_API}/search/issues",
-        token,
+        rotator,
         params={"q": f"repo:{owner}/{name} is:pr is:merged", "per_page": 1},
     )
     if resp is None or resp.status_code != 200:
@@ -350,50 +382,96 @@ def count_merged_prs(token: str, owner: str, name: str) -> int:
     return int(resp.json().get("total_count", 0))
 
 
-def validate_repos(repos: list[dict], token: str, *, min_prs: int,
-                   require_cmake: bool, require_tests: bool) -> list[dict]:
-    """Run cheap-first validation. Returns enriched repos that pass everything."""
-    out: list[dict] = []
-    for i, repo in enumerate(repos):
-        full = repo["full_name"]
-        owner = repo["owner"]["login"]
-        name = repo["name"]
-        stars = repo.get("stargazers_count", 0)
-        logger.info("[%d/%d] Validating %s (⭐%d)", i + 1, len(repos), full, stars)
+def _validate_single(
+    repo: dict,
+    rotator: _TokenRotator,
+    *,
+    min_prs: int,
+    require_cmake: bool,
+    require_tests: bool,
+    skip_pr_count: bool,
+) -> Optional[dict]:
+    """Validate a single repo. Returns the enriched repo dict or ``None``."""
+    full = repo["full_name"]
+    owner = repo["owner"]["login"]
+    name = repo["name"]
+    stars = repo.get("stargazers_count", 0)
 
-        # 1. License classification (also catches MIT-0).
-        spdx = classify_license(repo, token)
-        if spdx is None:
-            logger.info("  ✗ License not allowed: %s",
-                        (repo.get("license") or {}).get("spdx_id"))
-            continue
-        repo["_license_spdx"] = spdx
-        time.sleep(0.5)
+    spdx = classify_license(repo, rotator)
+    if spdx is None:
+        logger.info("  ✗ %s: license not allowed (%s)",
+                    full, (repo.get("license") or {}).get("spdx_id"))
+        return None
+    repo["_license_spdx"] = spdx
 
-        # 2. CMakeLists.txt at root.
-        if require_cmake:
-            if not check_cmake_root(token, owner, name):
-                logger.info("  ✗ No CMakeLists.txt at root")
-                continue
-            time.sleep(0.5)
+    if require_cmake and not check_cmake_root(rotator, owner, name):
+        logger.info("  ✗ %s: no CMakeLists.txt at root", full)
+        return None
 
-        # 3. Test infrastructure.
-        if require_tests:
-            if not check_tests(token, owner, name):
-                logger.info("  ✗ No test infrastructure detected")
-                continue
-            time.sleep(0.5)
+    if require_tests and not check_tests(rotator, owner, name):
+        logger.info("  ✗ %s: no test infrastructure detected", full)
+        return None
 
-        # 4. Merged PR count.
-        n_prs = count_merged_prs(token, owner, name)
+    if skip_pr_count:
+        # -1 = not measured; downstream `ranked` output still sorts by stars
+        # when merged_prs is uniform across all entries.
+        repo["_merged_prs"] = -1
+    else:
+        n_prs = count_merged_prs(rotator, owner, name)
         if n_prs < min_prs:
-            logger.info("  ✗ Only %d merged PRs (need >= %d)", n_prs, min_prs)
-            continue
+            logger.info("  ✗ %s: only %d merged PRs (need >= %d)",
+                        full, n_prs, min_prs)
+            return None
         repo["_merged_prs"] = n_prs
 
-        out.append(repo)
-        logger.info("  ✓ PASS — license=%s, prs=%d", spdx, n_prs)
-        time.sleep(1.0)
+    logger.info("  ✓ %s (⭐%d, license=%s, prs=%d)",
+                full, stars, spdx, repo["_merged_prs"])
+    return repo
+
+
+def validate_repos(
+    repos: list[dict],
+    rotator: _TokenRotator,
+    *,
+    min_prs: int,
+    require_cmake: bool,
+    require_tests: bool,
+    skip_pr_count: bool = False,
+    max_workers: Optional[int] = None,
+) -> list[dict]:
+    """Validate ``repos`` in parallel. Returns the enriched, passing subset.
+
+    Worker count defaults to the number of tokens in ``rotator`` since each
+    in-flight request consumes one token's rate-limit budget.
+    """
+    if max_workers is None:
+        max_workers = max(1, rotator.size)
+    out: list[dict] = []
+    logger.info(
+        "Validating %d repos with %d worker(s) over %d token(s); skip_pr_count=%s",
+        len(repos), max_workers, rotator.size, skip_pr_count,
+    )
+    with ThreadPoolExecutor(max_workers=max_workers) as exe:
+        futs = {
+            exe.submit(
+                _validate_single,
+                repo,
+                rotator,
+                min_prs=min_prs,
+                require_cmake=require_cmake,
+                require_tests=require_tests,
+                skip_pr_count=skip_pr_count,
+            ): repo["full_name"]
+            for repo in repos
+        }
+        for fut in as_completed(futs):
+            try:
+                result = fut.result()
+            except Exception:
+                logger.exception("validation worker raised for %s", futs[fut])
+                continue
+            if result is not None:
+                out.append(result)
     return out
 
 
@@ -503,7 +581,22 @@ def main(argv: Optional[list] = None) -> int:
         help="Skip license + cmake + tests + PR-count validation",
     )
     parser.add_argument(
-        "--token", default=None, help="GitHub PAT (default: GITHUB_TOKEN/GITHUB_TOKENS)"
+        "--no-pr-count",
+        action="store_true",
+        help="Skip the per-repo merged-PR count gate (saves one /search/issues "
+             "call per candidate; trades quality for throughput). Affected repos "
+             "will report merged_prs=-1.",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help="Parallel workers for validation (default: number of tokens supplied)",
+    )
+    parser.add_argument(
+        "--token",
+        default=None,
+        help="GitHub PAT or comma-separated list (default: GITHUB_TOKENS / GITHUB_TOKEN)",
     )
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args(argv)
@@ -511,17 +604,27 @@ def main(argv: Optional[list] = None) -> int:
     if args.verbose:
         logger.setLevel(logging.DEBUG)
 
-    token = args.token or os.environ.get("GITHUB_TOKEN")
-    if not token:
+    # Resolve token list. --token may be a single PAT or comma-separated;
+    # otherwise GITHUB_TOKENS (comma-separated) > GITHUB_TOKEN (single).
+    tokens: list[str] = []
+    if args.token:
+        tokens = [t.strip() for t in args.token.split(",") if t.strip()]
+    if not tokens:
         raw = os.environ.get("GITHUB_TOKENS", "")
         if raw:
-            token = raw.split(",")[0].strip()
-    if not token:
+            tokens = [t.strip() for t in raw.split(",") if t.strip()]
+    if not tokens:
+        single = os.environ.get("GITHUB_TOKEN", "").strip()
+        if single:
+            tokens = [single]
+    if not tokens:
         logger.error("No GitHub token. Set GITHUB_TOKEN/GITHUB_TOKENS or pass --token.")
         return 1
+    rotator = _TokenRotator(tokens)
+    logger.info("Token rotator: %d PAT(s)", rotator.size)
 
     candidates = search_repos(
-        token,
+        rotator,
         min_stars=args.min_stars,
         max_repos=args.max_repos * 3,
         activity_months=args.activity_months,
@@ -539,10 +642,12 @@ def main(argv: Optional[list] = None) -> int:
     else:
         validated = validate_repos(
             candidates,
-            token,
+            rotator,
             min_prs=args.min_prs,
             require_cmake=args.require_cmake,
             require_tests=args.require_tests,
+            skip_pr_count=args.no_pr_count,
+            max_workers=args.max_workers,
         )
 
     validated = validated[: args.max_repos]
