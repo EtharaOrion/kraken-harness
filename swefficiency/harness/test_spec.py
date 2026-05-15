@@ -1172,9 +1172,10 @@ def parse_perf_output(raw_output):
     if start_index == -1 or end_index == -1:
         raise ValueError("Perf tags not found in output.")
 
-    # Get only text between the tags.
+    # Get only text between the tags. (A stray `perf_text = cleaned_per_output`
+    # used to overwrite this slice, making the regex scan the whole output and
+    # pick up any stray Mean:/Std Dev: lines outside the sentinels.)
     perf_text = cleaned_per_output[start_index + len(perf_start_tag) : end_index]
-    perf_text = cleaned_per_output
 
     pattern = r"(?:Mean|Std\s*Dev):\s*([\S]+)"
     matches = re.findall(pattern, perf_text)
