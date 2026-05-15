@@ -50,11 +50,11 @@ def _get_version_cache_safe():
     if os.environ.get("SWEFF_DISABLE_CACHE"):
         return None
     try:
-        from swefficiency.cache.sqlite_cache import get_default_cache  # local import
+        from swefficiency.cache.sqlite_cache_cpp import get_default_cache_cpp  # local import
     except Exception:
         return None
     try:
-        return get_default_cache()
+        return get_default_cache_cpp()
     except Exception:
         return None
 
@@ -188,7 +188,7 @@ def get_version(
 
     if cache_usable:
         try:
-            from swefficiency.cache.sqlite_cache import NS_VERSION_CPP
+            from swefficiency.cache.sqlite_cache_cpp import NS_VERSION_CPP
             cached = cache.get(NS_VERSION_CPP, (repo, base_commit))
             if cached:
                 return cached
@@ -199,7 +199,7 @@ def get_version(
 
     if cache_usable and version:
         try:
-            from swefficiency.cache.sqlite_cache import NS_VERSION_CPP
+            from swefficiency.cache.sqlite_cache_cpp import NS_VERSION_CPP
             cache.set(NS_VERSION_CPP, (repo, base_commit), version)
         except Exception:
             logger.debug("cache write failed", exc_info=True)

@@ -6,34 +6,26 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
-"""Full preflight for a 10k-instance autonomous run.
+"""Full preflight for a 10k-instance autonomous C++ run.
 
-``validate_dataset.py`` covers the dataset shape. This script adds the
-infrastructure checks an autonomous run will silently fail on without:
+Standalone fork of ``scripts/validate_run.py``. The Python preflight is
+left untouched. This script adds:
 
-* GitHub tokens                — collect/* and patch fetching.
-* AWS credentials              — Bedrock LLM calls, S3 logs.
-* ECR registry reachability    — instance image pulls.
-* Docker daemon                — image builds and container runs.
-* Free disk space              — image cache + per-instance work dirs.
-* File-descriptor headroom     — concurrent docker connections.
-* Cost-tracker state           — prior partial spend across resumes.
+* All shared infrastructure checks (GitHub tokens, AWS creds, ECR, Docker,
+  disk space, FD limit, cost state) — duplicated here so the cpp pipeline
+  has zero edges into the Python validator file.
+* C++ toolchain probe (gcc-12+, cmake, ninja, ccache, gcov, lcov, gcovr).
+* C++ headers probe (GoogleTest, Google Benchmark).
+* Optional cpp dataset validation via ``validate_dataset_cpp.py``.
 
 Exits 0 if every check passes (or is downgraded to a WARN). Non-zero on the
 first FAIL. Pass ``--strict`` to escalate WARN to FAIL.
 
 Usage:
-    python scripts/validate_run.py [--dataset PATH] [--strict] \\
+    python scripts/validate_run_cpp.py [--dataset PATH] [--strict] \\
         [--min-disk-gb 50] [--min-fds 4096]
 """
-
 from __future__ import annotations
 
 import argparse
@@ -79,7 +71,8 @@ def _skip(name: str, reason: str) -> CheckResult:
 
 
 # ---------------------------------------------------------------------------
-# Individual checks. Each returns a CheckResult.
+# Infrastructure checks (shared with Python preflight; duplicated here to
+# keep the cpp pipeline free of any edge into validate_run.py).
 # ---------------------------------------------------------------------------
 
 def check_github_tokens() -> CheckResult:
@@ -115,22 +108,18 @@ def check_aws_credentials() -> CheckResult:
             "Set AWS_PROFILE or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, or run aws configure.",
         )
     region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
-    detail = "credentials present"
-    if region:
-        detail += f"; region={region}"
-    else:
+    if not region:
         return _warn(
             "aws_credentials",
             "AWS credentials present but no AWS_REGION/AWS_DEFAULT_REGION set.",
             "Export AWS_REGION=us-east-1 (or your chosen region).",
         )
-    return _ok("aws_credentials", detail)
+    return _ok("aws_credentials", f"credentials present; region={region}")
 
 
 def check_ecr_registry() -> CheckResult:
     registry = os.environ.get("ECR_REGISTRY")
     if not registry:
-        # Best-effort derive from account + region.
         account = os.environ.get("AWS_ACCOUNT_ID")
         region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
         if account and region:
@@ -187,7 +176,6 @@ def check_docker_daemon() -> CheckResult:
 
 
 def check_disk_space(min_gb: float) -> CheckResult:
-    # Disk under DOCKER_DATA_ROOT if set, else /var/lib/docker if exists, else /.
     candidates = []
     if "DOCKER_DATA_ROOT" in os.environ:
         candidates.append(Path(os.environ["DOCKER_DATA_ROOT"]))
@@ -284,27 +272,88 @@ def check_dataset(dataset_path: Optional[Path]) -> CheckResult:
         return _fail(
             "dataset",
             f"{dataset_path} does not exist.",
-            "Point --dataset at the JSONL produced by run_pipeline.sh.",
+            "Point --dataset at the cpp JSONL produced by run_pipeline_cpp.sh.",
         )
     try:
-        from scripts.validate_dataset import validate_dataset  # noqa: WPS433
+        from scripts.validate_dataset_cpp import validate_dataset_cpp
     except ImportError as e:
         return _warn(
             "dataset",
-            f"could not import validate_dataset helper: {e}",
-            "Run scripts/validate_dataset.py manually.",
+            f"could not import validate_dataset_cpp helper: {e}",
+            "Run scripts/validate_dataset_cpp.py manually.",
         )
-    count, errors, warnings = validate_dataset(dataset_path)
+    count, errors, warnings = validate_dataset_cpp(dataset_path)
     if errors:
         return _fail(
             "dataset",
             f"{count} records; {len(errors)} validation error(s).",
-            "Run scripts/validate_dataset.py for full error list.",
+            "Run scripts/validate_dataset_cpp.py for full error list.",
         )
     detail = f"{count} records valid"
     if warnings:
         detail += f"; {len(warnings)} non-fatal warning(s)"
     return _ok("dataset", detail)
+
+
+# ---------------------------------------------------------------------------
+# C++ toolchain checks (always-on for this script).
+# ---------------------------------------------------------------------------
+
+_CPP_TOOLS_REQUIRED = ("g++", "cmake", "ninja", "ccache", "gcov", "lcov", "gcovr")
+
+
+def check_cpp_toolchain() -> CheckResult:
+    """Verify host has C++17 build and coverage tooling."""
+    missing = [name for name in _CPP_TOOLS_REQUIRED if shutil.which(name) is None]
+    if missing:
+        return _warn(
+            "cpp_toolchain",
+            f"missing: {', '.join(missing)}",
+            "Bundled in cpp Docker base image; only required for host-side runs.",
+            "Ubuntu: apt-get install gcc-12 g++-12 cmake ninja-build ccache lcov gcovr",
+        )
+    try:
+        proc = subprocess.run(
+            ["g++", "--version"], capture_output=True, text=True, timeout=5
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return _warn("cpp_toolchain", f"g++ probe failed: {e}")
+    import re as _re
+    match = _re.search(r"\b(\d+)\.\d+\.\d+\b", proc.stdout)
+    if not match:
+        return _warn("cpp_toolchain", "could not parse g++ version output")
+    major = int(match.group(1))
+    if major < 9:
+        return _fail(
+            "cpp_toolchain",
+            f"g++ major version {major} too old (need >= 9 for C++17).",
+            "Install gcc-12: apt-get install gcc-12 g++-12.",
+        )
+    return _ok("cpp_toolchain", f"g++ {major}.x, all tools present")
+
+
+def check_cpp_libraries() -> CheckResult:
+    """Probe for GoogleTest 1.14+ and Google Benchmark 1.8+ headers."""
+    gtest_paths = (
+        "/usr/include/gtest/gtest.h",
+        "/usr/local/include/gtest/gtest.h",
+    )
+    bench_paths = (
+        "/usr/include/benchmark/benchmark.h",
+        "/usr/local/include/benchmark/benchmark.h",
+    )
+    missing = []
+    if not any(Path(p).exists() for p in gtest_paths):
+        missing.append("GoogleTest")
+    if not any(Path(p).exists() for p in bench_paths):
+        missing.append("Google Benchmark")
+    if missing:
+        return _warn(
+            "cpp_libraries",
+            f"host missing: {', '.join(missing)}",
+            "Bundled in cpp Docker base image; only required for host-side runs.",
+        )
+    return _ok("cpp_libraries", "GoogleTest + Google Benchmark headers present")
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +373,8 @@ def run_checks(args: argparse.Namespace) -> Tuple[List[CheckResult], int]:
         ("fd_limit", lambda: check_fd_limit(args.min_fds)),
         ("cost_state", lambda: check_cost_state(args.run_id)),
         ("dataset", lambda: check_dataset(Path(args.dataset) if args.dataset else None)),
+        ("cpp_toolchain", check_cpp_toolchain),
+        ("cpp_libraries", check_cpp_libraries),
     ]
     results: List[CheckResult] = []
     for _, fn in checks:
@@ -343,7 +394,7 @@ def run_checks(args: argparse.Namespace) -> Tuple[List[CheckResult], int]:
 def print_report(results: List[CheckResult]) -> None:
     print()
     print("=" * 60)
-    print(" SWE-fficiency run preflight")
+    print(" SWE-fficiency cpp run preflight")
     print("=" * 60)
     for r in results:
         glyph = _GLYPHS.get(r.status, "[?]")
@@ -363,7 +414,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--dataset",
-        help="Optional path to JSONL dataset to validate via validate_dataset.py.",
+        help="Optional path to JSONL dataset to validate via validate_dataset_cpp.py.",
     )
     parser.add_argument(
         "--run-id",
@@ -391,9 +442,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     results, exit_code = run_checks(args)
     print_report(results)
     if exit_code == 0:
-        print(" preflight: OK")
+        print(" cpp preflight: OK")
     else:
-        print(" preflight: FAILED — fix above before launching.")
+        print(" cpp preflight: FAILED — fix above before launching.")
     return exit_code
 
 

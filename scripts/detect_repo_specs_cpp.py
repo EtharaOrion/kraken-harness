@@ -32,10 +32,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-from swefficiency.cache.sqlite_cache import (
+from swefficiency.cache.sqlite_cache import SqliteKVCache
+from swefficiency.cache.sqlite_cache_cpp import (
     NS_REPO_SPECS_CPP,
-    SqliteKVCache,
-    get_default_cache,
+    get_default_cache_cpp,
 )
 from swefficiency.harness.constants_cpp import (
     BUILD_CMAKE,
@@ -601,7 +601,7 @@ def main() -> None:
         ok = validate_instances(instances)
         sys.exit(0 if ok else 1)
 
-    cache = get_default_cache()
+    cache = get_default_cache_cpp()
 
     groups: dict = defaultdict(list)
     for idx, inst in enumerate(instances):

@@ -37,8 +37,6 @@ logger = logging.getLogger(__name__)
 # Namespace constants — keep stable; they end up as TEXT in the table.
 NS_VERSION = "version"
 NS_REPO_SPECS = "repo_specs"
-NS_VERSION_CPP = "version_cpp"
-NS_REPO_SPECS_CPP = "repo_specs_cpp"
 
 _BUSY_TIMEOUT_MS = 30_000
 _CONNECT_TIMEOUT_S = 30.0
