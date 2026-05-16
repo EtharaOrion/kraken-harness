@@ -469,11 +469,14 @@ import json
 with open('$json_file') as f:
     data = json.load(f)
 if isinstance(data, list):
+    # Version is best-effort metadata, never a gate: a repo whose version
+    # cannot be parsed must still flow downstream (base_commit, not version,
+    # determines the build).
     with open('$VERSIONED_FILE', 'w') as out:
         for item in data:
-            if item.get('version'):
-                out.write(json.dumps(item) + '\n')
-    print(f'  → {len([d for d in data if d.get(\"version\")])} versioned instances')
+            out.write(json.dumps(item) + '\n')
+    _v = len([d for d in data if d.get('version')])
+    print(f'  → {len(data)} instances ({_v} with a detected version)')
 else:
     print('  WARNING: unexpected JSON shape')
 "

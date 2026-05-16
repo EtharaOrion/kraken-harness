@@ -298,6 +298,43 @@ def detect_version(repo_dir: Path, repo: str) -> str:
     return ""
 
 
+_CMAKE_TEST_OPTION_RE = re.compile(
+    r"option\s*\(\s*([A-Za-z0-9_]*(?:TEST|TESTING|TESTS)[A-Za-z0-9_]*)\s",
+    re.IGNORECASE,
+)
+
+
+def detect_cmake_flags(repo_dir: Path, repo: str) -> list[str]:
+    """CMake -D flags needed to enable the test build.
+
+    Mapped repos use their known test_flag. For any other repo we scan
+    CMakeLists.txt for an ``option()`` whose name contains TEST/TESTING and
+    enable it, preferring the CMake-standard ``BUILD_TESTING`` and
+    ``*_BUILD_TESTS`` toggles. Without this the test build is never enabled
+    for repos outside MAP_REPO_TO_BUILD_SYSTEM_CPP and ctest finds nothing.
+    """
+    entry = MAP_REPO_TO_BUILD_SYSTEM_CPP.get(repo, {})
+    if entry.get("test_flag"):
+        return [entry["test_flag"]]
+    raw = _read_text(repo_dir / "CMakeLists.txt") or ""
+    names = [m.group(1) for m in _CMAKE_TEST_OPTION_RE.finditer(raw)]
+    if not names:
+        return []
+
+    def _rank(name: str) -> int:
+        low = name.lower()
+        if low == "build_testing":
+            return 0
+        if "build_test" in low:
+            return 1
+        if "test" in low:
+            return 2
+        return 3
+
+    best = sorted(names, key=_rank)[0]
+    return [f"-D{best}=ON"]
+
+
 def detect_install_cmd(repo_dir: Path, repo: str) -> str:
     """Default install command: cmake configure with sensible defaults."""
     cpp_std = detect_cpp_standard(repo_dir)
@@ -372,6 +409,7 @@ def detect_all_specs_cpp(repo_dir: Path, repo: str) -> dict:
     test_framework = detect_test_framework(repo_dir, repo)
     min_cmake = detect_min_cmake_version(repo_dir)
     system_pkgs = detect_system_pkgs(repo_dir, repo)
+    cmake_flags = detect_cmake_flags(repo_dir, repo)
 
     return {
         "language": "cpp",
@@ -379,6 +417,7 @@ def detect_all_specs_cpp(repo_dir: Path, repo: str) -> dict:
         "build_system": build_system,
         "min_cmake_version": min_cmake,
         "test_framework": test_framework,
+        "cmake_flags": cmake_flags,
         "install_cmd": install_cmd,
         "test_cmd_override": test_cmd,
         "packages_source": source_type,
@@ -400,9 +439,14 @@ def process_repo_group_cpp(
     """Clone repo, checkout commit, detect cpp specs. Returns specs dict or None."""
     cache_key = (repo, base_commit)
     cached_specs = cache.get(NS_REPO_SPECS_CPP, cache_key)
-    if cached_specs is not None:
+    if cached_specs is not None and all(
+        f in cached_specs for f in REQUIRED_ENRICHMENT_FIELDS_CPP
+    ):
         log.info("Cache hit for cpp %s@%s", repo, base_commit[:8])
         return cached_specs
+    if cached_specs is not None:
+        # Cached entry predates a newer required field — re-detect.
+        log.info("Stale cpp cache for %s@%s; re-detecting", repo, base_commit[:8])
 
     dest = clone_dir / repo.replace("/", "__") / base_commit[:12]
     cloned = False
@@ -508,6 +552,7 @@ REQUIRED_ENRICHMENT_FIELDS_CPP = (
     "cpp_standard",
     "build_system",
     "test_framework",
+    "cmake_flags",
     "install_cmd",
     "test_cmd_override",
     "packages_source",
