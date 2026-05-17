@@ -644,7 +644,10 @@ def make_test_spec_cpp(
     repo = instance["repo"].lower()
     version = instance.get("version", "0.0")
     base_commit = instance["base_commit"]
-    test_patch = instance.get("test_patch", "")
+    # Guarantee test_patch on the instance dict: the shared get_test_directives
+    # (called by get_correctness_script_list_cpp) bracket-accesses it.
+    instance = {**instance, "test_patch": instance.get("test_patch", "")}
+    test_patch = instance["test_patch"]
 
     # No allow-list: dynamic_specs_cpp.get_or_create_specs_cpp synthesizes defaults
     # for repos not in MAP_REPO_TO_BUILD_SYSTEM_CPP. Unknown repos get the standard
