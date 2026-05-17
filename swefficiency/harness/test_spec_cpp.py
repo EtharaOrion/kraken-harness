@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import platform
 import textwrap
 import traceback
 from dataclasses import dataclass
@@ -43,7 +42,6 @@ from swefficiency.harness.constants import (
     FAIL_TO_PASS,
     KEY_INSTANCE_ID,
     PASS_TO_PASS,
-    USE_X86,
     SWEfficiencyInstance,
 )
 from swefficiency.harness.constants_cpp import (
@@ -206,9 +204,10 @@ class TestSpecCpp:
 
     @property
     def platform(self) -> str:
-        machine = platform.machine()
-        if machine in {"aarch64", "arm64"} and self.instance_id not in USE_X86:
-            return "linux/arm64/v8"
+        # Phase 1 ships single-arch linux/amd64 images (the EC2 production
+        # target). Build platform, container-create platform, and host must
+        # agree; returning the host arch broke eval on arm64 dev machines
+        # against the amd64-built instance images.
         return "linux/x86_64"
 
 
@@ -505,6 +504,17 @@ def _workload_env_detect_block() -> list[str]:
         while IFS= read -r lib; do
             [ -z "$lib" ] && continue
             name=$(basename "$lib" | sed -E 's/^lib([^.]+)\\..*/\\1/')
+            # Skip test/benchmark harness libraries: they are not the
+            # library under test, and libtest-main/libgtest_main define
+            # their own main(), colliding with the workload BENCHMARK_MAIN().
+            case "$name" in
+                test-main|gtest|gtest_main|gmock|gmock_main|benchmark|benchmark_main) continue ;;
+            esac
+            libdir=$(dirname "$lib")
+            case " $WORKLOAD_LIBS " in
+                *" -L$libdir "*) ;;
+                *) WORKLOAD_LIBS="$WORKLOAD_LIBS -L$libdir -Wl,-rpath,$libdir" ;;
+            esac
             case " $WORKLOAD_LIBS " in
                 *" -l$name "*) ;;
                 *) WORKLOAD_LIBS="$WORKLOAD_LIBS -l$name" ;;
