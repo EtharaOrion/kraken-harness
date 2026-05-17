@@ -33,13 +33,14 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
-from swefficiency.collect import utils as collect_utils
 from swefficiency.collect.utils import (
     PatchFetchError,
+    Repo,
     extract_patches,
     write_to_dlq,
 )
 from swefficiency.perf_filter.attributes.filter import is_perf_pr
+from swefficiency.perf_filter.utils import stream_jsonl
 
 logger = logging.getLogger(__name__)
 
@@ -54,10 +55,12 @@ def is_valid_instance(instance: dict) -> bool:
     return True
 
 
-def create_instance(pr: dict, repo: str, language: str = "cpp") -> dict:
+def create_instance(
+    pr: dict, repo: str, repo_obj: Repo, language: str = "cpp"
+) -> dict:
     instance_id = f"{repo.replace('/', '__')}-{pr.get('number')}"
     try:
-        patch, test_patch = extract_patches(pr)
+        patch, test_patch = extract_patches(pr, repo_obj)
         patch_fetch_failed = False
     except PatchFetchError as e:
         logger.warning("extract_patches failed for %s: %s", instance_id, e)
@@ -104,6 +107,10 @@ def build_dataset_cpp(
     Returns ``(completed, perf_kept, fetch_failed)``.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
+    # extract_patches needs a Repo object (it reads repo.token for the diff
+    # fetch). Construct it once per repo, mirroring the Python pipeline.
+    owner, name = repo.split("/", 1)
+    repo_obj = Repo(owner, name, token=os.environ.get("GITHUB_TOKEN"))
     all_output = output_dir / (repo.replace("/", "__") + "_cpp.all.jsonl")
     filtered_output = output_dir / (repo.replace("/", "__") + "_cpp.perf.jsonl")
     seen_prs_path = Path(str(all_output) + ".seen_prs")
@@ -138,10 +145,10 @@ def build_dataset_cpp(
     with open(all_output, write_mode_all) as all_f, \
          open(filtered_output, write_mode_filtered) as filtered_f, \
          open(seen_prs_path, "a") as seen_prs_f:
-        for pr in collect_utils.stream_jsonl(pulls_path):
+        for pr in stream_jsonl(str(pulls_path)):
             if max_pulls is not None and completed >= max_pulls:
                 break
-            instance = create_instance(pr, repo, language="cpp")
+            instance = create_instance(pr, repo, repo_obj, language="cpp")
             if not is_valid_instance(instance):
                 continue
             if instance["instance_id"] in seen_prs:
@@ -152,7 +159,9 @@ def build_dataset_cpp(
             if instance["patch_fetch_failed"]:
                 fetch_failed += 1
                 continue
-            if is_perf_pr(instance):
+            # is_perf_pr reads the raw PR's title/body/labels, not the
+            # derived instance dict.
+            if is_perf_pr(repo, pr):
                 print(json.dumps(instance), file=filtered_f, flush=True)
                 perf_kept += 1
 

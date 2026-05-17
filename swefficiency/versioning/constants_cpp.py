@@ -33,6 +33,7 @@ MAP_REPO_TO_VERSION_PATHS_CPP = {
     # fmtlib/fmt: project(FMT VERSION x.y.z) in root CMakeLists.txt.
     "fmtlib/fmt": [
         "CMakeLists.txt",
+        "include/fmt/base.h",
         "include/fmt/core.h",
         "include/fmt/format.h",
     ],

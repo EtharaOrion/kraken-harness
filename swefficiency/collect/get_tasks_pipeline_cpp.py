@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Optional
 
 from swefficiency.collect.build_dataset_cpp import build_dataset_cpp
+from swefficiency.collect.print_pulls import main as print_pulls
 from swefficiency.collect.utils import write_to_dlq
 
 logger = logging.getLogger(__name__)
@@ -55,14 +56,28 @@ def construct_data_files_cpp(data: dict) -> None:
     output_dir = Path(data["output_dir"])
     for repo in data["repos"]:
         try:
-            pulls_path = Path(data["pulls_dir"]) / (repo.replace("/", "__") + ".jsonl")
+            pulls_dir = Path(data["pulls_dir"])
+            pulls_dir.mkdir(parents=True, exist_ok=True)
+            pulls_path = pulls_dir / (repo.replace("/", "__") + ".jsonl")
+            # Scrape the repo's PRs if not already present. Without this the
+            # cpp scrape stage produced nothing — it only consumed pre-existing
+            # PR files that nothing created.
             if not pulls_path.exists():
-                logger.warning("missing pulls jsonl for %s at %s", repo, pulls_path)
+                logger.info("scraping PRs for %s -> %s", repo, pulls_path)
+                print_pulls(
+                    repo,
+                    str(pulls_path),
+                    token or None,
+                    max_pulls=data.get("max_pulls"),
+                    cutoff_date=data.get("cutoff_date"),
+                )
+            if not pulls_path.exists():
+                logger.warning("PR scrape produced no file for %s at %s", repo, pulls_path)
                 write_to_dlq(
                     "task_pipeline_cpp_missing_pulls.jsonl",
                     {"repo": repo, "stage": "construct_data_files_cpp",
                      "error_type": "FileNotFoundError",
-                     "error": f"missing pulls jsonl at {pulls_path}"},
+                     "error": f"PR scrape produced no file at {pulls_path}"},
                 )
                 continue
             completed, perf_kept, fetch_failed = build_dataset_cpp(
@@ -159,6 +174,7 @@ def main(argv: Optional[list] = None) -> int:
             "output_dir": str(args.path_tasks),
             "resume": not args.no_resume,
             "max_pulls": args.max_pulls,
+            "cutoff_date": args.cutoff_date,
             "token": tokens[i % len(tokens)] if tokens else "",
         }
         for i, chunk in enumerate(chunks)

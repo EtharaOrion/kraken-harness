@@ -171,12 +171,34 @@ def _get_headers(token: str) -> dict:
 
 
 def _rate_limit_wait(response: requests.Response) -> None:
+    """Back off on an HTTP 403. Handles all three GitHub cases:
+
+    1. Secondary rate limit with a ``Retry-After`` header (seconds).
+    2. Primary rate limit exhausted (``X-RateLimit-Remaining: 0``) -> wait for
+       ``X-RateLimit-Reset``.
+    3. Secondary rate limit without a ``Retry-After`` header -> fixed backoff.
+
+    Previously only case 2 was handled, so a secondary-limit 403 fell straight
+    through and the caller mis-read the failure as 'resource not found'.
+    """
+    retry_after = response.headers.get("Retry-After")
+    if retry_after:
+        try:
+            sleep_for = int(retry_after) + 1
+        except ValueError:
+            sleep_for = 60
+        logger.warning("Secondary rate limit; sleeping %ds (Retry-After)", sleep_for)
+        time.sleep(sleep_for)
+        return
     remaining = int(response.headers.get("X-RateLimit-Remaining", 1) or 1)
     if remaining == 0:
         reset = int(response.headers.get("X-RateLimit-Reset", 0) or 0)
         sleep_for = max(0, reset - int(time.time())) + 5
         logger.warning("Rate limited. Sleeping %ds for reset...", sleep_for)
         time.sleep(sleep_for)
+    else:
+        logger.warning("HTTP 403 without rate-limit headers; backing off 30s")
+        time.sleep(30)
 
 
 def _gh_get(url: str, rotator: _TokenRotator, params: Optional[dict] = None,

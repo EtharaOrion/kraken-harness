@@ -32,6 +32,11 @@ from typing import Iterable, Optional
 import docker
 import docker.errors
 
+from swefficiency.harness.constants import (
+    BASE_IMAGE_BUILD_DIR,
+    ENV_IMAGE_BUILD_DIR,
+    INSTANCE_IMAGE_BUILD_DIR,
+)
 from swefficiency.harness.constants_cpp import SWEfficiencyInstanceCpp
 from swefficiency.harness.docker_build import (
     BuildImageError,
@@ -83,6 +88,8 @@ def build_base_images_cpp(
                 logger.info("Pulled base cpp image from ECR")
                 return image_name
 
+    build_dir = BASE_IMAGE_BUILD_DIR / image_name.replace(":", "__")
+    build_dir.mkdir(parents=True, exist_ok=True)
     if multiarch:
         dockerfile = get_dockerfile_base_multiarch_cpp()
         build_multiarch_image(
@@ -91,7 +98,7 @@ def build_base_images_cpp(
             dockerfile=dockerfile,
             platforms=["linux/amd64"],
             client=client,
-            build_dir=None,
+            build_dir=build_dir,
         )
         if push_to_ecr and _ecr_registry():
             push_multiarch_to_ecr(image_name, ecr_repo=ECR_REPO_CPP)
@@ -105,7 +112,7 @@ def build_base_images_cpp(
             dockerfile=dockerfile,
             platform="linux/amd64",
             client=client,
-            build_dir=None,
+            build_dir=build_dir,
         )
     return image_name
 
@@ -130,6 +137,8 @@ def _build_one_env(
 
     try:
         setup_scripts = {"setup_env.sh": test_spec.setup_env_script}
+        build_dir = ENV_IMAGE_BUILD_DIR / env_image.replace(":", "__")
+        build_dir.mkdir(parents=True, exist_ok=True)
         if multiarch:
             build_multiarch_image(
                 image_name=env_image,
@@ -137,6 +146,7 @@ def _build_one_env(
                 dockerfile=get_dockerfile_env_multiarch_cpp(),
                 platforms=["linux/amd64"],
                 client=client,
+                build_dir=build_dir,
             )
             if push_to_ecr and _ecr_registry():
                 push_multiarch_to_ecr(env_image, ecr_repo=ECR_REPO_CPP)
@@ -149,6 +159,7 @@ def _build_one_env(
                 dockerfile=get_dockerfile_env_cpp("linux/amd64"),
                 platform="linux/amd64",
                 client=client,
+                build_dir=build_dir,
             )
         return None
     except BuildImageError as e:
@@ -207,6 +218,8 @@ def _build_one_instance(
 
     try:
         setup_scripts = {"setup_repo.sh": test_spec.install_repo_script}
+        build_dir = INSTANCE_IMAGE_BUILD_DIR / image_name.replace(":", "__")
+        build_dir.mkdir(parents=True, exist_ok=True)
         if multiarch:
             build_multiarch_image(
                 image_name=image_name,
@@ -214,6 +227,7 @@ def _build_one_instance(
                 dockerfile=get_dockerfile_instance_multiarch_cpp(test_spec.env_image_key),
                 platforms=["linux/amd64"],
                 client=client,
+                build_dir=build_dir,
             )
             if push_to_ecr and _ecr_registry():
                 push_multiarch_to_ecr(image_name, ecr_repo=ECR_REPO_CPP)
@@ -228,6 +242,7 @@ def _build_one_instance(
                 ),
                 platform="linux/amd64",
                 client=client,
+                build_dir=build_dir,
             )
         return None
     except BuildImageError as e:

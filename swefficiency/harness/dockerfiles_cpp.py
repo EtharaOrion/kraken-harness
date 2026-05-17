@@ -30,7 +30,7 @@ flag is supplied at build time; templates DON'T hardcode platform.
 """
 
 # Phase 1 toolchain pin -- see plan section 3.5 + 10b.5.
-_GTEST_VERSION = "release-1.14.0"
+_GTEST_VERSION = "v1.14.0"
 _GOOGLE_BENCHMARK_VERSION = "v1.8.3"
 
 

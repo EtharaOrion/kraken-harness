@@ -72,6 +72,9 @@ def _normalize_version(raw: str) -> Optional[str]:
     cleaned = cleaned.strip(".")
     if not cleaned:
         return None
+    # Packed integer version (e.g. fmt's FMT_VERSION 120101 -> 12.1).
+    if "." not in cleaned and cleaned.isdigit() and len(cleaned) in (5, 6):
+        return f"{int(cleaned[:-4])}.{int(cleaned[-4:-2])}"
     parts = cleaned.split(".")
     if len(parts) >= 2:
         return ".".join(parts[:2])
