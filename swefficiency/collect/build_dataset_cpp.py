@@ -101,6 +101,7 @@ def build_dataset_cpp(
     *,
     resume: bool = True,
     max_pulls: Optional[int] = None,
+    token=None,
 ) -> tuple[int, int, int]:
     """Iterate ``pulls_path`` and emit ``.all`` + ``.filtered`` JSONL files.
 
@@ -110,7 +111,7 @@ def build_dataset_cpp(
     # extract_patches needs a Repo object (it reads repo.token for the diff
     # fetch). Construct it once per repo, mirroring the Python pipeline.
     owner, name = repo.split("/", 1)
-    repo_obj = Repo(owner, name, token=os.environ.get("GITHUB_TOKEN"))
+    repo_obj = Repo(owner, name, token=token if token is not None else os.environ.get("GITHUB_TOKEN"))
     all_output = output_dir / (repo.replace("/", "__") + "_cpp.all.jsonl")
     filtered_output = output_dir / (repo.replace("/", "__") + "_cpp.perf.jsonl")
     seen_prs_path = Path(str(all_output) + ".seen_prs")
@@ -123,13 +124,13 @@ def build_dataset_cpp(
     fetch_failed = 0
 
     if resume and seen_prs_path.exists():
-        seen_prs = {line.strip() for line in seen_prs_path.read_text().splitlines() if line.strip()}
+        seen_prs = {line.strip() for line in seen_prs_path.read_text(encoding="utf-8").splitlines() if line.strip()}
         write_mode_all = "a"
         write_mode_filtered = "a"
         logger.info("Loaded %d seen instance ids from %s", len(seen_prs), seen_prs_path)
     elif resume and all_output.exists():
         logger.info("Bootstrapping seen_prs from %s (one-time cost)", all_output)
-        with open(all_output) as f, open(seen_prs_path, "w") as ledger:
+        with open(all_output, encoding="utf-8") as f, open(seen_prs_path, "w", encoding="utf-8") as ledger:
             for line in f:
                 try:
                     obj = json.loads(line)
@@ -142,9 +143,9 @@ def build_dataset_cpp(
         write_mode_all = "a"
         write_mode_filtered = "a"
 
-    with open(all_output, write_mode_all) as all_f, \
-         open(filtered_output, write_mode_filtered) as filtered_f, \
-         open(seen_prs_path, "a") as seen_prs_f:
+    with open(all_output, write_mode_all, encoding="utf-8") as all_f, \
+         open(filtered_output, write_mode_filtered, encoding="utf-8") as filtered_f, \
+         open(seen_prs_path, "a", encoding="utf-8") as seen_prs_f:
         for pr in stream_jsonl(str(pulls_path)):
             if max_pulls is not None and completed >= max_pulls:
                 break

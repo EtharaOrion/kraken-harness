@@ -227,12 +227,17 @@ def _gh_get(url: str, rotator: _TokenRotator, params: Optional[dict] = None,
 # ---------------------------------------------------------------------------
 
 def _build_query(license_key: str, min_stars: int, activity_months: int,
-                 topic: Optional[str] = None) -> str:
+                 topic: Optional[str] = None, star_band=None) -> str:
     cutoff = (datetime.utcnow() - timedelta(days=activity_months * 30)).strftime("%Y-%m-%d")
+    if star_band is None:
+        stars_q = f"stars:>={min_stars}"
+    else:
+        lo, hi = star_band
+        stars_q = f"stars:>={lo}" if hi is None else f"stars:{lo}..{hi}"
     parts = [
         "language:C++",
         f"license:{license_key}",
-        f"stars:>={min_stars}",
+        stars_q,
         f"pushed:>={cutoff}",
         "fork:false",
         "archived:false",
@@ -250,13 +255,31 @@ def search_repos(rotator: _TokenRotator, *, min_stars: int, max_repos: int,
     (5 queries) and optionally by topic (adds N more queries) to maximise
     distinct repos returned within the cap.
     """
+    # GitHub Search caps at 1000 results/query. Shard by license AND by star
+    # band so each (license, band[, topic]) sub-query stays under the cap;
+    # the union covers the full qualifying C++ population.
+    def _star_bands(low):
+        edges = [low]
+        for mult in (2, 4, 8, 20, 50, 150):
+            e = low * mult
+            if e > edges[-1]:
+                edges.append(e)
+        bands = []
+        for i in range(len(edges) - 1):
+            bands.append((edges[i], edges[i + 1] - 1))
+        bands.append((edges[-1], None))
+        return bands
+
     queries: list[str] = []
     for lic in SEARCH_LICENSE_KEYS:
-        if topics:
-            for t in topics:
-                queries.append(_build_query(lic, min_stars, activity_months, topic=t))
-        else:
-            queries.append(_build_query(lic, min_stars, activity_months))
+        for band in _star_bands(min_stars):
+            if topics:
+                for t in topics:
+                    queries.append(_build_query(lic, min_stars, activity_months,
+                                                topic=t, star_band=band))
+            else:
+                queries.append(_build_query(lic, min_stars, activity_months,
+                                            star_band=band))
 
     found: dict[str, dict] = {}
     found_lock = threading.Lock()
@@ -515,7 +538,7 @@ def write_output(repos: list[dict], output: str, fmt: str = "ranked") -> None:
     if parent:
         os.makedirs(parent, exist_ok=True)
     if fmt == "json":
-        with open(output, "w") as f:
+        with open(output, "w", encoding="utf-8") as f:
             json.dump(
                 [
                     {
@@ -538,7 +561,7 @@ def write_output(repos: list[dict], output: str, fmt: str = "ranked") -> None:
             key=lambda r: (r.get("_merged_prs", 0), r.get("stargazers_count", 0)),
             reverse=True,
         )
-        with open(output, "w") as f:
+        with open(output, "w", encoding="utf-8") as f:
             f.write(
                 "# Auto-discovered C++ repos for SWE-fficiency\n"
                 f"# Generated: {datetime.now().isoformat()}\n"
@@ -556,7 +579,7 @@ def write_output(repos: list[dict], output: str, fmt: str = "ranked") -> None:
                     f"{r.get('_merged_prs', 0)} merged PRs\n"
                 )
     else:  # simple
-        with open(output, "w") as f:
+        with open(output, "w", encoding="utf-8") as f:
             for r in repos:
                 f.write(f"{r['full_name']}\n")
     logger.info("Wrote %d repos to %s (format=%s)", len(repos), output, fmt)

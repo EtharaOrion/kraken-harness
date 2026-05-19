@@ -46,6 +46,9 @@ from swefficiency.collect.utils import (
     extract_problem_statement_and_hints,
     extract_problem_statement_and_hints_django,
     send_request_with_rate_limit_handling,
+    _TokenRotator,
+    TokenStuckError,
+    RepoRateLimitError,
 )
 
 
@@ -89,7 +92,7 @@ def _make_pull_dict(**overrides):
 
 def _make_rate_limit(remaining=5000):
     """Mock rate_limit.get() return value."""
-    return _ns(resources=_ns(core=_ns(remaining=remaining)))
+    return _ns(resources=_ns(core=_ns(remaining=remaining, reset=9999999999)))
 
 
 def _mock_repo(owner="psf", name="requests", token="ghp_fake1234567890"):
@@ -98,6 +101,7 @@ def _mock_repo(owner="psf", name="requests", token="ghp_fake1234567890"):
     repo.owner = owner
     repo.name = name
     repo.token = token
+    repo._rotator = MagicMock()
     repo.api = MagicMock()
     repo.api.rate_limit.get.return_value = _make_rate_limit()
     repo.repo = MagicMock()
@@ -173,8 +177,9 @@ class TestRepoInit:
         r = Repo("owner", "repo-\U0001f680")
         assert r.name == "repo-\U0001f680"
 
+    @patch("swefficiency.collect.utils.time.sleep")
     @patch("swefficiency.collect.utils.GhApi")
-    def test_d8_repos_get_raises_403(self, mock_ghapi_cls):
+    def test_d8_repos_get_raises_403(self, mock_ghapi_cls, mock_sleep):
         # D8: rate limit during init
         api_inst = mock_ghapi_cls.return_value
         api_inst.repos.get.side_effect = [
@@ -212,8 +217,8 @@ class TestCallApi:
         mock_ghapi_cls.return_value.rate_limit.get.return_value = _make_rate_limit()
         r = Repo("o", "r", token="ghp_abcdef1234567890")
         func = MagicMock(return_value={"data": "value"})
-        result = r.call_api(func, key="val")
-        func.assert_called_once_with(key="val")
+        result = r.call_api(lambda api: func(api))
+        func.assert_called_once()
         assert result == {"data": "value"}
 
     @patch("swefficiency.collect.utils.GhApi")
@@ -231,13 +236,10 @@ class TestCallApi:
     @patch("swefficiency.collect.utils.time.sleep")
     @patch("swefficiency.collect.utils.GhApi")
     def test_d8_403_retries_then_succeeds(self, mock_ghapi_cls, mock_sleep):
-        # D8: 403 rate limit -> wait -> retry succeeds
+        # D8: 403 -> token cooled, rotator advances, retry succeeds.
         api_inst = mock_ghapi_cls.return_value
         api_inst.repos.get.return_value = _ns(full_name="o/r")
-        api_inst.rate_limit.get.side_effect = [
-            _make_rate_limit(remaining=0),  # first check in 403 handler -> sleep
-            _make_rate_limit(remaining=1),  # second check -> remaining > 0, break
-        ]
+        api_inst.rate_limit.get.return_value = _make_rate_limit(remaining=0)
         r = Repo("o", "r", token="ghp_abcdef1234567890")
         func = MagicMock(
             side_effect=[
@@ -245,10 +247,9 @@ class TestCallApi:
                 {"success": True},
             ]
         )
-        result = r.call_api(func)
+        result = r.call_api(lambda api: func(api))
         assert result == {"success": True}
         assert func.call_count == 2
-        mock_sleep.assert_called_with(60 * 5)
 
     @patch("swefficiency.collect.utils.GhApi")
     def test_d1_passes_all_kwargs(self, mock_ghapi_cls):
@@ -257,8 +258,10 @@ class TestCallApi:
         mock_ghapi_cls.return_value.rate_limit.get.return_value = _make_rate_limit()
         r = Repo("o", "r", token="ghp_abcdef1234567890")
         func = MagicMock(return_value="ok")
-        r.call_api(func, owner="x", repo="y", page=3, extra="data")
-        func.assert_called_once_with(owner="x", repo="y", page=3, extra="data")
+        r.call_api(lambda api: func(api, owner="x", repo="y", page=3, extra="data"))
+        func.assert_called_once()
+        _, kwargs = func.call_args
+        assert kwargs == {"owner": "x", "repo": "y", "page": 3, "extra": "data"}
 
     @patch("swefficiency.collect.utils.GhApi")
     def test_d2_func_returns_none(self, mock_ghapi_cls):
@@ -272,17 +275,19 @@ class TestCallApi:
 
     @patch("swefficiency.collect.utils.time.sleep")
     @patch("swefficiency.collect.utils.GhApi")
-    def test_d3_none_token_crashes_on_403_slice(self, mock_ghapi_cls, mock_sleep):
-        """D3/D8: BUG — self.token[:10] in 403 handler crashes when token is None."""
+    def test_d3_none_token_403_raises_token_stuck(self, mock_ghapi_cls, mock_sleep):
+        """D3/D8: a None token no longer crashes on 403 (_tok_prefix handles
+        None); a persistent 403 exhausts the 1-token pool's rotations ->
+        RepoRateLimitError (per-repo, not the subset-fatal TokenStuckError)."""
         api_inst = mock_ghapi_cls.return_value
         api_inst.repos.get.return_value = _ns(full_name="o/r")
-        api_inst.rate_limit.get.return_value = _make_rate_limit()
+        api_inst.rate_limit.get.return_value = _make_rate_limit(remaining=0)
         r = Repo("o", "r", token=None)
         func = MagicMock(
             side_effect=HTTP403ForbiddenError(MagicMock(), MagicMock(), MagicMock())
         )
-        with pytest.raises(TypeError):
-            r.call_api(func)
+        with pytest.raises(RepoRateLimitError):
+            r.call_api(lambda api: func(api))
 
     @patch("swefficiency.collect.utils.GhApi")
     def test_d2_func_returns_empty_dict(self, mock_ghapi_cls):
@@ -590,7 +595,7 @@ class TestGetAllLoop:
         # D1: per_page parameter forwarded
         r = self._setup_repo(mock_ghapi_cls)
         func = MagicMock(return_value=[])
-        list(r.get_all_loop(func, per_page=50, quiet=True))
+        list(r.get_all_loop(lambda api, **kw: func(**kw), per_page=50, quiet=True))
         func.assert_called_with(owner="o", repo="r", per_page=50, page=1)
 
     @patch("swefficiency.collect.utils.GhApi")
@@ -627,9 +632,8 @@ class TestGetAllLoop:
     def test_d6_quiet_false_logs_progress(self, mock_ghapi_cls):
         r = self._setup_repo(mock_ghapi_cls)
         func = MagicMock(side_effect=[["a"], []])
-        api_inst = mock_ghapi_cls.return_value
-        list(r.get_all_loop(func, quiet=False))
-        assert api_inst.rate_limit.get.call_count >= 1
+        results = list(r.get_all_loop(lambda api, **kw: func(**kw), quiet=False))
+        assert results == ["a"]
 
     @patch("swefficiency.collect.utils.GhApi")
     def test_d6_quiet_true_skips_logging(self, mock_ghapi_cls):
@@ -658,14 +662,11 @@ class TestGetAllLoop:
         # D1: extra kwargs passed to func
         r = self._setup_repo(mock_ghapi_cls)
         func = MagicMock(return_value=[])
-        list(r.get_all_loop(func, quiet=True, pull_number=42, state="open"))
+        list(r.get_all_loop(
+            lambda api, **kw: func(**kw), quiet=True, pull_number=42, state="open"
+        ))
         func.assert_called_with(
-            owner="o",
-            repo="r",
-            per_page=100,
-            page=1,
-            pull_number=42,
-            state="open",
+            owner="o", repo="r", per_page=100, page=1, pull_number=42, state="open"
         )
 
 
@@ -2315,3 +2316,80 @@ class TestMassiveSendRequestStatusCodes:
         with patch("swefficiency.collect.utils.requests.get", return_value=mock_resp):
             with pytest.raises(Exception, match=f"HTTP {code}"):
                 send_request_with_rate_limit_handling("http://example.com")
+
+
+
+# ━━━ TestTokenRotator ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class TestTokenRotator:
+    """Tests for _TokenRotator: round-robin, cooldown, drop, back-compat."""
+
+    def test_round_robin_advance(self):
+        r = _TokenRotator(["t1", "t2", "t3"])
+        assert r.current() == "t1"
+        assert r.advance() == "t2"
+        assert r.advance() == "t3"
+        assert r.advance() == "t1"
+
+    def test_size(self):
+        assert _TokenRotator(["a", "b", "c"]).size == 3
+
+    def test_bare_str_wraps_to_single_token(self):
+        r = _TokenRotator("solo")
+        assert r.size == 1
+        assert r.current() == "solo"
+
+    def test_none_wraps_to_single_token(self):
+        r = _TokenRotator(None)
+        assert r.size == 1
+        assert r.current() is None
+
+    def test_scalar_int_wraps(self):
+        r = _TokenRotator(12345)
+        assert r.size == 1
+        assert r.current() == 12345
+
+    def test_empty_list_wraps_to_none(self):
+        r = _TokenRotator([])
+        assert r.size == 1
+        assert r.current() is None
+
+    def test_mark_cooling_skips_token(self):
+        r = _TokenRotator(["t1", "t2", "t3"])
+        r.mark_cooling("t2", time.time() + 9999)
+        seq = [r.advance() for _ in range(4)]
+        assert "t2" not in seq
+        assert set(seq) <= {"t1", "t3"}
+
+    def test_drop_removes_token(self):
+        r = _TokenRotator(["t1", "t2", "t3"])
+        r.drop("t2")
+        seq = [r.advance() for _ in range(4)]
+        assert "t2" not in seq
+
+    def test_all_dropped_raises_token_stuck(self):
+        r = _TokenRotator(["t1", "t2"])
+        r.drop("t1")
+        r.drop("t2")
+        with pytest.raises(TokenStuckError):
+            r.advance()
+
+    def test_all_cooling_sleeps_until_earliest_reset(self):
+        r = _TokenRotator(["t1", "t2"])
+        slept = []
+        fake_now = 1000.0
+        with patch("swefficiency.collect.utils.time.sleep",
+                   side_effect=lambda s: slept.append(s)), \
+             patch("swefficiency.collect.utils.time.time",
+                   side_effect=lambda: fake_now):
+            r.mark_cooling("t1", 1100.0)
+            r.mark_cooling("t2", 1050.0)
+            tok = r.advance()
+        assert slept, "expected a sleep when all tokens are cooling"
+        # earliest reset is t2 @ 1050, ~50s from fake now=1000
+        assert 49 <= slept[0] <= 52
+        assert tok in {"t1", "t2"}
+
+    def test_reject_rewrapping_rotator(self):
+        r = _TokenRotator(["t1"])
+        with pytest.raises(TypeError):
+            _TokenRotator(r)

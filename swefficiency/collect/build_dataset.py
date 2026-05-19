@@ -160,7 +160,7 @@ def main(
     # resumes are O(n) line-reads with no json.loads per row.
     seen_prs_path = all_output + ".seen_prs"
     if os.path.exists(seen_prs_path):
-        with open(seen_prs_path) as f:
+        with open(seen_prs_path, encoding="utf-8") as f:
             for line in f:
                 iid = line.strip()
                 if iid:
@@ -172,7 +172,7 @@ def main(
         logger.info(
             f"Bootstrapping {seen_prs_path} from {all_output} (one-time cost)"
         )
-        with open(all_output) as f, open(seen_prs_path, "w") as sp:
+        with open(all_output, encoding="utf-8") as f, open(seen_prs_path, "w", encoding="utf-8") as sp:
             for line in f:
                 pr = json.loads(line)
                 if "instance_id" not in pr:
@@ -192,11 +192,11 @@ def main(
 
     # Write to .all file for all PRs
     write_mode_all = "w" if not os.path.exists(all_output) else "a"
-    with open(all_output, write_mode_all) as all_output, open(seen_prs_path, "a") as seen_prs_file:
+    with open(all_output, write_mode_all, encoding="utf-8") as all_output, open(seen_prs_path, "a", encoding="utf-8") as seen_prs_file:
         # Write to output file for PRs with test suites
         write_mode = "w" if not os.path.exists(output) else "a"
-        with open(output, write_mode) as output:
-            for ix, line in enumerate(open(pr_file)):
+        with open(output, write_mode, encoding="utf-8") as output:
+            for ix, line in enumerate(open(pr_file, encoding="utf-8")):
                 total_instances += 1
                 pull = json.loads(line)
                 pr_repo_name = canonical_repo or pull["base"]["repo"]["full_name"]

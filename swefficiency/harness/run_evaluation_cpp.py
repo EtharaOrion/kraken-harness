@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import resource
 import sys
 import traceback
 from argparse import ArgumentParser
@@ -387,6 +388,20 @@ def main():
     parser.add_argument("--clean", action="store_true")
     parser.add_argument("--force-rebuild", action="store_true")
     args = parser.parse_args()
+
+    # Raise the open-file-descriptor soft limit: each worker holds a container
+    # socket plus a log file open, so high --max-workers runs can exhaust the
+    # default soft limit. Mirrors run_evaluation.py's setrlimit call.
+    try:
+        _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        _target = min(_hard, max(_soft, 4096)) if _hard > 0 else max(_soft, 4096)
+        if _target > _soft:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (_target, _hard))
+    except (ValueError, OSError) as _rlimit_err:
+        print(
+            f"warning: could not raise RLIMIT_NOFILE: {_rlimit_err}",
+            file=sys.stderr,
+        )
 
     if args.predictions_path.suffix == ".jsonl":
         predictions = {}

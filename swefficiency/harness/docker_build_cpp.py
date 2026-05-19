@@ -262,9 +262,22 @@ def build_instance_images_cpp(
     push_to_ecr: bool = False,
 ) -> tuple[list[TestSpecCpp], list[BuildImageError]]:
     """Build instance images for every instance after env images are ready."""
-    base_tag = build_base_images_cpp(
-        client, force_rebuild=force_rebuild, multiarch=multiarch, push_to_ecr=push_to_ecr
-    )
+    # The base image is the FROM root of every env and instance image. A bare
+    # uncaught raise here would crash the caller with a traceback; instead we
+    # surface the failure through the same (successes, failures) contract the
+    # caller already inspects, so it can exit cleanly with a clear cause.
+    try:
+        base_tag = build_base_images_cpp(
+            client, force_rebuild=force_rebuild, multiarch=multiarch, push_to_ecr=push_to_ecr
+        )
+    except BuildImageError as e:
+        logger.error("Base cpp image build failed; skipping all downstream builds: %s", e)
+        return [], [e]
+    except Exception as e:  # noqa: BLE001 - any base failure becomes a clean result
+        logger.error("Base cpp image build failed unexpectedly: %s", e)
+        return [], [
+            BuildImageError("sweb.base.cpp:latest", str(e), traceback.format_exc())
+        ]
     logger.info("Base image ready: %s", base_tag)
 
     env_specs, env_failures = build_env_images_cpp(

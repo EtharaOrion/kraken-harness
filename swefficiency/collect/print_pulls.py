@@ -44,7 +44,7 @@ def count_existing_lines(filepath: str) -> int:
     """Count lines in existing file for resume support."""
     if not os.path.exists(filepath):
         return 0
-    with open(filepath) as f:
+    with open(filepath, encoding="utf-8") as f:
         return sum(1 for _ in f)
 
 
@@ -71,35 +71,49 @@ def log_all_pulls(
         else None
     )
 
-    # Resume support: skip already-fetched PRs
-    existing_count = 0
+    # Resume support: skip PRs already in the output file. We key on the PR
+    # *number*, not a line count -- get_all_pulls() is ordered newest-first,
+    # so PRs that closed between runs appear at the TOP of the list; a
+    # line-count skip would drop those new PRs and re-write old ones.
+    seen_numbers: set = set()
     write_mode = "w"
     if resume and os.path.exists(output):
-        existing_count = count_existing_lines(output)
-        if existing_count > 0:
+        with open(output, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    seen_numbers.add(json.loads(line)["number"])
+                except (ValueError, KeyError, TypeError):
+                    continue
+        if seen_numbers:
             write_mode = "a"
             logger.info(
-                f"[{repo.owner}/{repo.name}] Resuming from {existing_count} existing PRs"
+                f"[{repo.owner}/{repo.name}] Resuming: "
+                f"{len(seen_numbers)} PRs already in file"
             )
 
-    with open(output, write_mode) as file:
-        for i_pull, pull in enumerate(repo.get_all_pulls()):
-            # Skip already-fetched PRs when resuming
-            if i_pull < existing_count:
-                continue
-
-            # Check max_pulls limit before writing
-            effective_count = i_pull - existing_count + 1
-            if max_pulls is not None and effective_count > max_pulls:
-                break
-
-            setattr(pull, "resolved_issues", repo.extract_resolved_issues(pull))
-            print(json.dumps(obj2dict(pull)), end="\n", flush=True, file=file)
+    new_written = 0
+    with open(output, write_mode, encoding="utf-8") as file:
+        for pull in repo.get_all_pulls():
+            # Desc-by-created order: the first PR older than the cutoff means
+            # every remaining PR is older too, so we can stop.
             if cutoff_date is not None and pull.created_at < cutoff_date:
                 break
+            if pull.number in seen_numbers:
+                continue
+            if max_pulls is not None and new_written >= max_pulls:
+                break
+            setattr(pull, "resolved_issues", repo.extract_resolved_issues(pull))
+            print(json.dumps(obj2dict(pull)), end="\n", flush=True, file=file)
+            new_written += 1
 
     total = count_existing_lines(output)
-    logger.info(f"[{repo.owner}/{repo.name}] Total PRs in file: {total}")
+    logger.info(
+        f"[{repo.owner}/{repo.name}] Total PRs in file: {total} "
+        f"(+{new_written} this run)"
+    )
 
 
 def main(

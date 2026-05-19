@@ -43,6 +43,7 @@ ARG HTTP_PROXY=""
 ARG HTTPS_PROXY=""
 ARG no_proxy=""
 ARG NO_PROXY=""
+ARG CA_CERT_PATH=""
 
 ARG DEBIAN_FRONTEND=noninteractive
 ENV TZ=Etc/UTC
@@ -113,6 +114,18 @@ ENV CCACHE_DIR=/root/.cache/ccache \
     CMAKE_C_COMPILER_LAUNCHER=ccache \
     CMAKE_CXX_COMPILER_LAUNCHER=ccache \
     PATH=/usr/lib/ccache:${{PATH}}
+
+# Inject custom CA certificate if CA_CERT_PATH is set (for MITM proxies)
+# Users building behind MITM proxy should volume-mount the cert at runtime
+RUN if [ -n "${{CA_CERT_PATH}}" ]; then \
+        echo "CA_CERT_PATH is set but cert must be injected at runtime via volume mount" && \
+        echo "export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt" >> /etc/profile.d/custom-ca.sh && \
+        echo "export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt" >> /etc/profile.d/custom-ca.sh && \
+        echo "export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt" >> /etc/profile.d/custom-ca.sh && \
+        echo "export PIP_CERT=/etc/ssl/certs/ca-certificates.crt" >> /etc/profile.d/custom-ca.sh; \
+    fi
+
+ENV PIP_NO_CACHE_DIR=1
 
 WORKDIR /testbed
 """

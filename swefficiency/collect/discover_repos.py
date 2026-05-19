@@ -35,7 +35,9 @@ import argparse
 import json
 import logging
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -95,6 +97,40 @@ EXCLUDE_PATTERNS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Token rotation (multi-PAT round-robin for throughput at scale)
+# ---------------------------------------------------------------------------
+
+class _TokenRotator:
+    """Thread-safe round-robin over a list of GitHub PATs.
+
+    GitHub rate limits are per-token (5000/hr core, 30/min secondary on
+    ``/search/issues``), so N tokens deliver roughly N x discovery throughput.
+    The single-token path is a no-op rotator wrapping ``[token]``.
+    """
+
+    def __init__(self, tokens: list[str]) -> None:
+        if not tokens:
+            raise ValueError("at least one GitHub token required")
+        self._tokens = list(tokens)
+        self._idx = 0
+        self._lock = threading.Lock()
+
+    def next(self) -> str:
+        with self._lock:
+            tok = self._tokens[self._idx % len(self._tokens)]
+            self._idx += 1
+            return tok
+
+    @property
+    def size(self) -> int:
+        return len(self._tokens)
+
+
+# ---------------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------------
+
 def get_headers(token: str) -> dict:
     """Build auth headers for GitHub API."""
     return {
@@ -104,18 +140,66 @@ def get_headers(token: str) -> dict:
     }
 
 
-def rate_limit_wait(response: requests.Response, token: str) -> None:
-    """Handle GitHub rate limiting with backoff."""
-    remaining = int(response.headers.get("X-RateLimit-Remaining", 1))
+def _rate_limit_wait(response: requests.Response) -> None:
+    """Back off on an HTTP 403. Handles all three GitHub cases:
+
+    1. Secondary rate limit with a ``Retry-After`` header (seconds).
+    2. Primary rate limit exhausted (``X-RateLimit-Remaining: 0``) -> wait for
+       ``X-RateLimit-Reset``.
+    3. Secondary rate limit without a ``Retry-After`` header -> fixed backoff.
+    """
+    retry_after = response.headers.get("Retry-After")
+    if retry_after:
+        try:
+            sleep_for = int(retry_after) + 1
+        except ValueError:
+            sleep_for = 60
+        logger.warning("Secondary rate limit; sleeping %ds (Retry-After)", sleep_for)
+        time.sleep(sleep_for)
+        return
+    remaining = int(response.headers.get("X-RateLimit-Remaining", 1) or 1)
     if remaining == 0:
-        reset_time = int(response.headers.get("X-RateLimit-Reset", 0))
-        wait_seconds = max(0, reset_time - int(time.time())) + 5
-        logger.warning(f"Rate limited. Waiting {wait_seconds}s for reset...")
-        time.sleep(wait_seconds)
+        reset = int(response.headers.get("X-RateLimit-Reset", 0) or 0)
+        sleep_for = max(0, reset - int(time.time())) + 5
+        logger.warning("Rate limited. Sleeping %ds for reset...", sleep_for)
+        time.sleep(sleep_for)
+    else:
+        logger.warning("HTTP 403 without rate-limit headers; backing off 30s")
+        time.sleep(30)
+
+
+def _gh_get(
+    url: str,
+    rotator: "_TokenRotator",
+    params: Optional[dict] = None,
+    max_retries: int = 4,
+) -> Optional[requests.Response]:
+    """GET ``url`` rotating tokens per attempt (so retries try a fresh PAT).
+
+    Returns the final :class:`requests.Response`, or ``None`` if every attempt
+    failed. 403 (rate limit) and transient 5xx responses are retried; the
+    round-robin rotator means each retry burns a *different* token's budget.
+    """
+    for attempt in range(max_retries):
+        headers = get_headers(rotator.next())
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=30)
+        except requests.RequestException as e:
+            logger.warning("Request error (%s); retrying", e)
+            time.sleep(2 ** attempt)
+            continue
+        if resp.status_code == 403:
+            _rate_limit_wait(resp)
+            continue
+        if resp.status_code in (502, 503, 504):
+            time.sleep(2 ** attempt)
+            continue
+        return resp
+    return None
 
 
 def search_repos(
-    token: str,
+    rotator: "_TokenRotator",
     min_stars: int = DEFAULT_MIN_STARS,
     max_repos: int = DEFAULT_MAX_REPOS,
     activity_months: int = DEFAULT_ACTIVITY_MONTHS,
@@ -132,24 +216,41 @@ def search_repos(
 
     Returns list of repo metadata dicts.
     """
-    headers = get_headers(token)
     cutoff_date = (datetime.now() - timedelta(days=activity_months * 30)).strftime(
         "%Y-%m-%d"
     )
 
-    # Base query: Python, not fork, active, sufficient stars
-    base_query = f"language:python stars:>={min_stars} pushed:>={cutoff_date} fork:false"
+    # GitHub Search returns at most 1000 results per query, so a single
+    # stars:>=N query silently caps the candidate pool at 1000. Shard the
+    # star axis into bands -- each sub-query gets its own 1000-result budget
+    # and the union covers the whole qualifying population.
+    def _star_bands(low):
+        edges = [low]
+        for mult in (2, 4, 8, 20, 50, 150):
+            e = low * mult
+            if e > edges[-1]:
+                edges.append(e)
+        bands = []
+        for i in range(len(edges) - 1):
+            bands.append((edges[i], edges[i + 1] - 1))
+        bands.append((edges[-1], None))  # open-ended top band
+        return bands
 
-    # If specific topics requested, search per topic
+    base = f"language:python pushed:>={cutoff_date} fork:false"
     queries = []
-    if topics:
-        for topic in topics:
-            queries.append(f"{base_query} topic:{topic}")
-    else:
-        queries.append(base_query)
+    for lo, hi in _star_bands(min_stars):
+        stars_q = f"stars:>={lo}" if hi is None else f"stars:{lo}..{hi}"
+        shard = f"{base} {stars_q}"
+        if topics:
+            for topic in topics:
+                queries.append(f"{shard} topic:{topic}")
+        else:
+            queries.append(shard)
 
     all_repos = {}
     for query in queries:
+        if len(all_repos) >= max_repos:
+            break
         page = 1
         per_page = 100  # GitHub max
         while len(all_repos) < max_repos:
@@ -160,68 +261,48 @@ def search_repos(
                 "per_page": per_page,
                 "page": page,
             }
-
-            response = requests.get(
-                f"{GITHUB_API}/search/repositories",
-                headers=headers,
-                params=params,
+            response = _gh_get(
+                f"{GITHUB_API}/search/repositories", rotator, params=params
             )
-
-            if response.status_code == 403:
-                rate_limit_wait(response, token)
-                continue
-            elif response.status_code != 200:
+            if response is None:
+                logger.error("Search request failed after retries: %s", query)
+                break
+            if response.status_code != 200:
                 logger.error(
                     f"Search failed: {response.status_code} - {response.text[:200]}"
                 )
                 break
-
             data = response.json()
             items = data.get("items", [])
-
             if not items:
                 break
-
             for repo in items:
                 full_name = repo["full_name"]
-                # Skip excluded patterns
-                repo_lower = full_name.lower()
-                if any(pat in repo_lower for pat in EXCLUDE_PATTERNS):
+                if any(pat in full_name.lower() for pat in EXCLUDE_PATTERNS):
                     continue
                 if full_name not in all_repos:
                     all_repos[full_name] = repo
-
-            # GitHub Search API caps at 1000 results per query
+            # GitHub Search API caps at 1000 results per query.
             if page * per_page >= min(data.get("total_count", 0), 1000):
                 break
-
             page += 1
             time.sleep(2)  # Be nice to GitHub
 
-        if len(all_repos) >= max_repos:
-            break
-
-    logger.info(f"Found {len(all_repos)} candidate repos from search")
+    logger.info(
+        f"Found {len(all_repos)} candidate repos from search "
+        f"({len(queries)} star-band queries)"
+    )
     return list(all_repos.values())[:max_repos]
 
 
-def check_repo_has_tests(
-    token: str, owner: str, repo: str
-) -> bool:
+def check_repo_has_tests(rotator: "_TokenRotator", owner: str, repo: str) -> bool:
     """
     Quick check if repo has test infrastructure by looking for common test markers.
     Checks repo root for: pytest.ini, conftest.py, tox.ini, tests/ directory,
     or pytest in pyproject.toml/setup.cfg.
     """
-    headers = get_headers(token)
-
-    # Check for tests/ or test/ directory via the tree API (shallow)
-    response = requests.get(
-        f"{GITHUB_API}/repos/{owner}/{repo}/contents/",
-        headers=headers,
-    )
-
-    if response.status_code != 200:
+    response = _gh_get(f"{GITHUB_API}/repos/{owner}/{repo}/contents/", rotator)
+    if response is None or response.status_code != 200:
         return False
 
     contents = response.json()
@@ -242,18 +323,10 @@ def check_repo_has_tests(
     return False
 
 
-def check_repo_installable(
-    token: str, owner: str, repo: str
-) -> bool:
+def check_repo_installable(rotator: "_TokenRotator", owner: str, repo: str) -> bool:
     """Check if repo is pip-installable (has setup.py, pyproject.toml, or setup.cfg)."""
-    headers = get_headers(token)
-
-    response = requests.get(
-        f"{GITHUB_API}/repos/{owner}/{repo}/contents/",
-        headers=headers,
-    )
-
-    if response.status_code != 200:
+    response = _gh_get(f"{GITHUB_API}/repos/{owner}/{repo}/contents/", rotator)
+    if response is None or response.status_code != 200:
         return False
 
     contents = response.json()
@@ -265,61 +338,34 @@ def check_repo_installable(
     return bool(install_markers & names)
 
 
-def check_pr_count(
-    token: str, owner: str, repo: str, min_prs: int
-) -> int:
+def check_pr_count(rotator: "_TokenRotator", owner: str, repo: str, min_prs: int) -> int:
     """
     Estimate PR count using the GitHub Search API (issues endpoint with is:pr).
-    Returns estimated count, or 0 if below threshold.
+    Returns estimated count, or 0 if the request fails.
     """
-    headers = get_headers(token)
-
     # Use search to count merged PRs
     query = f"repo:{owner}/{repo} is:pr is:merged"
     params = {"q": query, "per_page": 1}
 
-    response = requests.get(
-        f"{GITHUB_API}/search/issues",
-        headers=headers,
-        params=params,
-    )
-
-    if response.status_code == 403:
-        rate_limit_wait(response, token)
-        response = requests.get(
-            f"{GITHUB_API}/search/issues",
-            headers=headers,
-            params=params,
-        )
-
-    if response.status_code != 200:
+    response = _gh_get(f"{GITHUB_API}/search/issues", rotator, params=params)
+    if response is None or response.status_code != 200:
         return 0
 
-    total = response.json().get("total_count", 0)
-    return total
+    return response.json().get("total_count", 0)
 
 
-def estimate_perf_pr_density(
-    token: str, owner: str, repo: str
-) -> float:
+def estimate_perf_pr_density(rotator: "_TokenRotator", owner: str, repo: str) -> float:
     """
     Estimate the density of performance-related PRs by sampling.
     Returns ratio of perf PRs to total merged PRs (0.0-1.0).
     """
-    headers = get_headers(token)
-
     # Search for PRs with performance keywords in title/body
     perf_keywords = "performance OR speedup OR optimize OR profiling OR benchmark OR latency"
     query = f"repo:{owner}/{repo} is:pr is:merged {perf_keywords}"
     params = {"q": query, "per_page": 1}
 
-    response = requests.get(
-        f"{GITHUB_API}/search/issues",
-        headers=headers,
-        params=params,
-    )
-
-    if response.status_code != 200:
+    response = _gh_get(f"{GITHUB_API}/search/issues", rotator, params=params)
+    if response is None or response.status_code != 200:
         return 0.0
 
     perf_count = response.json().get("total_count", 0)
@@ -327,13 +373,11 @@ def estimate_perf_pr_density(
     # Get total merged PRs
     total_query = f"repo:{owner}/{repo} is:pr is:merged"
     total_params = {"q": total_query, "per_page": 1}
-    total_response = requests.get(
-        f"{GITHUB_API}/search/issues",
-        headers=headers,
-        params=total_params,
+    total_response = _gh_get(
+        f"{GITHUB_API}/search/issues", rotator, params=total_params
     )
 
-    if total_response.status_code != 200:
+    if total_response is None or total_response.status_code != 200:
         return 0.0
 
     total_count = total_response.json().get("total_count", 0)
@@ -344,73 +388,152 @@ def estimate_perf_pr_density(
     return perf_count / total_count
 
 
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+def _checkpoint_record(repo: dict) -> dict:
+    """The metadata subset persisted to the crash-recovery sidecar."""
+    return {
+        "full_name": repo["full_name"],
+        "stargazers_count": repo.get("stargazers_count", 0),
+        "_pr_count": repo.get("_pr_count", 0),
+        "_perf_density": repo.get("_perf_density", 0),
+        "_estimated_perf_prs": repo.get("_estimated_perf_prs", 0),
+        "description": repo.get("description", ""),
+        "topics": repo.get("topics", []),
+        "pushed_at": repo.get("pushed_at", ""),
+    }
+
+
+def _append_checkpoint(path: str, lock: threading.Lock, repo: dict) -> None:
+    """Append one passing repo to the crash-recovery sidecar (thread-safe).
+
+    ``write_repos_file`` only writes the final output once, at the very end of
+    ``main()``. A crash mid-validation would otherwise lose the whole pass, so
+    every repo that PASSES is also streamed here immediately as JSONL.
+    """
+    try:
+        with lock:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(_checkpoint_record(repo)) + "\n")
+    except Exception as exc:  # checkpointing must never abort discovery
+        logger.warning("checkpoint append failed for %s: %s", repo.get("full_name"), exc)
+
+
+def _validate_single(
+    repo: dict,
+    rotator: "_TokenRotator",
+    *,
+    min_prs: int,
+    require_tests: bool,
+    require_installable: bool,
+    min_perf_density: float,
+    checkpoint_path: Optional[str],
+    checkpoint_lock: threading.Lock,
+) -> Optional[dict]:
+    """Validate a single repo. Returns the enriched repo dict or ``None``.
+
+    Cheap checks run first so an early reject costs the fewest API calls.
+    """
+    owner = repo["owner"]["login"]
+    name = repo["name"]
+    full_name = repo["full_name"]
+
+    # Check 1: PR count (cheap -- single search query)
+    pr_count = check_pr_count(rotator, owner, name, min_prs)
+    if pr_count < min_prs:
+        logger.info("[%s] \u2717 Insufficient PRs: %d < %d", full_name, pr_count, min_prs)
+        return None
+
+    # Check 2: Installable (cheap -- single contents call)
+    if require_installable and not check_repo_installable(rotator, owner, name):
+        logger.info("[%s] \u2717 Not installable (no setup.py/pyproject.toml)", full_name)
+        return None
+
+    # Check 3: Has tests (cheap -- single contents call, often cached)
+    if require_tests and not check_repo_has_tests(rotator, owner, name):
+        logger.info("[%s] \u2717 No test infrastructure detected", full_name)
+        return None
+
+    # Check 4: Performance PR density (2 search queries)
+    perf_density = estimate_perf_pr_density(rotator, owner, name)
+    if perf_density < min_perf_density:
+        logger.info(
+            "[%s] \u2717 Low perf PR density: %.3f < %s",
+            full_name, perf_density, min_perf_density,
+        )
+        return None
+
+    # Passed all checks
+    repo["_pr_count"] = pr_count
+    repo["_perf_density"] = perf_density
+    repo["_estimated_perf_prs"] = int(pr_count * perf_density)
+    if checkpoint_path:
+        _append_checkpoint(checkpoint_path, checkpoint_lock, repo)
+    logger.info(
+        "[%s] \u2713 PASS - PRs:%d, perf_density:%.3f, est_perf_prs:%d",
+        full_name, pr_count, perf_density, repo["_estimated_perf_prs"],
+    )
+    return repo
+
+
 def validate_repos(
     repos: list[dict],
-    token: str,
+    rotator: "_TokenRotator",
     min_prs: int = DEFAULT_MIN_PRS,
     require_tests: bool = True,
     require_installable: bool = True,
     min_perf_density: float = 0.01,
+    checkpoint_path: Optional[str] = None,
+    max_workers: Optional[int] = None,
 ) -> list[dict]:
     """
-    Validate candidate repos against SWE-fficiency requirements.
-    Each check costs API calls, so we do cheap checks first.
+    Validate candidate repos against SWE-fficiency requirements, in parallel.
+
+    Validation is the dominant API cost, so it is fanned out across a thread
+    pool. Worker count defaults to the number of tokens in ``rotator`` because
+    each in-flight request consumes one token's rate-limit budget; the
+    round-robin rotator keeps the load balanced across every PAT.
 
     Returns repos enriched with validation metadata.
     """
-    validated = []
+    if max_workers is None:
+        max_workers = max(1, rotator.size)
 
-    for i, repo in enumerate(repos):
-        owner = repo["owner"]["login"]
-        name = repo["name"]
-        full_name = repo["full_name"]
+    # Fresh run: discard any stale checkpoint sidecar from a previous attempt.
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
+    checkpoint_lock = threading.Lock()
 
-        logger.info(
-            f"[{i+1}/{len(repos)}] Validating {full_name} "
-            f"(⭐{repo['stargazers_count']})"
-        )
-
-        # Check 1: PR count (cheap — single search query)
-        pr_count = check_pr_count(token, owner, name, min_prs)
-        time.sleep(1)
-
-        if pr_count < min_prs:
-            logger.info(f"  ✗ Insufficient PRs: {pr_count} < {min_prs}")
-            continue
-
-        # Check 2: Installable (cheap — single contents call)
-        if require_installable:
-            if not check_repo_installable(token, owner, name):
-                logger.info(f"  ✗ Not installable (no setup.py/pyproject.toml)")
+    validated: list[dict] = []
+    logger.info(
+        "Validating %d repos with %d worker(s) over %d token(s)",
+        len(repos), max_workers, rotator.size,
+    )
+    with ThreadPoolExecutor(max_workers=max_workers) as exe:
+        futs = {
+            exe.submit(
+                _validate_single,
+                repo,
+                rotator,
+                min_prs=min_prs,
+                require_tests=require_tests,
+                require_installable=require_installable,
+                min_perf_density=min_perf_density,
+                checkpoint_path=checkpoint_path,
+                checkpoint_lock=checkpoint_lock,
+            ): repo["full_name"]
+            for repo in repos
+        }
+        for fut in as_completed(futs):
+            try:
+                result = fut.result()
+            except Exception:
+                logger.exception("validation worker raised for %s", futs[fut])
                 continue
-            time.sleep(1)
-
-        # Check 3: Has tests (cheap — single contents call, often cached)
-        if require_tests:
-            if not check_repo_has_tests(token, owner, name):
-                logger.info(f"  ✗ No test infrastructure detected")
-                continue
-            time.sleep(1)
-
-        # Check 4: Performance PR density (2 search queries)
-        perf_density = estimate_perf_pr_density(token, owner, name)
-        time.sleep(2)
-
-        if perf_density < min_perf_density:
-            logger.info(
-                f"  ✗ Low perf PR density: {perf_density:.3f} < {min_perf_density}"
-            )
-            continue
-
-        # Passed all checks
-        repo["_pr_count"] = pr_count
-        repo["_perf_density"] = perf_density
-        repo["_estimated_perf_prs"] = int(pr_count * perf_density)
-        validated.append(repo)
-        logger.info(
-            f"  ✓ PASS — PRs:{pr_count}, perf_density:{perf_density:.3f}, "
-            f"est_perf_prs:{repo['_estimated_perf_prs']}"
-        )
+            if result is not None:
+                validated.append(result)
 
     return validated
 
@@ -427,7 +550,7 @@ def write_repos_file(repos: list[dict], output: str, format: str = "simple") -> 
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
 
     if format == "json":
-        with open(output, "w") as f:
+        with open(output, "w", encoding="utf-8") as f:
             json.dump(
                 [
                     {
@@ -450,7 +573,7 @@ def write_repos_file(repos: list[dict], output: str, format: str = "simple") -> 
         repos_sorted = sorted(
             repos, key=lambda r: r.get("_estimated_perf_prs", 0), reverse=True
         )
-        with open(output, "w") as f:
+        with open(output, "w", encoding="utf-8") as f:
             f.write(
                 "# Auto-discovered repos for SWE-fficiency pipeline\n"
                 f"# Generated: {datetime.now().isoformat()}\n"
@@ -463,14 +586,29 @@ def write_repos_file(repos: list[dict], output: str, format: str = "simple") -> 
                 stars = r["stargazers_count"]
                 est = r.get("_estimated_perf_prs", 0)
                 density = r.get("_perf_density", 0)
-                f.write(f"{r['full_name']}  # ⭐{stars} | ~{est} perf PRs | {density:.1%}\n")
+                f.write(f"{r['full_name']}  # \u2b50{stars} | ~{est} perf PRs | {density:.1%}\n")
     else:
         # Simple: one per line
-        with open(output, "w") as f:
+        with open(output, "w", encoding="utf-8") as f:
             for r in repos:
                 f.write(f"{r['full_name']}\n")
 
     logger.info(f"Wrote {len(repos)} repos to {output} (format={format})")
+
+
+def _resolve_tokens(cli_token: Optional[str]) -> list[str]:
+    """Collect every available GitHub PAT for round-robin rotation.
+
+    Precedence: ``--token`` (accepts a single PAT or a comma-separated list),
+    else ``GITHUB_TOKENS`` (comma-separated), else ``GITHUB_TOKEN`` (single).
+    """
+    raw = (
+        cli_token
+        or os.environ.get("GITHUB_TOKENS")
+        or os.environ.get("GITHUB_TOKEN")
+        or ""
+    )
+    return [t.strip() for t in raw.split(",") if t.strip()]
 
 
 def main():
@@ -535,27 +673,31 @@ def main():
         "--include-existing",
         type=str,
         default=None,
-        help="Path to existing repos file — include these without re-validation",
+        help="Path to existing repos file - include these without re-validation",
     )
     parser.add_argument(
         "--token",
         type=str,
         default=None,
-        help="GitHub token (default: GITHUB_TOKEN env var)",
+        help="GitHub token, or comma-separated list of tokens "
+        "(default: GITHUB_TOKENS / GITHUB_TOKEN env var)",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help="Parallel validation workers (default: number of tokens)",
     )
 
     args = parser.parse_args()
 
-    token = args.token or os.environ.get("GITHUB_TOKEN")
-    if not token:
-        # Try GITHUB_TOKENS (comma-separated), take first
-        tokens = os.environ.get("GITHUB_TOKENS", "")
-        if tokens:
-            token = tokens.split(",")[0].strip()
-    if not token:
+    tokens = _resolve_tokens(args.token)
+    if not tokens:
         raise ValueError(
-            "No GitHub token. Set GITHUB_TOKEN or pass --token."
+            "No GitHub token. Set GITHUB_TOKEN/GITHUB_TOKENS or pass --token."
         )
+    rotator = _TokenRotator(tokens)
+    logger.info("Token rotator initialised with %d PAT(s)", rotator.size)
 
     # Step 1: Search for candidate repos
     logger.info(
@@ -563,7 +705,7 @@ def main():
         f"active within {args.activity_months}mo, max={args.max_repos}"
     )
     candidates = search_repos(
-        token=token,
+        rotator,
         min_stars=args.min_stars,
         max_repos=args.max_repos * 3,  # Over-fetch since validation filters many
         activity_months=args.activity_months,
@@ -575,9 +717,11 @@ def main():
         logger.info(f"Validating {len(candidates)} candidates...")
         validated = validate_repos(
             repos=candidates,
-            token=token,
+            rotator=rotator,
             min_prs=args.min_prs,
             min_perf_density=args.min_perf_density,
+            checkpoint_path=args.output + ".partial.jsonl",
+            max_workers=args.max_workers,
         )
     else:
         validated = candidates
@@ -586,7 +730,7 @@ def main():
     # Step 3: Include existing repos if specified
     if args.include_existing and os.path.exists(args.include_existing):
         existing = set()
-        with open(args.include_existing) as f:
+        with open(args.include_existing, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#"):

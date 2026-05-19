@@ -45,14 +45,122 @@ MAX_HTTP_RETRIES = int(os.environ.get("SWEFF_MAX_HTTP_RETRIES", "8"))
 # completes and humans can triage afterwards instead of silently dropping data.
 _DLQ_DIR = Path(os.environ.get("SWEFF_DLQ_DIR", "artifacts/dlq"))
 _DLQ_LOCK = threading.Lock()
+try:
+    import fcntl  # POSIX-only; locks DLQ appends across processes.
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
 
 
 class TokenStuckError(Exception):
     """Raised when a GitHub token appears revoked or permanently rate-limited."""
 
+class RepoRateLimitError(Exception):
+    """Raised when one repo's API calls keep getting rate-limited and token
+    rotation did not recover within the bounded retry budget. This is
+    PER-REPO (the token subset is still healthy) -- the orchestrator DLQs
+    just this repo and continues, unlike TokenStuckError."""
+
 
 class PatchFetchError(Exception):
     """Raised when a patch cannot be fetched from GitHub after retries."""
+
+def _tok_prefix(t: Optional[str]) -> str:
+    return t[:10] if t else "<none>"
+
+
+class _TokenRotator:
+    """Round-robin GitHub-PAT pool with per-token cooldown tracking.
+
+    Each worker process owns one rotator over a private, disjoint subset of
+    tokens. On HTTP 403 the active token is cooled until its rate-limit reset
+    (or dropped, if revoked) and the rotator advances. Only when every live
+    token is cooling does it sleep, and then only until the earliest reset.
+    A bare token string (or None) is accepted and wrapped as a 1-token pool.
+    """
+
+    def __init__(self, tokens) -> None:
+        if isinstance(tokens, _TokenRotator):
+            raise TypeError("pass the rotator directly, do not re-wrap it")
+        if not isinstance(tokens, (list, tuple)):
+            # Wrap a bare scalar (str / None / anything) as a 1-token pool.
+            tokens = [tokens]
+        tokens = list(tokens) if tokens else [None]
+        self._tokens = tokens
+        self._idx = 0
+        self._cooling: dict = {}
+        self._dropped: set = set()
+        self._apis: dict = {}
+        self._lock = threading.RLock()
+
+    def _api_for(self, token):
+        api = self._apis.get(token)
+        if api is None:
+            api = GhApi(token=token)
+            self._apis[token] = api
+        return api
+
+    def current(self):
+        with self._lock:
+            return self._tokens[self._idx]
+
+    def current_api(self):
+        with self._lock:
+            return self._api_for(self._tokens[self._idx])
+
+    def mark_cooling(self, token, until_ts) -> None:
+        with self._lock:
+            self._cooling[token] = max(self._cooling.get(token, 0), until_ts)
+
+    def drop(self, token) -> None:
+        with self._lock:
+            self._dropped.add(token)
+            self._cooling.pop(token, None)
+
+    def _live(self):
+        return [t for t in self._tokens if t not in self._dropped]
+
+    def advance(self):
+        """Advance to the next usable token. Sleep if all live tokens are
+        cooling. Raise TokenStuckError if every token is dropped."""
+        with self._lock:
+            if not self._live():
+                raise TokenStuckError("all GitHub tokens in subset revoked")
+            now = time.time()
+            n = len(self._tokens)
+            for step in range(1, n + 1):
+                cand = (self._idx + step) % n
+                tok = self._tokens[cand]
+                if tok in self._dropped or self._cooling.get(tok, 0) > now:
+                    continue
+                self._idx = cand
+                return tok
+            soonest = min(self._cooling.get(t, now) for t in self._live())
+            sleep_for = max(0.0, soonest - now) + 1.0
+        logger.warning("All tokens in subset cooling; sleeping %.0fs", sleep_for)
+        time.sleep(sleep_for)
+        with self._lock:
+            now = time.time()
+            for t in [t for t, u in list(self._cooling.items()) if u <= now]:
+                del self._cooling[t]
+            n = len(self._tokens)
+            # Prefer a token that is neither dropped nor still cooling.
+            for step in range(0, n):
+                cand = (self._idx + step) % n
+                tok = self._tokens[cand]
+                if tok not in self._dropped and self._cooling.get(tok, 0) <= now:
+                    self._idx = cand
+                    return tok
+            # Fallback: any non-dropped token (may still be cooling).
+            for step in range(0, n):
+                cand = (self._idx + step) % n
+                if self._tokens[cand] not in self._dropped:
+                    self._idx = cand
+                    return self._tokens[cand]
+            raise TokenStuckError("all GitHub tokens in subset revoked")
+
+    @property
+    def size(self) -> int:
+        return len(self._tokens)
 
 
 def write_to_dlq(filename: str, record: dict) -> None:
@@ -66,8 +174,18 @@ def write_to_dlq(filename: str, record: dict) -> None:
     try:
         with _DLQ_LOCK:
             _DLQ_DIR.mkdir(parents=True, exist_ok=True)
-            with (_DLQ_DIR / filename).open("a") as f:
-                f.write(json.dumps(record) + "\n")
+            line = json.dumps(record) + "\n"
+            with (_DLQ_DIR / filename).open("a", encoding="utf-8") as f:
+                # Cross-process lock: ProcessPool workers each hold their own
+                # _DLQ_LOCK, and a record (with traceback) can exceed PIPE_BUF,
+                # so a bare append may interleave into corrupt JSONL.
+                if fcntl is not None:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    f.write(line)
+                finally:
+                    if fcntl is not None:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
     except Exception as exc:
         # DLQ write must never crash the pipeline. Surface to stderr only.
         logger.error(f"DLQ write failed for {filename}: {exc}")
@@ -85,9 +203,8 @@ class Repo:
         """
         self.owner = owner
         self.name = name
-        self.token = token
-        self.api = GhApi(token=token)
-        self.repo = self.call_api(self.api.repos.get, owner=owner, repo=name)
+        self._rotator = token if isinstance(token, _TokenRotator) else _TokenRotator(token)
+        self.repo = self.call_api(lambda api: api.repos.get(owner=owner, repo=name))
         # GitHub API may redirect to a fork if the token owner has one.
         # Force canonical owner/name to prevent fork resolution issues.
         if self.repo is not None:
@@ -98,65 +215,85 @@ class Repo:
                     f"(token user's fork). Forcing canonical name."
                 )
                 self.repo.full_name = canonical
-                self.repo.owner.login = owner
+                if getattr(self.repo, "owner", None) is not None:
+                    self.repo.owner.login = owner
                 self.repo.name = name
 
-    def call_api(self, func: Callable, **kwargs) -> dict | None:
-        """
-        API call wrapper with bounded rate limit handling.
+    @property
+    def api(self):
+        """GhApi bound to the rotator's currently-active token."""
+        return self._rotator.current_api()
 
-        Sleeps up to MAX_RATE_LIMIT_RETRIES * RATE_LIMIT_SLEEP_SECONDS (default
-        1 hour) for a stuck token before raising TokenStuckError. This prevents
-        a single revoked token from hanging the entire pipeline.
+    @property
+    def token(self):
+        """The currently-active GitHub token (str or None)."""
+        return self._rotator.current()
 
-        Args:
-            func (callable): API function to call
-            **kwargs: keyword arguments to pass to API function
-        Return:
-            values (dict): response object of `func`
+    current_token = token
+
+    def call_api(self, fn: Callable):
+        """Invoke a GhApi call with token-rotation rate-limit handling.
+
+        ``fn`` receives the rotator's active ``GhApi`` and makes one call. On
+        HTTP 403 the active token is cooled (or dropped if revoked) and the
+        rotator advances to a fresh token; the call is retried. Raises
+        TokenStuckError only when the worker's whole token subset is exhausted.
         """
-        call_attempts = 0
-        while call_attempts < MAX_RATE_LIMIT_RETRIES:
+        max_rotations = max(2, self._rotator.size * 2)
+        for _ in range(max_rotations):
             try:
-                return func(**kwargs)
-            except HTTP403ForbiddenError:
-                for attempt in range(MAX_RATE_LIMIT_RETRIES):
-                    try:
-                        rl = self.api.rate_limit.get()
-                        remaining = rl.resources.core.remaining
-                    except Exception as exc:
-                        logger.warning(
-                            f"[{self.owner}/{self.name}] rate_limit.get() failed: {exc}"
-                        )
-                        remaining = 0
-                    logger.info(
-                        f"[{self.owner}/{self.name}] Rate limit exceeded for token {self.token[:10]}, "
-                        f"attempt {attempt + 1}/{MAX_RATE_LIMIT_RETRIES}, remaining calls: {remaining}"
-                    )
-                    if remaining > 0:
-                        break
-                    time.sleep(RATE_LIMIT_SLEEP_SECONDS)
-                else:
-                    write_to_dlq(
-                        "token_stuck.jsonl",
-                        {
-                            "repo": f"{self.owner}/{self.name}",
-                            "token_prefix": self.token[:10] if self.token else None,
-                            "reason": "call_api rate-limit exhausted",
-                        },
-                    )
-                    raise TokenStuckError(
-                        f"Token {self.token[:10] if self.token else '<none>'} appears revoked: "
-                        f"rate limit never reset after {MAX_RATE_LIMIT_RETRIES} retries"
-                    )
-                call_attempts += 1
+                return fn(self.api)
             except HTTP404NotFoundError:
-                logger.info(f"[{self.owner}/{self.name}] Resource not found {kwargs}")
+                logger.info(f"[{self.owner}/{self.name}] Resource not found")
                 return None
-        # call_attempts exhausted (e.g. repeated 403s without rate-limit recovery)
-        raise TokenStuckError(
-            f"call_api gave up after {MAX_RATE_LIMIT_RETRIES} attempts for "
-            f"{self.owner}/{self.name}: {func.__name__}"
+            except HTTP403ForbiddenError:
+                self._cool_or_drop_current()
+                self._rotator.advance()
+        raise RepoRateLimitError(
+            f"call_api exhausted token rotations for {self.owner}/{self.name}"
+        )
+
+    def _cool_or_drop_current(self) -> None:
+        """Classify a 403 on the active token: cool it (rate-limited) or drop
+        it (revoked). If rate_limit.get() itself fails, treat as revoked."""
+        tok = self._rotator.current()
+        try:
+            rl = self.api.rate_limit.get()
+        except Exception as exc:
+            # The rate_limit endpoint itself failed -> token revoked/invalid.
+            logger.warning(
+                f"[{self.owner}/{self.name}] rate_limit.get() failed for token "
+                f"{_tok_prefix(tok)}: {exc}; treating token as revoked"
+            )
+            write_to_dlq("token_stuck.jsonl", {
+                "repo": f"{self.owner}/{self.name}",
+                "token_prefix": _tok_prefix(tok),
+                "reason": "rate_limit.get failed - token revoked",
+            })
+            self._rotator.drop(tok)
+            return
+        core = getattr(getattr(rl, "resources", None), "core", None)
+        try:
+            remaining = int(getattr(core, "remaining", 0) or 0)
+        except (TypeError, ValueError):
+            remaining = 0
+        try:
+            reset = int(getattr(core, "reset", 0) or 0)
+        except (TypeError, ValueError):
+            reset = 0
+        if remaining > 0:
+            # Quota remains: a 403 here is GitHub's SECONDARY (abuse) rate
+            # limit -- routine in a large scrape. It MUST back off, so cool
+            # the token ~60s; the rotator then moves to a fresh token (or, on
+            # a 1-token pool, sleeps rather than hot-spinning into a spurious
+            # RepoRateLimitError).
+            cool_until = time.time() + 60
+        else:
+            cool_until = reset + 5 if reset > time.time() else time.time() + 60
+        self._rotator.mark_cooling(tok, cool_until)
+        logger.info(
+            f"[{self.owner}/{self.name}] token {_tok_prefix(tok)} "
+            f"rate-limited; cooling ~{int(cool_until - time.time())}s, rotating"
         )
 
     def extract_resolved_issues(self, pull: dict) -> list[str]:
@@ -187,7 +324,9 @@ class Repo:
         text = pull.title if pull.title else ""
         text += "\n" + (pull.body if pull.body else "")
         commits = self.get_all_loop(
-            self.api.pulls.list_commits, pull_number=pull.number, quiet=True
+            lambda api, **kw: api.pulls.list_commits(**kw),
+            pull_number=pull.number,
+            quiet=True,
         )
         commit_messages = [commit.commit.message for commit in commits]
         commit_text = "\n".join(commit_messages) if commit_messages else ""
@@ -205,89 +344,63 @@ class Repo:
 
     def get_all_loop(
         self,
-        func: Callable,
+        fn: Callable,
         per_page: int = 100,
         num_pages: Optional[int] = None,
         quiet: bool = False,
         **kwargs,
     ) -> Iterator:
-        """
-        Return all values from a paginated API endpoint.
+        """Yield all values from a paginated endpoint, rotating tokens on 403.
 
-        Args:
-            func (callable): API function to call
-            per_page (int): number of values to return per page
-            num_pages (int): number of pages to return
-            quiet (bool): whether to print progress
-            **kwargs: keyword arguments to pass to API function
-        """
+        ``fn`` receives ``(api, **call_kwargs)`` and returns one page. On a
+        rate-limit error the current page is re-issued with a fresh token
+        (``page`` is NOT advanced)."""
         page = 1
-        args = {
-            "owner": self.owner,
-            "repo": self.name,
-            "per_page": per_page,
-            **kwargs,
-        }
+        args = {"owner": self.owner, "repo": self.name, "per_page": per_page, **kwargs}
+        rotations = 0
+        max_rotations = max(2, self._rotator.size * 2)
+        values = []
         while True:
             try:
-                # Get values from API call
-                values = func(**args, page=page)
+                values = fn(self.api, **args, page=page)
                 yield from values
                 if len(values) == 0:
                     break
                 if not quiet:
-                    rl = self.api.rate_limit.get()
                     logger.info(
-                        f"[{self.owner}/{self.name}] Processed page {page} ({per_page} values per page). "
-                        f"Remaining calls: {rl.resources.core.remaining}"
+                        f"[{self.owner}/{self.name}] Processed page {page} "
+                        f"({per_page}/page)"
                     )
                 if num_pages is not None and page >= num_pages:
                     break
                 page += 1
+                rotations = 0
             except (HTTP403ForbiddenError, requests.exceptions.HTTPError) as e:
-                # Rate-limit path: bounded retry, then DLQ + raise.
                 logger.warning(
-                    f"[{self.owner}/{self.name}] HTTP/rate-limit error on page {page} "
-                    f"w/ token {self.token[:10]} - {e}"
+                    f"[{self.owner}/{self.name}] rate-limit on page {page} w/ "
+                    f"token {_tok_prefix(self._rotator.current())} - {e}"
                 )
-                for attempt in range(MAX_RATE_LIMIT_RETRIES):
-                    try:
-                        rl = self.api.rate_limit.get()
-                        remaining = rl.resources.core.remaining
-                    except Exception as inner:
-                        logger.warning(
-                            f"[{self.owner}/{self.name}] rate_limit.get() failed: {inner}"
-                        )
-                        remaining = 0
-                    if remaining > 0:
-                        break
-                    logger.info(
-                        f"[{self.owner}/{self.name}] Waiting for rate limit reset "
-                        f"for token {self.token[:10]} (attempt {attempt + 1}/{MAX_RATE_LIMIT_RETRIES})"
-                    )
-                    time.sleep(RATE_LIMIT_SLEEP_SECONDS)
-                else:
-                    write_to_dlq(
-                        "token_stuck.jsonl",
-                        {
-                            "repo": f"{self.owner}/{self.name}",
-                            "token_prefix": self.token[:10] if self.token else None,
-                            "page": page,
-                            "reason": "get_all_loop rate-limit exhausted",
-                        },
-                    )
-                    raise TokenStuckError(
-                        f"Token {self.token[:10] if self.token else '<none>'} appears revoked"
+                self._cool_or_drop_current()
+                self._rotator.advance()
+                rotations += 1
+                if rotations > max_rotations:
+                    write_to_dlq("repo_rate_limited.jsonl", {
+                        "repo": f"{self.owner}/{self.name}", "page": page,
+                        "reason": "get_all_loop exhausted token rotations",
+                    })
+                    raise RepoRateLimitError(
+                        f"get_all_loop exhausted token rotations for "
+                        f"{self.owner}/{self.name}"
                     )
             except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-                # Network-level failures: short backoff, do not exhaust the rate-limit budget.
                 logger.warning(
-                    f"[{self.owner}/{self.name}] Network error on page {page}: {e}; backing off 30s"
+                    f"[{self.owner}/{self.name}] Network error on page {page}: "
+                    f"{e}; backing off 30s"
                 )
                 time.sleep(30)
         if not quiet:
             logger.info(
-                f"[{self.owner}/{self.name}] Processed {(page-1)*per_page + len(values)} values"
+                f"[{self.owner}/{self.name}] Finished pagination at page {page}"
             )
 
     def get_all_issues(
@@ -311,7 +424,7 @@ class Repo:
             quiet (bool): whether to print progress
         """
         issues = self.get_all_loop(
-            self.api.issues.list_for_repo,
+            lambda api, **kw: api.issues.list_for_repo(**kw),
             num_pages=num_pages,
             per_page=per_page,
             direction=direction,
@@ -342,7 +455,7 @@ class Repo:
             quiet (bool): whether to print progress
         """
         pulls = self.get_all_loop(
-            self.api.pulls.list,
+            lambda api, **kw: api.pulls.list(**kw),
             num_pages=num_pages,
             direction=direction,
             per_page=per_page,
@@ -370,10 +483,9 @@ def extract_problem_statement_and_hints(pull: dict, repo: Repo) -> tuple[str, st
     all_hint_texts = list()
     for issue_number in pull["resolved_issues"]:
         issue = repo.call_api(
-            repo.api.issues.get,
-            owner=repo.owner,
-            repo=repo.name,
-            issue_number=issue_number,
+            lambda api: api.issues.get(
+                owner=repo.owner, repo=repo.name, issue_number=issue_number
+            )
         )
         if issue is None:
             continue
@@ -400,7 +512,7 @@ def _extract_hints(pull: dict, repo: Repo, issue_number: int) -> list[str]:
     """
     # Get all commits in PR
     commits = repo.get_all_loop(
-        repo.api.pulls.list_commits, pull_number=pull["number"], quiet=True
+        lambda api, **kw: api.pulls.list_commits(**kw), pull_number=pull["number"], quiet=True
     )
     commits = list(commits)
     if len(commits) == 0:
@@ -411,7 +523,7 @@ def _extract_hints(pull: dict, repo: Repo, issue_number: int) -> list[str]:
     commit_time = time.mktime(time.strptime(commit_time, "%Y-%m-%dT%H:%M:%SZ"))
     # Get all comments in PR
     all_comments = repo.get_all_loop(
-        repo.api.issues.list_comments, issue_number=issue_number, quiet=True
+        lambda api, **kw: api.issues.list_comments(**kw), issue_number=issue_number, quiet=True
     )
     all_comments = list(all_comments)
     # Iterate through all comments, only keep comments created before first commit
@@ -430,7 +542,7 @@ def _extract_hints(pull: dict, repo: Repo, issue_number: int) -> list[str]:
     return comments
 
 
-def send_request_with_rate_limit_handling(url, headers=None, params=None, timeout: int = 30):
+def send_request_with_rate_limit_handling(url, headers=None, params=None, timeout: int = 30, rotator=None):
     """GET with bounded retries on rate-limit and transient errors.
 
     Raises:
@@ -441,6 +553,8 @@ def send_request_with_rate_limit_handling(url, headers=None, params=None, timeou
     last_exc: Optional[Exception] = None
 
     for attempt in range(MAX_HTTP_RETRIES):
+        if rotator is not None:
+            headers = {**(headers or {}), "Authorization": f"Bearer {rotator.current()}"}
         try:
             response = requests.get(url, headers=headers, params=params, timeout=timeout)
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
@@ -473,6 +587,9 @@ def send_request_with_rate_limit_handling(url, headers=None, params=None, timeou
                 f"attempt {attempt + 1}/{MAX_HTTP_RETRIES}); sleeping {sleep_for}s"
             )
             time.sleep(sleep_for)
+            if rotator is not None:
+                rotator.mark_cooling(rotator.current(), time.time() + sleep_for)
+                rotator.advance()
             last_exc = requests.HTTPError(f"{response.status_code} on {url}")
             continue
 
@@ -502,7 +619,7 @@ def extract_patches(pull: dict, repo: Repo) -> tuple[str, str]:
         "X-GitHub-Api-Version": "2022-11-28",
     }
     try:
-        patch = send_request_with_rate_limit_handling(pull["url"], headers=headers)
+        patch = send_request_with_rate_limit_handling(pull["url"], headers=headers, rotator=repo._rotator)
     except (PatchFetchError, requests.exceptions.RequestException, requests.exceptions.HTTPError) as e:
         # Surface the failure to the DLQ so it can be retried/triaged later,
         # then return None sentinels so the caller can distinguish 'fetch
@@ -566,7 +683,7 @@ def extract_problem_statement_and_hints_django(
 
         # Get time of first commit in PR
         commits = repo.get_all_loop(
-            repo.api.pulls.list_commits, pull_number=pull["number"], quiet=True
+            lambda api, **kw: api.pulls.list_commits(**kw), pull_number=pull["number"], quiet=True
         )
         commits = list(commits)
         if len(commits) == 0:
