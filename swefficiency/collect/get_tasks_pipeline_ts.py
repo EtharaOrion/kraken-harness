@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Optional
 
 from swefficiency.collect.build_dataset_ts import build_dataset_ts
-from swefficiency.collect.discover_repos_ts import _TokenRotator
+from swefficiency.collect.utils import _TokenRotator
 from swefficiency.collect.print_pulls import main as print_pulls
 from swefficiency.collect.utils import write_to_dlq
 

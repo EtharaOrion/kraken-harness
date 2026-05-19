@@ -496,40 +496,77 @@ def validate_repos(
     require_tests: bool,
     skip_pr_count: bool = False,
     max_workers: Optional[int] = None,
+    stream_path: Optional[str] = None,
 ) -> list[dict]:
     """Validate ``repos`` in parallel. Returns the enriched, passing subset.
 
     Worker count defaults to the number of tokens in ``rotator`` since each
     in-flight request consumes one token's rate-limit budget.
+
+    When ``stream_path`` is provided, every repo that passes validation is
+    appended to that path as a single JSONL row immediately (flush + fsync
+    per row) so partial progress survives a crash and external observers can
+    tail the file in real time. The final ``write_output`` call still emits
+    the canonical batched output; the stream is a sidecar.
     """
     if max_workers is None:
         max_workers = max(1, rotator.size)
     out: list[dict] = []
+
+    stream_f = None
+    stream_lock = threading.Lock()
+    if stream_path:
+        parent = os.path.dirname(stream_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        stream_f = open(stream_path, "w", encoding="utf-8")
+        logger.info("Streaming validated repos to %s (real-time append)", stream_path)
+
     logger.info(
         "Validating %d repos with %d worker(s) over %d token(s); skip_pr_count=%s",
         len(repos), max_workers, rotator.size, skip_pr_count,
     )
-    with ThreadPoolExecutor(max_workers=max_workers) as exe:
-        futs = {
-            exe.submit(
-                _validate_single,
-                repo,
-                rotator,
-                min_prs=min_prs,
-                require_ts_root=require_ts_root,
-                require_tests=require_tests,
-                skip_pr_count=skip_pr_count,
-            ): repo["full_name"]
-            for repo in repos
-        }
-        for fut in as_completed(futs):
-            try:
-                result = fut.result()
-            except Exception:
-                logger.exception("validation worker raised for %s", futs[fut])
-                continue
-            if result is not None:
-                out.append(result)
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as exe:
+            futs = {
+                exe.submit(
+                    _validate_single,
+                    repo,
+                    rotator,
+                    min_prs=min_prs,
+                    require_ts_root=require_ts_root,
+                    require_tests=require_tests,
+                    skip_pr_count=skip_pr_count,
+                ): repo["full_name"]
+                for repo in repos
+            }
+            for fut in as_completed(futs):
+                try:
+                    result = fut.result()
+                except Exception:
+                    logger.exception("validation worker raised for %s", futs[fut])
+                    continue
+                if result is not None:
+                    out.append(result)
+                    if stream_f is not None:
+                        with stream_lock:
+                            stream_f.write(json.dumps({
+                                "full_name": result["full_name"],
+                                "stars": result.get("stargazers_count", 0),
+                                "license": result.get("_license_spdx", ""),
+                                "merged_prs": result.get("_merged_prs", 0),
+                                "description": result.get("description", ""),
+                                "topics": result.get("topics", []),
+                                "pushed_at": result.get("pushed_at", ""),
+                            }) + "\n")
+                            stream_f.flush()
+                            try:
+                                os.fsync(stream_f.fileno())
+                            except OSError:
+                                pass
+    finally:
+        if stream_f is not None:
+            stream_f.close()
     return out
 
 
@@ -706,6 +743,7 @@ def main(argv: Optional[list] = None) -> int:
             require_tests=args.require_tests,
             skip_pr_count=args.no_pr_count,
             max_workers=args.max_workers,
+            stream_path=str(args.output) + ".stream.jsonl",
         )
 
     validated = validated[: args.max_repos]
