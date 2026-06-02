@@ -44,6 +44,25 @@ LiteLLM-resolved; per-provider defaults. Override with `llm.api_key_env` in conf
 | `HF_TOKEN` | Hugging Face Router |
 | `TOGETHER_API_KEY` | Together |
 | `GROQ_API_KEY` | Groq |
+| `AWS_BEARER_TOKEN_BEDROCK` | AWS Bedrock (or `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_REGION_NAME`) |
+
+### Cost tracking override (for unmappable models)
+
+litellm prices a call by looking the model name up in its static `model_cost`
+table. Opaque Bedrock **application-inference-profile ARNs** aren't in that
+table, so `completion_cost` raises and `cost_usd` falls back to `0.0` — which
+silently disables the `max_llm_spend_usd` budget cap. Set these to price calls
+from the real token counts instead (a loud warning is logged if neither native
+pricing nor these are available):
+
+| Variable | Meaning |
+|---|---|
+| `R2E_COST_INPUT_PER_1M` | USD per 1M **input** tokens (e.g. `5` for Claude Opus 4.7 global profile) |
+| `R2E_COST_OUTPUT_PER_1M` | USD per 1M **output** tokens (e.g. `25` for Claude Opus 4.7 global profile) |
+
+Native litellm pricing takes precedence when available; these are a fallback
+only for models it can't map. Even with them set, prefer `max_iterations` /
+`max_seconds` as hard guards on autonomous loops.
 
 ## Container registry (for `_runtime` image distribution on push)
 

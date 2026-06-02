@@ -73,6 +73,9 @@ def resolve_llm_api_key(provider: str, llm_api_key_env: str | None = None) -> st
         "huggingface": "HF_TOKEN",
         "together": "TOGETHER_API_KEY",
         "groq": "GROQ_API_KEY",
+        # NB: no "bedrock" entry on purpose. Bedrock auth (AWS_BEARER_TOKEN_BEDROCK
+        # or AWS_ACCESS_KEY_ID/SECRET/REGION) is read directly from the env by
+        # litellm/boto3, not passed as an api_key. See ENV_AUTH_PROVIDERS in llm.py.
     }
     env_name = defaults.get(provider.lower())
     if env_name:

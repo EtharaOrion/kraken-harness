@@ -55,6 +55,16 @@ def test_llm_api_key_resolution_explicit_env():
         assert resolve_llm_api_key("anthropic", "MY_KEY") == "custom"
 
 
+def test_llm_api_key_resolution_bedrock_is_unmapped_by_design():
+    # Bedrock is intentionally NOT in the provider->env-var map: its creds
+    # (AWS_BEARER_TOKEN_BEDROCK or AWS_ACCESS_KEY_ID/SECRET/REGION) are read by
+    # litellm/boto3 from the env, never passed as an api_key. So even with a
+    # bearer token present, resolve_llm_api_key returns None — and _do_complete
+    # must not hard-fail for it (see ENV_AUTH_PROVIDERS).
+    with mock.patch.dict(os.environ, {"AWS_BEARER_TOKEN_BEDROCK": "bdrk-xxx"}, clear=True):
+        assert resolve_llm_api_key("bedrock") is None
+
+
 def test_hf_token_falls_back_to_env():
     with mock.patch.dict(os.environ, {"HF_TOKEN": "hf_xxx"}, clear=True):
         # Patch the cache file path so we don't accidentally pick up real cache

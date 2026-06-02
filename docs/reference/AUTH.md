@@ -92,8 +92,42 @@ LiteLLM resolves provider keys from provider-default env vars:
 | Hugging Face Router | `HF_TOKEN` |
 | Together | `TOGETHER_API_KEY` |
 | Groq | `GROQ_API_KEY` |
+| AWS Bedrock | `AWS_BEARER_TOKEN_BEDROCK` *or* `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_REGION_NAME` |
 
 Override with `llm.api_key_env` in your config if you have non-default names.
+
+**Bedrock** is an *env-auth* provider: LiteLLM reads AWS credentials directly
+from the environment, so no `api_key` is passed. It requires the optional
+`boto3` dependency (`pip install 'repo2rlenv[bedrock]'` or `uv sync --extra
+bedrock`). Use it with a model id or an inference-profile ARN:
+
+```bash
+export AWS_BEARER_TOKEN_BEDROCK=...        # Bedrock API key (bearer token)
+# or: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION_NAME
+export AWS_REGION_NAME=ap-south-1
+# Cost tracking (litellm can't price opaque ARNs — see below):
+export R2E_COST_INPUT_PER_1M=5 R2E_COST_OUTPUT_PER_1M=25
+
+repo2rlenv generate --repo <owner>/<repo> --pipeline pr_runtime \
+  --llm "bedrock/converse/arn:aws:bedrock:ap-south-1:<acct>:application-inference-profile/<id>" \
+  --pipeline-opt limit=3 --out ./datasets/<name>
+```
+
+Three things to know for Bedrock inference-profile ARNs:
+
+1. **Use the `converse/` route** for opaque `application-inference-profile`
+   ARNs — `bedrock/converse/<ARN>`. The plain `bedrock/<ARN>` route errors
+   `Unknown provider=None ... try converse route`, because litellm can't infer
+   the base model from the profile id.
+2. **`temperature` is handled automatically.** Opus 4.7+ rejects it, and an
+   opaque ARN hides the model name so it can't be pre-detected. The first call
+   that gets rejected strips `temperature`, retries, and remembers the model
+   for the rest of the run.
+3. **Set `R2E_COST_INPUT_PER_1M` / `R2E_COST_OUTPUT_PER_1M`** (see
+   [`ENV.md`](./ENV.md)). litellm can't price an opaque ARN, so without these
+   `cost_usd` is `0.0` and the `--max-spend-usd` cap is silently inert (a
+   warning is logged). Even with them set, prefer `--max-iterations` /
+   `--max-seconds` as hard guards on the autonomous bootstrap loop.
 
 ### Container registry (image distribution for `_runtime` datasets)
 
