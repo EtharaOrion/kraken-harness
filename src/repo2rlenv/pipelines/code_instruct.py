@@ -48,6 +48,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import ClassVar
 
+import repo2rlenv
 from repo2rlenv.auth import resolve_github_token
 from repo2rlenv.bootstrap.runner import _shallow_clone_at_ref
 from repo2rlenv.bootstrap.spec import BootstrapResult, LanguageHint
@@ -58,6 +59,7 @@ from repo2rlenv.pipelines._oss_instruct import (
     PROMPT_USER_TEMPLATE,
     ParsedTask,
     Seed,
+    extract_task_module_imports,
     has_benchmark_overlap,
     list_source_files,
     parse_task_response,
@@ -66,9 +68,6 @@ from repo2rlenv.pipelines._oss_instruct import (
 )
 from repo2rlenv.pipelines.base import PipelineResult
 from repo2rlenv.pipelines.mutation_bugs import build_mutation_eval_script
-from repo2rlenv.pipelines.pr_runtime import (
-    _path_prelude_for_language,  # noqa: F401  (re-exported via mutation)
-)
 from repo2rlenv.spec.input import GenerationInput, PipelineName
 from repo2rlenv.spec.options import CodeInstructOptions
 
@@ -83,42 +82,115 @@ class _VerifyOutcome:
     post_log: str = ""
 
 
-def _make_two_file_diff(*, task_module_code: str, test_code: str, test_filename: str) -> str:
-    """Build a `git apply`-compatible diff that creates two NEW files at repo root.
+def _make_solution_diff(*, task_module_code: str) -> str:
+    """Gold patch creating only `task_module.py` at the repo root.
 
-    Both files are added (no deletes). The diff has standard `diff --git`
-    + `new file mode` + index + `--- /dev/null` + `+++ b/<path>` headers
-    for each file. Hunk: a single `@@ -0,0 +1,N @@` block.
+    The synthesized grading test is NOT bundled here: Harbor stages
+    solution/ inside the container only for the OracleAgent, so anything
+    placed in this patch is invisible to every non-oracle agent. The test
+    file is shipped under tests/ via HarborTask.aux_files instead, and
+    test.sh copies it into /workspace before pytest runs.
+
+    Raises ValueError on empty/whitespace input — a 0-line hunk produces
+    `@@ -0,0 +1,0 @@` which `git apply` rejects as corrupt.
     """
-
-    def new_file_hunk(content: str, path: str) -> str:
-        lines = content.splitlines()
-        n = len(lines)
-        header = (
-            f"diff --git a/{path} b/{path}\n"
-            f"new file mode 100644\n"
-            f"index 0000000..0000001\n"
-            f"--- /dev/null\n"
-            f"+++ b/{path}\n"
-            f"@@ -0,0 +1,{n} @@\n"
-        )
-        body = "".join(f"+{ln}\n" for ln in lines)
-        if not content.endswith("\n"):
-            body += "\\ No newline at end of file\n"
-        return header + body
-
-    return new_file_hunk(task_module_code, "task_module.py") + new_file_hunk(
-        test_code, test_filename
+    if not task_module_code or not task_module_code.strip():
+        raise ValueError("task_module_code is empty; cannot synthesise gold patch")
+    lines = task_module_code.splitlines()
+    n = len(lines)
+    header = (
+        "diff --git a/task_module.py b/task_module.py\n"
+        "new file mode 100644\n"
+        "index 0000000..0000001\n"
+        "--- /dev/null\n"
+        "+++ b/task_module.py\n"
+        f"@@ -0,0 +1,{n} @@\n"
     )
+    body = "".join(f"+{ln}\n" for ln in lines)
+    if not task_module_code.endswith("\n"):
+        body += "\\ No newline at end of file\n"
+    return header + body
+
+
+_TASK_MODULE_ROUTER_PY = r"""
+import ast
+import os
+import pathlib
+import subprocess
+import sys
+
+ROOT = pathlib.Path(os.environ.get("R2E_ROUTER_ROOT", "/workspace"))
+TARGET = ROOT / "task_module.py"
+if TARGET.exists():
+    sys.exit(0)
+
+NAMES = __NAMES__
+try:
+    proc = subprocess.run(
+        ["git", "-C", str(ROOT), "ls-files", "--others", "--exclude-standard", "--modified"],
+        capture_output=True, text=True, check=False, timeout=15,
+    )
+    rel_paths = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip().endswith(".py")]
+except Exception:
+    rel_paths = []
+
+for rel in rel_paths:
+    p = ROOT / rel
+    if not p.is_file():
+        continue
+    if p.name in ("task_module.py", "conftest.py"):
+        continue
+    if p.name.startswith("test_") or p.name.endswith("_test.py"):
+        continue
+    try:
+        tree = ast.parse(p.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        continue
+    # Top-level defs only: `from <mod> import *` does not expose nested names,
+    # so a nested method named `render_frames` is NOT a valid routing target.
+    defs = {n.name for n in tree.body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+    matched = sorted(set(NAMES) & defs)
+    if matched:
+        mod = pathlib.Path(rel).with_suffix("").as_posix().replace("/", ".")
+        TARGET.write_text("from " + mod + " import *\n")
+        sys.stderr.write("[task_module_router] -> " + mod + " (matched=" + repr(matched) + ")\n")
+        break
+
+sys.exit(0)
+""".strip()
+
+
+def _build_task_module_router(expected_names: list[str]) -> str:
+    """Return a SINGLE shell command that synthesises `task_module.py` at runtime.
+
+    Baked into `tests/test.sh` between the test-file copy and the pytest
+    invocation. Reads agent-added files via `git ls-files --others
+    --exclude-standard --modified` so it never picks up the repo's own
+    pre-existing code (the bootstrap image clones the target repo into
+    /workspace; aws-cli for example has thousands of .py files). Always
+    exits 0 — if no agent file defines any expected name, pytest will
+    fail naturally with ModuleNotFoundError and the agent earns reward 0.
+
+    Single-line output (no embedded newlines) so it composes safely with
+    `build_mutation_eval_script`'s ` && ` joiner.
+    """
+    import base64
+
+    names = sorted({n for n in expected_names if n.isidentifier()})
+    py = _TASK_MODULE_ROUTER_PY.replace("__NAMES__", repr(names))
+    enc = base64.b64encode(py.encode("utf-8")).decode("ascii")
+    return f"echo {enc} | base64 -d | python3 -"
 
 
 def build_code_instruct_dockerfile(bootstrap_image: str) -> str:
     """Per-task Dockerfile: FROM bootstrap + defensive git install. HEAD state.
 
     Unlike pr_runtime / mutation_bugs, code_instruct adds NEW files at
-    test time (no patching needed at build time). Harbor's oracle agent
-    applies solution/patch.diff which lands `task_module.py` + the test
-    file at the repo root; then tests/test.sh runs pytest on the test.
+    test time. The grading test ships as a plain file under tests/ (via
+    HarborTask.aux_files) and test.sh copies it into /workspace before
+    pytest runs, so every agent (not just oracle) can be graded. The
+    gold solution/patch.diff carries only `task_module.py`.
     """
     return (
         f"# Auto-generated by Repo2RLEnv code_instruct\n"
@@ -218,6 +290,21 @@ class CodeInstructPipeline:
                             emitted,
                         )
                         break
+                    if (
+                        self.options.max_llm_spend_usd is not None
+                        and self._llm_cost_usd >= self.options.max_llm_spend_usd
+                    ):
+                        logger.warning(
+                            "code_instruct: LLM spend cap reached "
+                            "($%.4f >= $%.4f); halting (emitted=%d)",
+                            self._llm_cost_usd,
+                            self.options.max_llm_spend_usd,
+                            emitted,
+                        )
+                        skip_reasons["llm_budget_exceeded"] = (
+                            skip_reasons.get("llm_budget_exceeded", 0) + 1
+                        )
+                        break
                     candidates_seen += 1
                     seed = sample_seed(
                         source_files,
@@ -257,17 +344,39 @@ class CodeInstructPipeline:
                         self._emit_progress(label, "skip", "test_does_not_use_task_module")
                         continue
 
+                    # Runtime delivery requires `from task_module import <name>` form:
+                    # the router shim matches by name against agent-modified files. A
+                    # bare `import task_module` test yields no names → router cannot
+                    # synthesize task_module.py → silent reward 0 for every agent.
+                    expected_names = extract_task_module_imports(parsed.test_code)
+                    if not expected_names:
+                        skip_reasons["test_uses_bare_module_import"] = (
+                            skip_reasons.get("test_uses_bare_module_import", 0) + 1
+                        )
+                        self._emit_progress(label, "skip", "test_uses_bare_module_import")
+                        continue
+
                     # Sandbox verification
                     test_filename = self._task_test_filename(seed, parsed)
                     if not self.options.skip_validation:
-                        outcome = self._verify_task(sandbox, parsed, test_filename=test_filename)
+                        outcome = self._verify_task(
+                            sandbox,
+                            parsed,
+                            test_filename=test_filename,
+                            expected_names=expected_names,
+                        )
                         if not outcome.accepted:
                             skip_reasons[outcome.reason] = skip_reasons.get(outcome.reason, 0) + 1
                             self._emit_progress(label, "skip", outcome.reason)
                             continue
 
                     # Emit
-                    task = self._build_task(seed, parsed, test_filename=test_filename)
+                    task = self._build_task(
+                        seed,
+                        parsed,
+                        test_filename=test_filename,
+                        expected_names=expected_names,
+                    )
                     write_harbor_task(task, out_dir)
                     emitted += 1
                     logger.info("emitted task %s (seed=%s)", task.name, seed.relative_path)
@@ -321,17 +430,25 @@ class CodeInstructPipeline:
             platform=self.input.bootstrap.platform,
         )
 
-    def _verify_task(self, sandbox, parsed: ParsedTask, *, test_filename: str) -> _VerifyOutcome:
-        """Two-stage verification.
+    def _verify_task(
+        self,
+        sandbox,
+        parsed: ParsedTask,
+        *,
+        test_filename: str,
+        expected_names: list[str],
+    ) -> _VerifyOutcome:
+        """Two-stage verification — Stage B exercises the runtime router path.
 
-        Stage A: write only the test file, run pytest on it → must NOT pass.
-                 (Without the oracle module, the import fails or the
-                  assertions fail. Either way, exit_code != 0.)
-        Stage B: write both the test file AND task_module.py, re-run pytest →
-                 must pass (exit_code == 0).
+        Stage A: write only the test file, run pytest → must NOT pass.
+        Stage B: write solution to a NON-`task_module.py` filename, run the
+                 SAME router shim that ships in the emitted task, then run
+                 pytest → must pass. This catches router/name-extraction
+                 bugs at synthesis time instead of in production.
         """
         enc_test = base64.b64encode(parsed.test_code.encode("utf-8")).decode("ascii")
         enc_solution = base64.b64encode(parsed.solution_code.encode("utf-8")).decode("ascii")
+        router_cmd = _build_task_module_router(expected_names)
 
         # Stage A — test only, no oracle
         script_a = (
@@ -340,7 +457,7 @@ class CodeInstructPipeline:
             "git config --global --add safe.directory /workspace\n"
             "git reset --hard HEAD\n"
             "git clean -fdx -e .venv -e venv -e __pycache__ || true\n"
-            "rm -f task_module.py task_module.pyc || true\n"
+            "rm -f task_module.py task_module.pyc r2e_solution.py || true\n"
             f"echo {enc_test} | base64 -d > {test_filename}\n"
             ": 'START_TEST_OUTPUT'\n"
             f"python -m pytest {test_filename} -v --no-header || true\n"
@@ -348,26 +465,27 @@ class CodeInstructPipeline:
         )
         a = sandbox.exec(script_a, timeout=self.options.validation_timeout_sec)
         pre_log = a.truncated(max_chars=4000)
-        # We re-check exit code by inspecting the log — pytest returns non-zero
-        # on collection error or test failure. The wrapper command uses `|| true`
-        # so the sandbox call always succeeds; we look for the "passed" summary
-        # to decide.
+        # The wrapper uses `|| true` so sandbox.exec succeeds regardless;
+        # we parse the pytest summary line to decide pass/fail.
         pre_passed = _all_tests_passed(pre_log)
         if self.options.require_test_fails_without_oracle and pre_passed:
             return _VerifyOutcome(
                 accepted=False, reason="test_passes_without_oracle", pre_log=pre_log
             )
 
-        # Stage B — oracle in place
+        # Stage B — write solution under a non-canonical name and let the
+        # router shim synthesise task_module.py. This is the EXACT path the
+        # emitted task takes at runtime: a bug in name extraction or in the
+        # router's git-ls-files scan surfaces here, not in production.
         script_b = (
             "set -uxo pipefail\n"
             "cd /workspace\n"
-            f"echo {enc_solution} | base64 -d > task_module.py\n"
+            f"echo {enc_solution} | base64 -d > r2e_solution.py\n"
+            f"{router_cmd}\n"
             ": 'START_TEST_OUTPUT'\n"
             f"python -m pytest {test_filename} -v --no-header\n"
             ": 'END_TEST_OUTPUT'\n"
-            # Restore HEAD state on exit
-            f"rm -f task_module.py {test_filename}\n"
+            f"rm -f task_module.py r2e_solution.py {test_filename}\n"
         )
         b = sandbox.exec(script_b, timeout=self.options.validation_timeout_sec)
         post_log = b.truncated(max_chars=4000)
@@ -394,7 +512,14 @@ class CodeInstructPipeline:
         h.update(parsed.problem.encode())
         return f"test_r2e_{h.hexdigest()[:10]}.py"
 
-    def _build_task(self, seed: Seed, parsed: ParsedTask, *, test_filename: str) -> HarborTask:
+    def _build_task(
+        self,
+        seed: Seed,
+        parsed: ParsedTask,
+        *,
+        test_filename: str,
+        expected_names: list[str],
+    ) -> HarborTask:
         owner, name = self.input.repo.owner_name
         h = hashlib.sha256()
         h.update(seed.relative_path.encode())
@@ -404,16 +529,19 @@ class CodeInstructPipeline:
         h.update(parsed.problem.encode())
         task_id = f"{owner}__{name}-cinst-{h.hexdigest()[:8]}"
 
-        gold_diff = _make_two_file_diff(
-            task_module_code=parsed.solution_code,
-            test_code=parsed.test_code,
-            test_filename=test_filename,
-        )
+        gold_diff = _make_solution_diff(task_module_code=parsed.solution_code)
 
-        # The verifier runs the synthesized test file specifically (NOT the
-        # bootstrap's recorded test_cmds — those are for the original suite).
+        # Harbor mounts tests/ at /tests for every agent (oracle or not);
+        # we copy the synthesized test into /workspace so pytest finds it.
+        # The router shim (between cp and pytest) synthesises task_module.py
+        # at runtime from whatever file the agent created, so the agent
+        # isn't forced to use the literal filename `task_module.py`.
         eval_script = build_mutation_eval_script(
-            [f"python -m pytest {test_filename} -v --no-header"],
+            [
+                f"cp /tests/{test_filename} /workspace/",
+                _build_task_module_router(expected_names),
+                f"python -m pytest {test_filename} -v --no-header",
+            ],
             language=self.bootstrap.language.value,
         )
         image_ref = (
@@ -425,7 +553,7 @@ class CodeInstructPipeline:
 
         repo2env = {
             "pipeline": "code_instruct",
-            "pipeline_version": "0.6.0",
+            "pipeline_version": repo2rlenv.__version__,
             "repo": f"{owner}/{name}",
             "ref": self.input.repo.ref,
             "reference": (
@@ -458,18 +586,25 @@ class CodeInstructPipeline:
             keywords=[name, "code_instruct"],
             environment_dockerfile=dockerfile,
             test_script=eval_script,
+            aux_files={f"tests/{test_filename}": parsed.test_code},
         )
 
 
 def _all_tests_passed(log: str) -> bool:
-    """Heuristic: pytest summary line ends with `N passed` and no `failed`/`error`."""
+    """Heuristic: pytest summary line shows `N passed` and zero failed/errored.
+
+    Rejects on any of: collection error, `>=1 failed`, `>=1 error(s)`. The
+    `error` token is critical — pytest reports collection/setup failures
+    separately from assertion failures, and treating an `errors+passed`
+    line as success accepts a broken verifier (regression for review S1).
+    """
     import re as _re
 
     lower = log.lower()
-    if "error" in lower and "collected 0 items" in lower:
+    if "collected 0 items" in lower:
         return False
-    # `0 failed` is fine; anything else is a failure
-    if "failed" in lower and _re.search(r"\b[1-9]\d*\s+failed\b", lower):
+    if _re.search(r"\b[1-9]\d*\s+failed\b", lower):
         return False
-    # A successful pytest run has a summary like `=== N passed in 0.12s ===`
+    if _re.search(r"\b[1-9]\d*\s+errors?\b", lower):
+        return False
     return bool(_re.search(r"\b[1-9]\d*\s+passed\b", lower))

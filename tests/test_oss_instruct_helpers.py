@@ -10,6 +10,7 @@ import pytest
 from repo2rlenv.pipelines._oss_instruct import (
     DEFAULT_BENCHMARK_PHRASES,
     _looks_substantive,
+    extract_task_module_imports,
     has_benchmark_overlap,
     is_excluded,
     list_source_files,
@@ -131,6 +132,17 @@ def test_benchmark_phrases_nonempty():
     assert len(DEFAULT_BENCHMARK_PHRASES) >= 5
 
 
+def test_benchmark_overlap_does_not_flag_numpy_pandas_idioms():
+    """Bare `import numpy as np` / `import pandas as pd` are language idioms,
+    not contamination signals. Regression for review finding B1 — including
+    them in the phrase list rejected every legitimate data-stack task.
+    """
+    numpy_solution = "import numpy as np\n\ndef mean(xs):\n    return float(np.mean(xs))\n"
+    pandas_solution = "import pandas as pd\n\ndef to_frame(rows):\n    return pd.DataFrame(rows)\n"
+    assert not has_benchmark_overlap(numpy_solution)
+    assert not has_benchmark_overlap(pandas_solution)
+
+
 # ---------------------------------------------------------------------------
 # parse_task_response
 # ---------------------------------------------------------------------------
@@ -210,9 +222,73 @@ def test_references_task_module_negative():
     assert not references_task_module("from typing import Any\n")
 
 
-def test_references_task_module_with_leading_whitespace():
-    """Indented import (e.g. inside a function) — we still accept it."""
-    assert references_task_module("    from task_module import foo\n")
+def test_references_task_module_nested_import():
+    """Import nested inside a function body is still detected via AST."""
+    code = "def test_x():\n    from task_module import foo\n    assert foo()\n"
+    assert references_task_module(code)
+
+
+def test_references_task_module_ignores_docstring_mention():
+    """A docstring or comment that merely *mentions* the import string
+    must NOT trip the gate — only real AST-level imports count.
+    Regression for review finding S5.
+    """
+    docstring_only = (
+        "def test_x():\n"
+        '    """Example usage:\n'
+        "    from task_module import foo\n"
+        '    """\n'
+        "    assert 1 == 1\n"
+    )
+    assert not references_task_module(docstring_only)
+
+
+def test_references_task_module_ignores_syntax_error():
+    assert not references_task_module("def broken(:::")
+
+
+# ---------------------------------------------------------------------------
+# extract_task_module_imports — names parsed for the runtime auto-router shim
+# ---------------------------------------------------------------------------
+
+
+def test_extract_imports_single_name():
+    code = "from task_module import render_frames\n\ndef test_x(): pass\n"
+    assert extract_task_module_imports(code) == ["render_frames"]
+
+
+def test_extract_imports_multiple_names():
+    code = "from task_module import foo, bar, baz\n"
+    assert extract_task_module_imports(code) == ["bar", "baz", "foo"]
+
+
+def test_extract_imports_parenthesized_multiline():
+    code = "from task_module import (\n    foo,\n    bar,\n    baz,\n)\n"
+    assert extract_task_module_imports(code) == ["bar", "baz", "foo"]
+
+
+def test_extract_imports_with_alias():
+    code = "from task_module import compute as c, helper as h\n"
+    assert extract_task_module_imports(code) == ["compute", "helper"]
+
+
+def test_extract_imports_bare_module_import():
+    code = "import task_module\n\ndef test_x(): task_module.foo()\n"
+    assert extract_task_module_imports(code) == []
+
+
+def test_extract_imports_negative():
+    code = "from typing import Any\nimport os\n"
+    assert extract_task_module_imports(code) == []
+
+
+def test_extract_imports_handles_syntax_error():
+    assert extract_task_module_imports("def broken(:::") == []
+
+
+def test_extract_imports_dedup_across_statements():
+    code = "from task_module import foo\nfrom task_module import foo, bar\n"
+    assert extract_task_module_imports(code) == ["bar", "foo"]
 
 
 if __name__ == "__main__":

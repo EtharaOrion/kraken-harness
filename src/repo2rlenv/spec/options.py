@@ -204,6 +204,11 @@ class CodeInstructOptions(_BaseOptions):
     # --- Decontamination ---
     skip_decontamination: bool = False
 
+    # --- Cost cap (mirrors BootstrapSpec.max_llm_spend_usd) ---
+    # When set, the candidate loop short-circuits once accumulated LiteLLM cost
+    # crosses this ceiling. None = unbounded.
+    max_llm_spend_usd: float | None = None
+
 
 class RefactorSynthesisOptions(_BaseOptions):
     """Mine historical rename refactors from commit history.

@@ -136,9 +136,10 @@ DEFAULT_BENCHMARK_PHRASES: tuple[str, ...] = (
     # GSM8K (math word problems)
     "natalia sold clips to",
     "if a car travels",
-    # DS-1000
-    "import pandas as pd",
-    "import numpy as np",
+    # DS-1000 — NOTE: bare `import numpy as np` / `import pandas as pd` are
+    # NOT included here; they're language idioms, not contamination signals,
+    # and matching them rejects every legitimate data-stack task. If you want
+    # real DS-1000 coverage, vendor the full substring corpus.
 )
 
 
@@ -245,15 +246,54 @@ def _strip_code_fence(text: str) -> str:
 
 
 def references_task_module(test_code: str) -> bool:
-    """True iff the test code imports from `task_module` (our convention).
+    """True iff the test code imports `task_module` (our convention).
 
-    Without this check, the LLM could write a self-sufficient test that
-    passes whether or not we apply the oracle — making the task trivial.
-
-    Named without a `test_` prefix so pytest doesn't try to collect this
-    helper as a test function.
+    Uses AST so that the string `from task_module import …` appearing inside
+    a docstring, comment, or `pytest.skip("…")` argument does NOT count as
+    an import. Returns False on syntax errors (those tasks would be rejected
+    downstream anyway).
     """
-    pattern = re.compile(
-        r"^\s*(?:from\s+task_module\s+import|import\s+task_module)\b", re.MULTILINE
-    )
-    return bool(pattern.search(test_code))
+    import ast
+
+    try:
+        tree = ast.parse(test_code)
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "task_module":
+            return True
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "task_module":
+                    return True
+    return False
+
+
+def extract_task_module_imports(test_code: str) -> list[str]:
+    """Return the names imported via `from task_module import ...`, sorted+unique.
+
+    Used by the runtime auto-router shim baked into `tests/test.sh`: at
+    verify time the shim scans agent-modified files for any of these names
+    and synthesizes `task_module.py` re-exporting from whichever module
+    defines them, so the agent isn't forced to use the literal filename
+    `task_module.py`.
+
+    Returns the ORIGINAL exported name even when the test aliases it
+    (`import compute as c` → "compute"), because the original name is what
+    the agent's module must define. Returns [] on syntax errors or when
+    no `from task_module import …` appears (bare `import task_module`
+    yields no name list, since the test accesses attributes dynamically).
+    """
+    import ast
+
+    try:
+        tree = ast.parse(test_code)
+    except SyntaxError:
+        return []
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "task_module":
+            for alias in node.names:
+                if alias.name != "*":
+                    names.add(alias.name)
+    return sorted(names)
