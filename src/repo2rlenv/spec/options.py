@@ -209,6 +209,9 @@ class CodeInstructOptions(_BaseOptions):
     # crosses this ceiling. None = unbounded.
     max_llm_spend_usd: float | None = None
 
+    # --- AWS mode ---
+    aws_mode: bool = False
+
 
 class RefactorSynthesisOptions(_BaseOptions):
     """Mine historical rename refactors from commit history.

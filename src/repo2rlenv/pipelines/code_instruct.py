@@ -56,6 +56,7 @@ from repo2rlenv.emitter.harbor import HarborTask, write_harbor_task
 from repo2rlenv.llm import complete
 from repo2rlenv.pipelines._oss_instruct import (
     PROMPT_SYSTEM,
+    PROMPT_SYSTEM_AWS,
     PROMPT_USER_TEMPLATE,
     ParsedTask,
     Seed,
@@ -70,6 +71,117 @@ from repo2rlenv.pipelines.base import PipelineResult
 from repo2rlenv.pipelines.mutation_bugs import build_mutation_eval_script
 from repo2rlenv.spec.input import GenerationInput, PipelineName
 from repo2rlenv.spec.options import CodeInstructOptions
+
+_DEBUG_LOG_DIR = Path(tempfile.gettempdir()) / "repo2rlenv_code_instruct_debug"
+
+_AWS_CONFTEST_BODY = (
+    "import os\n"
+    "import socket\n"
+    "import sys\n"
+    "import urllib.request\n"
+    "import pytest\n"
+    "\n"
+    "_R2E_ORIG_CONNECT = socket.socket.connect\n"
+    "\n"
+    "\n"
+    "def _r2e_is_loopback(host):\n"
+    "    if isinstance(host, bytes):\n"
+    '        host = host.decode("utf-8", "ignore")\n'
+    "    return isinstance(host, str) and (\n"
+    '        host == "localhost" or host == "::1" or host.startswith("127.")\n'
+    "    )\n"
+    "\n"
+    "\n"
+    "def _r2e_guarded_connect(self, address):\n"
+    "    if self.family in (socket.AF_INET, socket.AF_INET6) and isinstance(address, tuple) and address:\n"
+    "        if not _r2e_is_loopback(address[0]):\n"
+    "            raise RuntimeError(\n"
+    '                f"r2e:network-isolation: connect to {address[0]!r} blocked; only loopback (moto) is allowed"\n'
+    "            )\n"
+    "    return _R2E_ORIG_CONNECT(self, address)\n"
+    "\n"
+    "\n"
+    "socket.socket.connect = _r2e_guarded_connect\n"
+    "\n"
+    "\n"
+    "@pytest.fixture(autouse=True)\n"
+    "def _reset_moto():\n"
+    '    endpoint = os.environ.get("AWS_ENDPOINT_URL", "http://127.0.0.1:5000")\n'
+    "    try:\n"
+    '        req = urllib.request.Request(f"{endpoint}/moto-api/reset", method="POST")\n'
+    "        urllib.request.urlopen(req, timeout=5).read()\n"
+    "    except Exception as exc:\n"
+    '        print(f"r2e:moto-reset-failed: {exc}", file=sys.stderr)\n'
+    "    yield\n"
+)
+_AWS_CONFTEST_B64 = base64.b64encode(_AWS_CONFTEST_BODY.encode("utf-8")).decode("ascii")
+
+_AWS_CLI_VERSION = "2.17.45"
+_MOTO_UNAVAILABLE_SENTINEL = "R2E_MOTO_SERVER_UNAVAILABLE"
+
+
+def _references_aws(test_code: str, solution_code: str) -> bool:
+    """Guard against aws_mode tasks whose synthesized code never touches AWS."""
+    import re as _re
+
+    blob = test_code + "\n" + solution_code
+    if "boto3" in blob:
+        return True
+    return bool(_re.search(r"""['"]aws[ '"]""", blob))
+
+
+def _aws_verify_preamble() -> str:
+    """Idempotent moto bring-up; sentinel is the LAST stderr line so it survives log truncation."""
+    return (
+        'MOTO_PORT="${MOTO_PORT:-5000}"\n'
+        'MOTO_CMD="moto_server -H 127.0.0.1 -p ${MOTO_PORT}"\n'
+        'if ! pgrep -f "moto_server -H 127.0.0.1 -p ${MOTO_PORT}" >/dev/null 2>&1; then\n'
+        "  $MOTO_CMD > /tmp/moto.log 2>&1 &\n"
+        "  for i in $(seq 1 20); do\n"
+        '    (echo > /dev/tcp/127.0.0.1/"$MOTO_PORT") >/dev/null 2>&1 && break\n'
+        "    sleep 0.5\n"
+        "  done\n"
+        "fi\n"
+        'if ! (echo > /dev/tcp/127.0.0.1/"$MOTO_PORT") >/dev/null 2>&1; then\n'
+        "  cat /tmp/moto.log >&2 2>/dev/null || true\n"
+        f"  echo '{_MOTO_UNAVAILABLE_SENTINEL}' >&2\n"
+        "  exit 99\n"
+        "fi\n"
+        'curl -sX POST "http://127.0.0.1:${MOTO_PORT}/moto-api/reset" >/dev/null 2>&1 || true\n'
+        'export AWS_ENDPOINT_URL="http://127.0.0.1:${MOTO_PORT}"\n'
+        "export AWS_ACCESS_KEY_ID=testing\n"
+        "export AWS_SECRET_ACCESS_KEY=testing\n"
+        "export AWS_DEFAULT_REGION=us-east-1\n"
+        "export AWS_SESSION_TOKEN=testing\n"
+        "export AWS_EC2_METADATA_DISABLED=true\n"
+    )
+
+
+def _dump_failure_log(
+    test_filename: str,
+    reason: str,
+    *,
+    pre_log: str,
+    post_log: str | None,
+) -> None:
+    """Persist Stage A/B pytest output — otherwise post_log is truncated to 4000 chars and discarded on skip."""
+    try:
+        _DEBUG_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        target = _DEBUG_LOG_DIR / f"{test_filename}.log"
+        body = [
+            f"reason: {reason}",
+            f"timestamp: {datetime.now(UTC).isoformat()}",
+            "",
+            "===== STAGE A (test only, no oracle) =====",
+            pre_log,
+        ]
+        if post_log is not None:
+            body.extend(["", "===== STAGE B (test + oracle) =====", post_log])
+        target.write_text("\n".join(body) + "\n", encoding="utf-8")
+        logger.warning("code_instruct: failure log -> %s", target)
+    except OSError as exc:
+        logger.warning("code_instruct: could not write failure log (%s)", exc)
+
 
 logger = logging.getLogger(__name__)
 
@@ -183,7 +295,7 @@ def _build_task_module_router(expected_names: list[str]) -> str:
     return f"echo {enc} | base64 -d | python3 -"
 
 
-def build_code_instruct_dockerfile(bootstrap_image: str) -> str:
+def build_code_instruct_dockerfile(bootstrap_image: str, *, aws_mode: bool = False) -> str:
     """Per-task Dockerfile: FROM bootstrap + defensive git install. HEAD state.
 
     Unlike pr_runtime / mutation_bugs, code_instruct adds NEW files at
@@ -191,8 +303,12 @@ def build_code_instruct_dockerfile(bootstrap_image: str) -> str:
     HarborTask.aux_files) and test.sh copies it into /workspace before
     pytest runs, so every agent (not just oracle) can be graded. The
     gold solution/patch.diff carries only `task_module.py`.
+
+    When ``aws_mode`` is true, additional layers install moto[all,server],
+    boto3, and AWS CLI v2. v1 is rejected explicitly (it silently ignores
+    ``AWS_ENDPOINT_URL`` and would leak traffic to real AWS).
     """
-    return (
+    base = (
         f"# Auto-generated by Repo2RLEnv code_instruct\n"
         f"FROM {bootstrap_image}\n"
         f"WORKDIR /workspace\n"
@@ -201,6 +317,65 @@ def build_code_instruct_dockerfile(bootstrap_image: str) -> str:
         f"     && rm -rf /var/lib/apt/lists/*) || \\\n"
         f"    apk add --no-cache git || true\n"
         f"RUN git config --global --add safe.directory /workspace\n"
+    )
+    if not aws_mode:
+        return base
+    return base + (
+        "# AWS mode: moto + boto3 + aws-cli v2\n"
+        "RUN (apt-get update && apt-get install -y --no-install-recommends curl unzip ca-certificates \\\n"
+        "     && rm -rf /var/lib/apt/lists/*) || \\\n"
+        "    apk add --no-cache curl unzip ca-certificates || true\n"
+        "RUN pip install --no-cache-dir 'moto[all,server]>=5.0' 'boto3>=1.34' pytest\n"
+        "RUN set -e; \\\n"
+        '    arch="$(uname -m)"; \\\n'
+        '    case "$arch" in \\\n'
+        "      x86_64|amd64) cli_arch=x86_64 ;; \\\n"
+        "      aarch64|arm64) cli_arch=aarch64 ;; \\\n"
+        '      *) echo "aws_mode: unsupported arch $arch" >&2; exit 1 ;; \\\n'
+        "    esac; \\\n"
+        f'    url="https://awscli.amazonaws.com/awscli-exe-linux-${{cli_arch}}-{_AWS_CLI_VERSION}.zip"; \\\n'
+        '    curl -sSL "$url" -o /tmp/awscli.zip; \\\n'
+        "    unzip -q /tmp/awscli.zip -d /tmp; \\\n"
+        "    /tmp/aws/install; \\\n"
+        "    rm -rf /tmp/awscli.zip /tmp/aws\n"
+        "RUN aws --version\n"
+    )
+
+
+def build_aws_eval_script(test_cmds: list[str], *, language: str) -> str:
+    del language
+    test_block = " && ".join(test_cmds)
+    return (
+        "#!/bin/bash\n"
+        "set -uxo pipefail\n"
+        "cd /workspace\n"
+        "mkdir -p /logs/verifier\n"
+        'MOTO_PORT="${MOTO_PORT:-5000}"\n'
+        'moto_server -H 127.0.0.1 -p "$MOTO_PORT" > /logs/verifier/moto.log 2>&1 &\n'
+        "MOTO_PID=$!\n"
+        "trap 'kill $MOTO_PID 2>/dev/null || true' EXIT\n"
+        "for i in $(seq 1 20); do\n"
+        '  (echo > /dev/tcp/127.0.0.1/"$MOTO_PORT") >/dev/null 2>&1 && break\n'
+        "  sleep 0.5\n"
+        "done\n"
+        'if ! (echo > /dev/tcp/127.0.0.1/"$MOTO_PORT") >/dev/null 2>&1; then\n'
+        "  cat /logs/verifier/moto.log >&2 2>/dev/null || true\n"
+        "  echo 'moto_server failed to start; see /logs/verifier/moto.log' >&2\n"
+        "  exit 99\n"
+        "fi\n"
+        'export AWS_ENDPOINT_URL="http://127.0.0.1:${MOTO_PORT}"\n'
+        "export AWS_ACCESS_KEY_ID=testing\n"
+        "export AWS_SECRET_ACCESS_KEY=testing\n"
+        "export AWS_DEFAULT_REGION=us-east-1\n"
+        "export AWS_SESSION_TOKEN=testing\n"
+        "export AWS_EC2_METADATA_DISABLED=true\n"
+        'curl -sX POST "${AWS_ENDPOINT_URL}/moto-api/reset" >/dev/null 2>&1 || true\n'
+        f"echo {_AWS_CONFTEST_B64} | base64 -d > /workspace/conftest.py\n"
+        f"( {test_block} ) > /logs/verifier/test_output.log 2>&1\n"
+        "TEST_EXIT_CODE=$?\n"
+        '[ "$TEST_EXIT_CODE" -eq 0 ] && echo "1.0" > /logs/verifier/reward.txt '
+        '|| echo "0.0" > /logs/verifier/reward.txt\n'
+        "exit $TEST_EXIT_CODE\n"
     )
 
 
@@ -356,6 +531,16 @@ class CodeInstructPipeline:
                         self._emit_progress(label, "skip", "test_uses_bare_module_import")
                         continue
 
+                    # aws_mode: skip synthesized tasks that don't actually use AWS
+                    if self.options.aws_mode and not _references_aws(
+                        parsed.test_code, parsed.solution_code
+                    ):
+                        skip_reasons["aws_mode_test_does_not_use_aws"] = (
+                            skip_reasons.get("aws_mode_test_does_not_use_aws", 0) + 1
+                        )
+                        self._emit_progress(label, "skip", "aws_mode_test_does_not_use_aws")
+                        continue
+
                     # Sandbox verification
                     test_filename = self._task_test_filename(seed, parsed)
                     if not self.options.skip_validation:
@@ -406,7 +591,7 @@ class CodeInstructPipeline:
         try:
             resp = complete(
                 self.input.llm,
-                system=PROMPT_SYSTEM,
+                system=PROMPT_SYSTEM_AWS if self.options.aws_mode else PROMPT_SYSTEM,
                 user=user,
                 max_tokens=self.options.max_llm_tokens,
                 temperature=self.options.llm_temperature,
@@ -424,11 +609,25 @@ class CodeInstructPipeline:
 
         marker = Path(tempfile.mkdtemp(prefix="r2e-code-instruct-"))
         (marker / ".keep").write_text("")
-        return DockerSandbox.start(
+        sandbox = DockerSandbox.start(
             base_image=self.bootstrap.image_tag,
             repo_dir=marker,
             platform=self.input.bootstrap.platform,
         )
+        if self.options.aws_mode:
+            logger.info("code_instruct: installing moto+boto3 into verification sandbox")
+            install = sandbox.exec(
+                "pip install --no-cache-dir 'moto[all,server]>=5.0' 'boto3>=1.34' pytest",
+                timeout=600,
+            )
+            if not install.ok:
+                output = install.truncated(max_chars=2000)
+                sandbox.cleanup()
+                raise RuntimeError(
+                    "failed to install moto/boto3 into verification sandbox; "
+                    "aws_mode candidates cannot be verified.\n" + output
+                )
+        return sandbox
 
     def _verify_task(
         self,
@@ -449,26 +648,48 @@ class CodeInstructPipeline:
         enc_test = base64.b64encode(parsed.test_code.encode("utf-8")).decode("ascii")
         enc_solution = base64.b64encode(parsed.solution_code.encode("utf-8")).decode("ascii")
         router_cmd = _build_task_module_router(expected_names)
+        conftest_write = (
+            f"echo {_AWS_CONFTEST_B64} | base64 -d > /workspace/conftest.py\n"
+            if self.options.aws_mode
+            else ""
+        )
+        moto_preamble = _aws_verify_preamble() if self.options.aws_mode else ""
 
         # Stage A — test only, no oracle
         script_a = (
             "set -uxo pipefail\n"
             "cd /workspace\n"
-            "git config --global --add safe.directory /workspace\n"
+            + moto_preamble
+            + "git config --global --add safe.directory /workspace\n"
             "git reset --hard HEAD\n"
             "git clean -fdx -e .venv -e venv -e __pycache__ || true\n"
             "rm -f task_module.py task_module.pyc r2e_solution.py || true\n"
-            f"echo {enc_test} | base64 -d > {test_filename}\n"
+            + conftest_write
+            + f"echo {enc_test} | base64 -d > {test_filename}\n"
             ": 'START_TEST_OUTPUT'\n"
             f"python -m pytest {test_filename} -v --no-header || true\n"
             ": 'END_TEST_OUTPUT'\n"
         )
         a = sandbox.exec(script_a, timeout=self.options.validation_timeout_sec)
         pre_log = a.truncated(max_chars=4000)
+        if self.options.aws_mode and "R2E_MOTO_SERVER_UNAVAILABLE" in pre_log:
+            _dump_failure_log(
+                test_filename,
+                "moto_server_unavailable",
+                pre_log=pre_log,
+                post_log=None,
+            )
+            return _VerifyOutcome(accepted=False, reason="moto_server_unavailable", pre_log=pre_log)
         # The wrapper uses `|| true` so sandbox.exec succeeds regardless;
         # we parse the pytest summary line to decide pass/fail.
         pre_passed = _all_tests_passed(pre_log)
         if self.options.require_test_fails_without_oracle and pre_passed:
+            _dump_failure_log(
+                test_filename,
+                "test_passes_without_oracle",
+                pre_log=pre_log,
+                post_log=None,
+            )
             return _VerifyOutcome(
                 accepted=False, reason="test_passes_without_oracle", pre_log=pre_log
             )
@@ -480,8 +701,10 @@ class CodeInstructPipeline:
         script_b = (
             "set -uxo pipefail\n"
             "cd /workspace\n"
-            f"echo {enc_solution} | base64 -d > r2e_solution.py\n"
-            f"{router_cmd}\n"
+            + moto_preamble
+            + conftest_write
+            + f"echo {enc_solution} | base64 -d > r2e_solution.py\n"
+            + f"{router_cmd}\n"
             ": 'START_TEST_OUTPUT'\n"
             f"python -m pytest {test_filename} -v --no-header\n"
             ": 'END_TEST_OUTPUT'\n"
@@ -489,8 +712,27 @@ class CodeInstructPipeline:
         )
         b = sandbox.exec(script_b, timeout=self.options.validation_timeout_sec)
         post_log = b.truncated(max_chars=4000)
+        if self.options.aws_mode and "R2E_MOTO_SERVER_UNAVAILABLE" in post_log:
+            _dump_failure_log(
+                test_filename,
+                "moto_server_unavailable",
+                pre_log=pre_log,
+                post_log=post_log,
+            )
+            return _VerifyOutcome(
+                accepted=False,
+                reason="moto_server_unavailable",
+                pre_log=pre_log,
+                post_log=post_log,
+            )
         post_passed = b.ok and _all_tests_passed(post_log)
         if self.options.require_test_passes_with_oracle and not post_passed:
+            _dump_failure_log(
+                test_filename,
+                "oracle_does_not_satisfy_test",
+                pre_log=pre_log,
+                post_log=post_log,
+            )
             return _VerifyOutcome(
                 accepted=False,
                 reason="oracle_does_not_satisfy_test",
@@ -531,12 +773,17 @@ class CodeInstructPipeline:
 
         gold_diff = _make_solution_diff(task_module_code=parsed.solution_code)
 
+        # The verifier runs the synthesized test file specifically (NOT the
+        # bootstrap's recorded test_cmds — those are for the original suite).
         # Harbor mounts tests/ at /tests for every agent (oracle or not);
         # we copy the synthesized test into /workspace so pytest finds it.
         # The router shim (between cp and pytest) synthesises task_module.py
         # at runtime from whatever file the agent created, so the agent
         # isn't forced to use the literal filename `task_module.py`.
-        eval_script = build_mutation_eval_script(
+        eval_builder = (
+            build_aws_eval_script if self.options.aws_mode else build_mutation_eval_script
+        )
+        eval_script = eval_builder(
             [
                 f"cp /tests/{test_filename} /workspace/",
                 _build_task_module_router(expected_names),
@@ -549,7 +796,7 @@ class CodeInstructPipeline:
             if self.bootstrap.pushed_to_registry
             else self.bootstrap.image_tag
         )
-        dockerfile = build_code_instruct_dockerfile(image_ref)
+        dockerfile = build_code_instruct_dockerfile(image_ref, aws_mode=self.options.aws_mode)
 
         repo2env = {
             "pipeline": "code_instruct",

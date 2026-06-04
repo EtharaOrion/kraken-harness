@@ -105,6 +105,61 @@ See `CodeInstructOptions` in `src/repo2rlenv/spec/options.py`. Key fields:
 | `require_test_passes_with_oracle` | `True` | stage B invariant |
 | `skip_decontamination` | `False` | turn off benchmark substring check |
 | `skip_validation` | `False` | debug; emits without sandbox run |
+| `aws_mode` | `False` | synthesize tasks that exercise aws-cli v2 / boto3 against an in-container moto server (see [AWS mode](#aws-mode) below) |
+
+## AWS mode
+
+Opt in with `--pipeline-opt aws_mode=true` to synthesize tasks that exercise
+`aws` CLI v2 (`aws s3 cp`, `aws s3 mb`, etc.) or `boto3` against a
+[moto](https://github.com/getmoto/moto) server running inside the task
+container. The agent's generated code does not know moto exists — a single
+env var (`AWS_ENDPOINT_URL`) routes all traffic to the mock.
+
+When enabled, four things change vs the default pipeline:
+
+1. **Dockerfile** installs `moto[all,server]>=5.0`, `boto3>=1.34`, and AWS
+   CLI v2. A final `RUN aws --version` fails the build if v1 sneaks in
+   (v1 silently ignores `AWS_ENDPOINT_URL` and would leak traffic to real
+   AWS — a guaranteed false-negative).
+2. **Eval script** starts `moto_server` on `127.0.0.1:5000` before pytest,
+   health-polls `/moto-api/` for up to 10 seconds, exports the AWS env,
+   POSTs `/moto-api/reset` for clean state, runs the tests, and traps
+   `EXIT` to kill moto on teardown.
+3. **Verify stages** both run the same moto preamble. State is reset
+   between Stage A (test alone, should fail) and Stage B (test + oracle,
+   should pass) so leftover buckets from Stage A can't fool Stage B.
+4. **Synthesis prompt** swaps to a variant that allows `boto3` and
+   `subprocess.run(['aws', ...])`. It tells the LLM that moto is already
+   running and env vars are exported — tests must NOT hardcode
+   `endpoint_url=` or pass `CreateBucketConfiguration` for `us-east-1`
+   (moto rejects it, matching real S3).
+
+Preconfigured container env when `aws_mode=true`:
+
+| Var | Value |
+|---|---|
+| `AWS_ENDPOINT_URL` | `http://127.0.0.1:5000` |
+| `AWS_ACCESS_KEY_ID` | `testing` |
+| `AWS_SECRET_ACCESS_KEY` | `testing` |
+| `AWS_DEFAULT_REGION` | `us-east-1` |
+| `AWS_SESSION_TOKEN` | `testing` |
+
+Example:
+
+```bash
+repo2rlenv generate \
+  --repo aws/aws-cli \
+  --pipeline code_instruct \
+  --pipeline-opt aws_mode=true \
+  --pipeline-opt limit=5 \
+  --llm anthropic/claude-sonnet-4-6 \
+  --out ./datasets/aws-tasks
+```
+
+> Documentation lives in `docs/`. `instruction.md` baked into each Harbor
+> task is the agent's **task prompt** (built from the synthesized problem
+> description) and is intentionally untouched by `aws_mode` — the
+> mocking infrastructure is invisible to the agent.
 
 ## End-to-end smoke
 

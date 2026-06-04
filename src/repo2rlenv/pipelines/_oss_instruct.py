@@ -170,6 +170,31 @@ The Python source for `task_module.py` — the implementation the test will exer
 Output only those three sections in that order. No preamble, no closing notes."""
 
 
+PROMPT_SYSTEM_AWS = """You are a senior Python engineer. You will be given a code snippet from an open-source repository. Your job is to design a new, self-contained programming exercise that exercises AWS via the AWS CLI v2 (`aws s3 ...`, `aws dynamodb ...`, etc.) or boto3, INSPIRED by the snippet but not requiring the repo's APIs.
+
+Runtime guarantees provided by the sandbox (do NOT restate them in your output):
+- `aws` (AWS CLI v2) is on PATH.
+- `boto3` is installed.
+- A `moto_server` is already running on http://127.0.0.1:5000 BEFORE pytest starts.
+- These env vars are already exported: AWS_ENDPOINT_URL=http://127.0.0.1:5000, AWS_ACCESS_KEY_ID=testing, AWS_SECRET_ACCESS_KEY=testing, AWS_DEFAULT_REGION=us-east-1.
+- The test MUST NOT hardcode endpoint URLs or credentials. The env handles routing.
+- Each test FUNCTION starts with freshly-reset moto state — an autouse `conftest.py` fixture wipes all AWS resources before every test. Tests are isolated from each other; do NOT rely on or assume resources created by sibling tests still exist.
+- When an AWS resource is created asynchronously (e.g. Kinesis `create_stream`, DynamoDB `create_table`), call the matching waiter — `client.get_waiter("stream_exists").wait(StreamName=...)`, `client.get_waiter("table_exists").wait(TableName=...)`, etc. — before invoking the function under test. Otherwise the resource may still be in the CREATING state and operations against it will fail.
+
+Produce three sections — exactly in this order, exactly with these section headers:
+
+[Problem Description]
+A clear, self-contained problem statement. Describe a function or CLI workflow that operates on AWS resources (S3 buckets/objects, DynamoDB tables, etc.). Include 1-2 worked examples. Keep it under 200 words.
+
+[Test]
+A pytest test file. It MUST import from the module `task_module` (literal name). Write 2-4 assertions covering normal cases AND edge cases. Use plain `def test_...(): assert ...` — no fixtures. The test SHOULD set up any required AWS state (e.g., `boto3.client('s3').create_bucket(Bucket=...)`) before invoking the function under test. Use only the env-provided endpoint routing — do NOT pass `endpoint_url=` explicitly. For S3 buckets in us-east-1, do NOT pass `CreateBucketConfiguration` (real S3 rejects LocationConstraint for us-east-1; moto matches that behavior).
+
+[Solution]
+The Python source for `task_module.py` — the implementation the test will exercise. Provide a complete, runnable Python file. Allowed imports: Python stdlib + `boto3`. May call `aws` via `subprocess.run(...)`. Do NOT pass `endpoint_url=` to boto3 clients; rely on AWS_ENDPOINT_URL from the environment.
+
+Output only those three sections in that order. No preamble, no closing notes."""
+
+
 PROMPT_USER_TEMPLATE = """Inspiration snippet (from `{path}`, lines {start}-{end}):
 
 ```python
