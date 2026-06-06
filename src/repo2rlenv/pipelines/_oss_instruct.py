@@ -322,3 +322,38 @@ def extract_task_module_imports(test_code: str) -> list[str]:
                 if alias.name != "*":
                     names.add(alias.name)
     return sorted(names)
+
+
+# ---------------------------------------------------------------------------
+# Multi-file diff helper (shared between snippet and cli_app modes)
+# ---------------------------------------------------------------------------
+
+
+def make_multi_file_diff(files: dict[str, str]) -> str:
+    """Build a `git apply`-compatible diff that creates each file as new.
+
+    All files added at mode 100644, no deletes, no edits. Paths are sorted
+    for byte-deterministic output across runs (same input dict -> same diff
+    bytes). Handles missing trailing newline per the unified-diff spec.
+
+    Used by code_instruct cli_app mode via _cli_app_synthesis, and available
+    for any future multi-file pipeline.
+    """
+    out: list[str] = []
+    for path in sorted(files):
+        content = files[path]
+        lines = content.splitlines()
+        n = len(lines)
+        header = (
+            f"diff --git a/{path} b/{path}\n"
+            f"new file mode 100644\n"
+            f"index 0000000..0000001\n"
+            f"--- /dev/null\n"
+            f"+++ b/{path}\n"
+            f"@@ -0,0 +1,{n} @@\n"
+        )
+        body = "".join(f"+{ln}\n" for ln in lines)
+        if content and not content.endswith("\n"):
+            body += "\\ No newline at end of file\n"
+        out.append(header + body)
+    return "".join(out)

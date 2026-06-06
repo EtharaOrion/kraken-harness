@@ -393,7 +393,10 @@ class CodeInstructPipeline:
         options: CodeInstructOptions,
         bootstrap: BootstrapResult | None = None,
     ):
-        if bootstrap is None:
+        # cli_app mode reads from clone + LLM and does NOT need a bootstrap
+        # image (we build our own task image via the optional Docker gauntlet).
+        _cli_app = getattr(options, "mode", "snippet") == "cli_app"
+        if bootstrap is None and not _cli_app:
             raise RuntimeError(
                 "code_instruct requires a BootstrapResult (set requires_bootstrap=True "
                 "and let cmd_generate trigger it, or pass one explicitly)"
@@ -420,6 +423,12 @@ class CodeInstructPipeline:
 
     def run(self, out_dir: Path) -> PipelineResult:
         out_dir.mkdir(parents=True, exist_ok=True)
+        # cli_app mode dispatches to a sibling module — snippet code below
+        # is byte-identical for mode="snippet" (the default).
+        if getattr(self.options, "mode", "snippet") == "cli_app":
+            from repo2rlenv.pipelines._cli_app_synthesis import run_cli_app_pipeline
+
+            return run_cli_app_pipeline(self, self.options, out_dir)
         token = resolve_github_token(self.input.repo, self.input.auth)
         if self.input.repo.access == "private" and not token:
             raise RuntimeError(

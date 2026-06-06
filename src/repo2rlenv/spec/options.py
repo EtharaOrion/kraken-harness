@@ -212,6 +212,28 @@ class CodeInstructOptions(_BaseOptions):
     # --- AWS mode ---
     aws_mode: bool = False
 
+    # --- cli_app mode (build full CLI app from a target repo) ---
+    # When mode == "cli_app", the snippet-mode fields above (sampling, LLM
+    # temperature, decontam) are largely ignored. The pipeline AST-extracts
+    # a CLI spec + per-test intents from the target repo, LLM-translates
+    # intents into black-box tests, synthesises an oracle, and emits a
+    # Harbor-format RL environment. Orthogonal to `aws_mode` (snippet+AWS).
+    # See docs/AWS_CLI_S3_PLAN.md (v3).
+    mode: Literal["snippet", "cli_app"] = "snippet"
+    cli_app_command_prefix: str = ""           # e.g. "s3" for aws s3 *
+    cli_app_command: str | None = None         # focus on one command (None = all)
+    cli_app_entry_point_override: str | None = None
+    cli_app_tests_dir_override: str | None = None
+    cli_app_max_intents: int = 10              # cap on per-run translation calls
+    cli_app_skip_gauntlet: bool = False        # skip G1-G4 (for smoke runs)
+    cli_app_skip_suite_verify: bool = False    # skip Docker suite-level verify
+    cli_app_translation_model: str | None = None  # override --llm for translation
+    cli_app_per_intent: bool = False           # emit one task per (command, intent) instead of per command
+    cli_app_docker_gauntlet: bool = False      # G3+G4: build image + run empty/oracle to verify discriminative
+    cli_app_docker_empty_pass_max: float = 0.05    # G3 reject threshold: empty stub must pass <= 5%
+    cli_app_docker_oracle_pass_min: float = 0.95   # G4 reject threshold: oracle must pass >= 95%
+    cli_app_docker_timeout_sec: int = 240          # per-run pytest timeout inside container
+
 
 class RefactorSynthesisOptions(_BaseOptions):
     """Mine historical rename refactors from commit history.

@@ -109,10 +109,18 @@ def cmd_generate(args: argparse.Namespace) -> int:
 
     options = parse_options(gen_input.pipeline.name.value, gen_input.pipeline.options)
 
+    # code_instruct mode=cli_app reads from clone + LLM and bypasses both
+    # language detection and bootstrap (neither operates on the source repo
+    # the way snippet mode does).
+    _cli_app_mode = (
+        gen_input.pipeline.name.value == "code_instruct"
+        and getattr(options, "mode", "snippet") == "cli_app"
+    )
+
     # Pre-flight: does this pipeline support this repo's primary language?
     # Cheap GitHub API call; runs BEFORE bootstrap so we fail fast on a
     # Go/Rust/Node repo + Python-only pipeline mismatch (~2s vs ~5 min).
-    if getattr(pipeline_cls, "supported_languages", None) is not None:
+    if getattr(pipeline_cls, "supported_languages", None) is not None and not _cli_app_mode:
         from repo2rlenv.auth import resolve_github_token
         from repo2rlenv.bootstrap.language import language_from_github_name
         from repo2rlenv.github import get_primary_language
@@ -134,13 +142,17 @@ def cmd_generate(args: argparse.Namespace) -> int:
     # Auto-trigger bootstrap for sandbox-required pipelines (requires_bootstrap=True).
     # Cache hit ⇒ instant; cache miss ⇒ full LLM-agent run with the live UI.
     bootstrap_result = None
-    if getattr(pipeline_cls, "requires_bootstrap", False) and gen_input.llm is None:
+    if (
+        getattr(pipeline_cls, "requires_bootstrap", False)
+        and gen_input.llm is None
+        and not _cli_app_mode
+    ):
         console.error(
             f"pipeline {gen_input.pipeline.name.value!r} requires --llm "
             f"(bootstrap needs an LLM to build the sandbox image)"
         )
         return 2
-    if getattr(pipeline_cls, "requires_bootstrap", False):
+    if getattr(pipeline_cls, "requires_bootstrap", False) and not _cli_app_mode:
         from repo2rlenv.bootstrap import LanguageHint, ensure_bootstrap
         from repo2rlenv.bootstrap.runner import BootstrapError
         from repo2rlenv.ui.views.bootstrap import bootstrap_view_or_plain
