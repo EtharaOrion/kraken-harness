@@ -233,6 +233,23 @@ class CodeInstructOptions(_BaseOptions):
     cli_app_docker_empty_pass_max: float = 0.05    # G3 reject threshold: empty stub must pass <= 5%
     cli_app_docker_oracle_pass_min: float = 0.95   # G4 reject threshold: oracle must pass >= 95%
     cli_app_docker_timeout_sec: int = 240          # per-run pytest timeout inside container
+    # --- cli_app subset (multi-command) tasks ---
+    # When set, emit ONE task per compatible subset of commands (instead of one
+    # task per command). Each entry is a comma-joined command list, e.g.
+    # ["mb,ls,rb", "mb,cp,ls,rm"]. None = unchanged per-command behaviour.
+    cli_app_subsets: list[str] | None = None
+    # Number of cross-command workflow tests to synthesise per subset task
+    # (0 disables). Ignored for single-command tasks.
+    cli_app_workflow_tests: int = 3
+    # --- Reference grounding (real aws-cli as ground-truth oracle) ---
+    # When True, the Docker gauntlet keeps ONLY tests that BOTH the real `aws`
+    # CLI AND the synthesised oracle pass, and that an empty stub fails. This
+    # removes LLM-hallucinated/brittle tests and guarantees the gold patch
+    # solves its own task. Requires Docker. The `aws` binary lives only in the
+    # gauntlet image, never in the shipped task image (anti-cheat).
+    cli_app_reference_grounding: bool = False
+    # Reject a task if fewer than this many tests survive reference grounding.
+    cli_app_min_grounded_tests: int = 3
 
 
 class RefactorSynthesisOptions(_BaseOptions):

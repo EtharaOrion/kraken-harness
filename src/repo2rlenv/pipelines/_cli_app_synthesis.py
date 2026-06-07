@@ -171,6 +171,90 @@ so a single `main.py` can handle multiple commands when extended later. For now,
 focus on the `{command}` subcommand."""
 
 
+# --- Subset (multi-command) oracle prompts ---
+
+ORACLE_SUBSET_SYSTEM = """You write a reference Python implementation of a SUBSET of \
+aws-cli S3 commands as ONE file.
+
+Constraints:
+- Single file: `submission/main.py`
+- Parse argv and dispatch on the subcommand (argv[2]) so one program handles \
+every requested subcommand
+- Use boto3 with the default endpoint (moto intercepts via AWS_ENDPOINT_URL_S3 env var)
+- Do NOT import `awscli` or shell out to the `aws` binary
+- Exit 0 on success, non-zero on failure
+- Match real aws-cli output format on stdout (e.g. `make_bucket: <name>` for mb, \
+`delete: s3://<bucket>/<key>` for rm, `upload: <src> to <dst>` for cp, etc.)
+- Print errors to stderr, suppress noisy boto3 tracebacks (use `botocore.exceptions.ClientError`)
+- Keep S3 state consistent across subcommands so a sequence like upload -> list -> \
+download -> remove behaves correctly end-to-end
+
+The CLI is invoked as: `python submission/main.py <prefix> <command> [args...]`
+
+Return ONLY the Python source for `submission/main.py` (no preamble, no surrounding markdown fences)."""
+
+
+ORACLE_SUBSET_USER_TEMPLATE = """Implement a single `aws {command_prefix}` CLI supporting \
+ALL of these subcommands: {commands_csv}.
+
+It must cover these behaviours (collected across the subcommands):
+
+{behaviours_bulleted}
+
+Dispatch on argv[1] (prefix) / argv[2] (subcommand) so one `main.py` handles every \
+listed subcommand, and keep S3 state consistent across them so cross-command workflows \
+(upload -> list -> download -> move -> remove -> remove-bucket) behave correctly."""
+
+
+# --- Cross-command workflow-test prompts (subset tasks) ---
+
+WORKFLOW_SYSTEM = """You write black-box pytest tests that exercise CROSS-COMMAND \
+behaviour of a from-scratch `aws s3`-style CLI.
+
+The CLI is a single file at /workspace/submission/main.py, invoked as a subprocess via \
+the `cli` fixture: `cli(*argv) -> subprocess.CompletedProcess` (with .returncode, \
+.stdout, .stderr). A boto3 client `s3_client` (pointing at the SAME sandboxed S3) and \
+pytest's `tmp_path` are also available as fixtures.
+
+Rules:
+1. Use ONLY the fixtures `cli`, `s3_client`, `tmp_path` as test-function arguments. Do \
+NOT use any decorator. You may use the standard library plus `boto3`/`botocore` \
+(assume both are importable).
+2. Create ALL prerequisite state inside the test (buckets via the CLI or \
+`s3_client.create_bucket`, local files via `tmp_path`). Tests must run in isolation and \
+in any order.
+3. After EVERY `cli(...)` step meant to succeed, assert `result.returncode == 0`. For \
+steps meant to fail, assert `result.returncode != 0` AND a stderr substring.
+4. Assert cross-command invariants on `s3_client` STATE, not on stdout wording: object \
+presence via `list_objects_v2`/`head_object`; byte-identical content via \
+`get_object()['Body'].read()`; deletion by expecting a `botocore.exceptions.ClientError` \
+(error code '404' or 'NoSuchKey') from `head_object`; bucket presence/absence via \
+`list_buckets`.
+5. Each test MUST chain at least TWO different subcommands and include at least one \
+assertion that depends on a PRIOR command's effect.
+6. Assert only on order-insensitive state (sets of keys, object bytes, bucket existence, \
+exit codes) — never on listing order, ETags, or timestamps.
+7. Name each function `test_workflow_<chain>`. Return ONLY the test function source(s) \
+(one or more `def test_...`), no preamble, no surrounding markdown fences."""
+
+
+WORKFLOW_USER_TEMPLATE = """Write {n_workflows} cross-command workflow test function(s) \
+for an `aws {command_prefix}` CLI covering ONLY this compatible subset of subcommands: \
+{subset_csv}.
+
+Documented per-command and cross-command invariants (the contract you must verify):
+{state_models_joined}
+
+Representative argv shapes observed for these commands:
+{argv_shapes_bulleted}
+
+Each test must chain at least two different subcommands from {subset_csv} and assert on \
+`s3_client` state produced by an earlier command. Cover, where the subset allows: a \
+create -> write -> read-back -> delete lifecycle; the cp round-trip identity (upload \
+then download is byte-identical); and at least one NEGATIVE chain (e.g. removing a \
+non-empty bucket must fail and leave it intact). Use ONLY subcommands from {subset_csv}."""
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -237,6 +321,87 @@ def run_cli_app_pipeline(
                 f"Available: {[c.name for c in spec.commands]}"
             )
 
+        # --- Subset mode: one multi-command task per compatible subset ---
+        # When cli_app_subsets is set we emit subset tasks and return; the
+        # per-command path below is left byte-identical for the default case.
+        if options.cli_app_subsets:
+            tests_dir_path = clone_dir / spec.tests_dir
+            by_name = {c.name: c for c in spec.commands}
+            for raw in options.cli_app_subsets:
+                if emitted >= options.limit:
+                    logger.info("cli_app: limit=%d reached", options.limit)
+                    break
+                # dedupe while preserving order (a repeated command would
+                # bloat the slug/keywords and double the translation cost)
+                names = list(dict.fromkeys(n.strip() for n in raw.split(",") if n.strip()))
+                missing = [n for n in names if n not in by_name]
+                if missing:
+                    logger.warning(
+                        "cli_app: subset %r references unknown commands %s (available: %s)",
+                        raw, missing, sorted(by_name),
+                    )
+                group = [by_name[n] for n in names if n in by_name]
+                candidates_seen += 1
+                slug = "+".join(sorted(c.name for c in group))
+                label = f"{owner_name}:{slug or raw}"
+                if len(group) < 2:
+                    skip_reasons["subset_too_small"] = (
+                        skip_reasons.get("subset_too_small", 0) + 1
+                    )
+                    pipeline._emit_progress(label, "skip", "subset_too_small")
+                    continue
+                intents: list[TestIntent] = []
+                for c in group:
+                    intents.extend(
+                        extract_test_intents(
+                            tests_dir_path,
+                            spec,
+                            command_filter=c.name,
+                            max_intents=options.cli_app_max_intents,
+                        )
+                    )
+                logger.info(
+                    "cli_app: subset %s -> %d intents across %d commands",
+                    slug, len(intents), len(group),
+                )
+                if not intents:
+                    skip_reasons["no_intents_extracted"] = (
+                        skip_reasons.get("no_intents_extracted", 0) + 1
+                    )
+                    pipeline._emit_progress(label, "skip", "no_intents_extracted")
+                    continue
+                try:
+                    task_path = _build_one_task(
+                        pipeline=pipeline,
+                        options=options,
+                        spec=spec,
+                        cmd_specs=group,
+                        intents=intents,
+                        out_dir=out_dir,
+                        intent_idx=None,
+                    )
+                    emitted += 1
+                    logger.info("cli_app: emitted %s", task_path.name)
+                    pipeline._emit_progress(task_path.name, "emit")
+                except _TaskRejected as exc:
+                    skip_reasons[exc.reason] = skip_reasons.get(exc.reason, 0) + 1
+                    pipeline._emit_progress(label, "skip", exc.reason)
+                except Exception as exc:
+                    logger.exception(
+                        "cli_app: subset task synthesis failed for %s: %s", label, exc
+                    )
+                    skip_reasons["synthesis_error"] = (
+                        skip_reasons.get("synthesis_error", 0) + 1
+                    )
+                    pipeline._emit_progress(label, "skip", f"synthesis_error: {exc}")
+            return PipelineResult(
+                candidates=candidates_seen,
+                emitted=emitted,
+                skipped=sum(skip_reasons.values()),
+                out_dir=out_dir,
+                skip_reasons=skip_reasons,
+            )
+
         # Emit per_command (default) or per_intent (one task per (cmd, intent))
         for cmd_spec in target_commands:
             if emitted >= options.limit:
@@ -283,7 +448,7 @@ def run_cli_app_pipeline(
                         pipeline=pipeline,
                         options=options,
                         spec=spec,
-                        cmd_spec=cmd_spec,
+                        cmd_specs=[cmd_spec],
                         intents=intent_slice,
                         out_dir=out_dir,
                         intent_idx=intent_idx,
@@ -328,12 +493,25 @@ def _build_one_task(
     pipeline: "CodeInstructPipeline",
     options: "CodeInstructOptions",
     spec: CliSpec,
-    cmd_spec: CommandSpec,
+    cmd_specs: list[CommandSpec],
     intents: list[TestIntent],
     out_dir: Path,
     intent_idx: int | None = None,
 ) -> Path:
-    """Synthesise + verify + emit ONE Harbor task for one command."""
+    """Synthesise + verify + emit ONE Harbor task for one command, or for a
+    compatible subset of commands.
+
+    `cmd_specs` holds a single CommandSpec for the original single-command task
+    (output stays byte-identical) or several for a subset task. Subset tasks
+    additionally synthesise cross-command workflow tests and a multi-command
+    oracle + instruction.
+    """
+    is_subset = len(cmd_specs) > 1
+    cmd_names = [c.name for c in cmd_specs]
+    # Canonical, order-independent slugs. Single-command keeps the bare command
+    # name so existing task_ids / cache keys / filenames are unchanged.
+    cmd_slug = cmd_names[0] if not is_subset else "+".join(sorted(cmd_names))
+    id_slug = cmd_names[0] if not is_subset else "_".join(sorted(cmd_names))
 
     # ----- LLM: translate each intent into a black-box test -----
     translated: list[str] = []
@@ -345,12 +523,12 @@ def _build_one_task(
     if not translated:
         raise _TaskRejected("no_translatable_intents")
 
-    # ----- LLM: synthesise oracle for this command (cached per command) -----
-    cache_key = f"{spec.spec_sha256}|{cmd_spec.name}"
+    # ----- LLM: synthesise oracle (cached per command-or-subset) -----
+    cache_key = f"{spec.spec_sha256}|{cmd_slug}"
     if cache_key in _ORACLE_CACHE:
         oracle_code = _ORACLE_CACHE[cache_key]
     else:
-        oracle_code = _synthesise_oracle(pipeline, options, spec, cmd_spec, intents)
+        oracle_code = _synthesise_oracle(pipeline, options, spec, cmd_specs, intents)
         if oracle_code is not None:
             _ORACLE_CACHE[cache_key] = oracle_code
     if oracle_code is None:
@@ -359,9 +537,16 @@ def _build_one_task(
     # ----- Build supporting files -----
     conftest = _build_conftest()
     test_files = {
-        f"test_{spec.command_prefix}_{cmd_spec.name}_{i:02d}.py": code
+        f"test_{spec.command_prefix}_{id_slug}_{i:02d}.py": code
         for i, code in enumerate(translated)
     }
+    # ----- Cross-command workflow tests (subset tasks only) -----
+    if is_subset and options.cli_app_workflow_tests > 0:
+        workflow_tests = _synthesise_workflow_tests(
+            pipeline, options, spec, cmd_specs, intents
+        )
+        for j, code in enumerate(workflow_tests):
+            test_files[f"test_{spec.command_prefix}_workflow_{j:02d}.py"] = code
     dockerfile = _build_dockerfile()
     test_script = _build_test_script()
 
@@ -378,6 +563,38 @@ def _build_one_task(
             raise _TaskRejected("all_tests_failed_static_gauntlet")
         test_files = survivors
 
+    # ----- Reference grounding (opt-in): keep ONLY tests that BOTH the real
+    # aws CLI AND the synthesised oracle pass, and that the empty stub fails.
+    # Filters out LLM-hallucinated/brittle tests and guarantees the gold patch
+    # solves its own task. The `aws` binary lives only in the gauntlet image,
+    # never in the shipped task image (anti-cheat).
+    reference_grounding = None
+    if options.cli_app_reference_grounding:
+        tests_aux = {"tests/conftest.py": conftest, "tests/__init__.py": ""}
+        for fname, code in test_files.items():
+            tests_aux[f"tests/{fname}"] = code
+        reference_grounding = _run_reference_grounding(
+            dockerfile_content=dockerfile,
+            tests_aux=tests_aux,
+            test_script=test_script,
+            oracle_code=oracle_code,
+            timeout_sec=options.cli_app_docker_timeout_sec,
+        )
+        if reference_grounding.get("skipped"):
+            raise _TaskRejected("reference_grounding_unavailable")
+        grounded = reference_grounding["grounded_files"]
+        logger.info(
+            "reference grounding: %d ref-pass & %d oracle-pass -> %d grounded "
+            "(empty-stub passed %d of all)",
+            reference_grounding["n_reference"], reference_grounding["n_oracle"],
+            len(grounded), reference_grounding["n_empty"],
+        )
+        if len(grounded) < options.cli_app_min_grounded_tests:
+            raise _TaskRejected(
+                f"reference_grounding_insufficient_tests_{len(grounded)}"
+            )
+        test_files = {f: c for f, c in test_files.items() if f in grounded}
+
     # ----- Assemble aux_files for Harbor (tests/ subdir) -----
     aux_files: dict[str, str] = {"tests/conftest.py": conftest, "tests/__init__.py": ""}
     for fname, code in test_files.items():
@@ -387,14 +604,17 @@ def _build_one_task(
     gold_diff = make_multi_file_diff({"submission/main.py": oracle_code})
 
     # ----- instruction.md (rendered from spec, NEVER from tests) -----
-    instruction_md = _build_instruction_md(spec, cmd_spec, intents)
+    if is_subset:
+        instruction_md = _build_subset_instruction_md(spec, cmd_specs, intents)
+    else:
+        instruction_md = _build_instruction_md(spec, cmd_specs[0], intents)
     _assert_no_test_leakage(instruction_md, test_files)
 
     # ----- task_id derived from spec sha + command + prompt version (+ intent_idx) -----
     h = hashlib.sha256()
     h.update(spec.spec_sha256.encode())
     h.update(b"\0")
-    h.update(cmd_spec.name.encode())
+    h.update(cmd_slug.encode())
     h.update(b"\0")
     h.update(PROMPT_TEMPLATE_VERSION.encode())
     if intent_idx is not None:
@@ -406,7 +626,7 @@ def _build_one_task(
         idx_suffix = f"-i{intent_idx:02d}"
     else:
         idx_suffix = ""
-    task_id = f"{spec.name}-cliapp-{cmd_spec.name}{idx_suffix}-{h.hexdigest()[:10]}"
+    task_id = f"{spec.name}-cliapp-{id_slug}{idx_suffix}-{h.hexdigest()[:10]}"
 
     # ----- Pre-compute content_hash covering spec + tests + oracle + instr -----
     # Overrides harbor.py's default which only covers instruction + diff.
@@ -462,7 +682,7 @@ def _build_one_task(
         "code_instruct": {
             "mode": "cli_app",
             "command_prefix": spec.command_prefix,
-            "command": cmd_spec.name,
+            "command": cmd_slug,
             "cli_spec_sha256": spec.spec_sha256,
             "prompt_template_version": PROMPT_TEMPLATE_VERSION,
             "translation_model": _translation_model_id(pipeline, options),
@@ -483,6 +703,24 @@ def _build_one_task(
             "behaviour_tag_counts": _count_behaviour_tags(intents),
         },
     }
+    if is_subset:
+        repo2env["code_instruct"]["commands"] = sorted(cmd_names)
+        repo2env["code_instruct"]["subset"] = True
+        # count workflow tests that actually shipped (post static gauntlet)
+        repo2env["code_instruct"]["workflow_tests"] = sum(
+            1 for f in test_files if "_workflow_" in f
+        )
+    if reference_grounding is not None and not reference_grounding.get("skipped"):
+        repo2env["code_instruct"]["reference_grounding"] = {
+            "reference": "aws-cli",
+            "awscli_version": PINNED_AWSCLI,
+            "n_reference_pass": reference_grounding["n_reference"],
+            "n_oracle_pass": reference_grounding["n_oracle"],
+            "n_empty_stub_pass": reference_grounding["n_empty"],
+            "tests_shipped": len(test_files),
+            "discriminative": True,
+            "oracle_solves_all_shipped": True,
+        }
     if gauntlet_g34 is not None and not gauntlet_g34.get("skipped"):
         repo2env["code_instruct"]["docker_gauntlet"] = {
             "g3_empty_pass_rate": round(gauntlet_g34["g3_empty_pass_rate"], 4),
@@ -495,18 +733,28 @@ def _build_one_task(
             "image_tag": gauntlet_g34.get("image_tag", ""),
         }
 
+    if is_subset:
+        description = (
+            f"Implement an `aws {spec.command_prefix}` CLI subset "
+            f"({', '.join(sorted(cmd_names))}) from scratch"
+        )[:120]
+        keywords = [spec.name, "code_instruct", "cli_app", "subset", *sorted(cmd_names)]
+    else:
+        description = (
+            f"Implement `aws {spec.command_prefix} {cmd_names[0]}` from scratch"
+        )[:120]
+        keywords = [spec.name, "code_instruct", "cli_app", cmd_names[0]]
+
     task = HarborTask(
         name=task_id,
         org=pipeline.input.output.org,
-        description=(
-            f"Implement `aws {spec.command_prefix} {cmd_spec.name}` from scratch"
-        )[:120],
+        description=description,
         instruction=instruction_md,
         oracle_diff=gold_diff,
         repo2env=repo2env,
         difficulty="medium",
         category="feature",
-        keywords=[spec.name, "code_instruct", "cli_app", cmd_spec.name],
+        keywords=keywords,
         environment_dockerfile=dockerfile,
         test_script=test_script,
         aux_files=aux_files,
@@ -554,26 +802,45 @@ def _synthesise_oracle(
     pipeline: "CodeInstructPipeline",
     options: "CodeInstructOptions",
     spec: CliSpec,
-    cmd_spec: CommandSpec,
+    cmd_specs: list[CommandSpec],
     intents: list[TestIntent],
 ) -> str | None:
-    """One LLM call per command. Returns oracle source code or None on failure."""
+    """One LLM call per command-or-subset. Returns oracle source or None.
+
+    For a single command the prompt is byte-identical to the original. For a
+    subset, a multi-command oracle prompt asks for one `main.py` implementing
+    every subcommand, dispatched on argv.
+    """
     behaviours = _summarise_behaviours_from_intents(intents)
-    user = ORACLE_USER_TEMPLATE.format(
-        command_prefix=spec.command_prefix,
-        command=cmd_spec.name,
-        behaviours_bulleted="\n".join(f"- {b}" for b in behaviours),
-    )
+    behaviours_bulleted = "\n".join(f"- {b}" for b in behaviours)
+    if len(cmd_specs) > 1:
+        commands_csv = ", ".join(
+            f"`{spec.command_prefix} {c.name}`" for c in cmd_specs
+        )
+        system = ORACLE_SUBSET_SYSTEM
+        user = ORACLE_SUBSET_USER_TEMPLATE.format(
+            command_prefix=spec.command_prefix,
+            commands_csv=commands_csv,
+            behaviours_bulleted=behaviours_bulleted,
+        )
+    else:
+        system = ORACLE_SYSTEM
+        user = ORACLE_USER_TEMPLATE.format(
+            command_prefix=spec.command_prefix,
+            command=cmd_specs[0].name,
+            behaviours_bulleted=behaviours_bulleted,
+        )
+    cmd_label = "+".join(c.name for c in cmd_specs)
     try:
         resp = complete(
             pipeline.input.llm,
-            system=ORACLE_SYSTEM,
+            system=system,
             user=user,
             max_tokens=options.max_llm_tokens,
             temperature=options.llm_temperature,
         )
     except Exception as exc:
-        logger.warning("oracle synthesis failed for command=%s: %s", cmd_spec.name, exc)
+        logger.warning("oracle synthesis failed for command=%s: %s", cmd_label, exc)
         return None
     pipeline._llm_cost_usd += resp.cost_usd
     code = _strip_code_fence(resp.content)
@@ -583,6 +850,142 @@ def _synthesise_oracle(
         logger.warning("oracle synthesis returned invalid Python: %s", exc)
         return None
     return code
+
+
+# Prepended to every workflow-test module so each is self-contained after the
+# multi-function LLM response is split into one file per test function.
+_WF_IMPORT_PREAMBLE = "import boto3\nimport botocore\nimport botocore.exceptions\n\n\n"
+
+
+def _synthesise_workflow_tests(
+    pipeline: "CodeInstructPipeline",
+    options: "CodeInstructOptions",
+    spec: CliSpec,
+    cmd_specs: list[CommandSpec],
+    intents: list[TestIntent],
+) -> list[str]:
+    """One LLM call per subset -> cross-command workflow pytest modules.
+
+    Each returned string is a standalone module (import preamble + one
+    `def test_workflow_*`). Returns [] on failure so the per-command tests still
+    ship. Tests chain `cli(*argv)` calls and assert on `s3_client` state across
+    commands. Built from the hand-authored _COMMAND_STATE_MODEL + intents, never
+    from raw test code.
+    """
+    subset_names = sorted(c.name for c in cmd_specs)
+    state_blocks: list[str] = []
+    for name in subset_names:
+        sm = _COMMAND_STATE_MODEL.get((spec.command_prefix, name))
+        if sm:
+            state_blocks.append(f"{spec.command_prefix} {name}:\n{sm}")
+    state_models_joined = "\n\n".join(state_blocks) if state_blocks else "(none)"
+
+    shapes: list[str] = []
+    seen: set[str] = set()
+    for intent in intents:
+        shape = _argv_shape(intent.cmdline_template)
+        if shape and shape not in seen:
+            seen.add(shape)
+            shapes.append(f"- `{shape}`")
+    argv_shapes_bulleted = "\n".join(shapes) if shapes else "- (none observed)"
+
+    n_workflows = max(1, options.cli_app_workflow_tests)
+    user = WORKFLOW_USER_TEMPLATE.format(
+        command_prefix=spec.command_prefix,
+        subset_csv=", ".join(subset_names),
+        state_models_joined=state_models_joined,
+        argv_shapes_bulleted=argv_shapes_bulleted,
+        n_workflows=n_workflows,
+    )
+    try:
+        resp = complete(
+            pipeline.input.llm,
+            system=WORKFLOW_SYSTEM,
+            user=user,
+            max_tokens=options.max_llm_tokens,
+            temperature=options.llm_temperature,
+        )
+    except Exception as exc:
+        logger.warning(
+            "workflow-test synthesis failed for subset=%s: %s", subset_names, exc
+        )
+        return []
+    pipeline._llm_cost_usd += resp.cost_usd
+    code = _strip_code_fence(resp.content)
+    return _split_workflow_functions(
+        code, allowed_commands=set(subset_names), prefix=spec.command_prefix
+    )
+
+
+def _split_workflow_functions(
+    code: str, *, allowed_commands: set[str], prefix: str
+) -> list[str]:
+    """Split a multi-function workflow blob into one self-contained module per
+    `test_*` function. Functions whose `cli(...)` calls reference a subcommand
+    outside the subset are dropped (the combined oracle won't implement it).
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as exc:
+        logger.warning("workflow-test synthesis returned invalid Python: %s", exc)
+        return []
+    # Preserve the LLM's module-level imports (e.g. `import uuid`, `import os`)
+    # so each split-out function module is self-contained — otherwise a
+    # function that uses a module-level import NameErrors after splitting.
+    module_imports: list[str] = []
+    for node in tree.body:
+        if isinstance(node, ast.Import | ast.ImportFrom):
+            seg = ast.get_source_segment(code, node)
+            if seg:
+                module_imports.append(seg)
+    header = _WF_IMPORT_PREAMBLE
+    if module_imports:
+        header += "\n".join(module_imports) + "\n\n\n"
+    out: list[str] = []
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef) or not node.name.startswith("test_"):
+            continue
+        stray = _commands_used_in_cli_calls(node, prefix) - allowed_commands
+        if stray:
+            logger.info(
+                "workflow test %s references out-of-subset commands %s; dropping",
+                node.name, sorted(stray),
+            )
+            continue
+        src = ast.get_source_segment(code, node)
+        if not src:
+            continue
+        out.append(header + src.strip() + "\n")
+    return out
+
+
+def _commands_used_in_cli_calls(fn: ast.FunctionDef, prefix: str) -> set[str]:
+    """Best-effort: subcommand tokens passed to `cli(...)` calls in the function.
+
+    Recognises `cli("s3", "mb", ...)` -> {"mb"}: the token after the command
+    prefix. If the leading literal is not the prefix (the model omitted it,
+    e.g. `cli("mb", ...)`), the first literal is taken as the subcommand.
+    Non-literal args are ignored, so the check is lenient (only drops a test
+    when it clearly invokes a foreign subcommand).
+    """
+    used: set[str] = set()
+    for node in ast.walk(fn):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "cli"
+        ):
+            literals = [
+                a.value
+                for a in node.args
+                if isinstance(a, ast.Constant) and isinstance(a.value, str)
+            ]
+            if not literals:
+                continue
+            toks = literals[1:] if literals[0] == prefix else literals
+            if toks:
+                used.add(toks[0])
+    return used
 
 
 # ---------------------------------------------------------------------------
@@ -997,6 +1400,157 @@ def _build_instruction_md(
     return "\n".join(parts) + "\n"
 
 
+# ---------------------------------------------------------------------------
+# Subset (multi-command) instruction.md
+# ---------------------------------------------------------------------------
+
+
+# Cross-command observable contracts, keyed by the command whose effect another
+# command must observe. Used to render the "Cross-command behaviour" section so
+# the agent knows state must stay consistent across subcommands.
+_CROSS_COMMAND_INVARIANTS_BY_CMD: dict[str, str] = {
+    "mb": "After `mb s3://bucket`, the bucket appears in `ls` (no path).",
+    "rb": (
+        "After `rb s3://bucket`, the bucket disappears from `ls`; `rb` on a "
+        "non-empty bucket fails unless `--force` is given."
+    ),
+    "cp": (
+        "After `cp <local> s3://bucket/key`, the object is listed by "
+        "`ls s3://bucket/` and retrievable; `cp s3://bucket/key <local2>` yields "
+        "bytes identical to the original (round-trip identity)."
+    ),
+    "mv": (
+        "After `mv A B`, the source no longer exists and the destination does "
+        "(mv behaves like a copy followed by removal of the source)."
+    ),
+    "rm": "After `rm s3://bucket/key`, the object is no longer listed or retrievable.",
+    "ls": "`ls` reflects exactly the cumulative effect of the prior commands at every step.",
+    "sync": (
+        "A second `sync` over an unchanged source/destination transfers nothing "
+        "(idempotent); the destination set is a superset of the source."
+    ),
+}
+
+
+def _cross_command_invariants(prefix: str, names: list[str]) -> str:
+    """Render the cross-command behaviour bullets for a subset."""
+    bullets: list[str] = []
+    for n in names:
+        inv = _CROSS_COMMAND_INVARIANTS_BY_CMD.get(n)
+        if inv:
+            bullets.append(f"- {inv}")
+    if {"cp", "rb"} <= set(names) or {"sync", "rb"} <= set(names):
+        bullets.append(
+            "- A bucket populated by `cp`/`sync` cannot be removed by a plain `rb` "
+            "until its objects are removed (e.g. via `rm`)."
+        )
+    if not bullets:
+        bullets.append(
+            "- After any successful operation, its effect MUST be observable via the "
+            "documented read operations of the other commands."
+        )
+    return "\n".join(bullets) + "\n"
+
+
+def _command_section_parts(
+    spec: CliSpec, cmd_spec: CommandSpec, intents: list[TestIntent]
+) -> list[str]:
+    """Compact per-command spec section for a subset instruction.md."""
+    prefix = spec.command_prefix
+    cmd_label = f"{prefix} {cmd_spec.name}"
+    parts: list[str] = [f"### Command: `{cmd_label}`\n"]
+
+    shapes: list[str] = []
+    seen: set[str] = set()
+    for intent in intents:
+        shape = _argv_shape(intent.cmdline_template)
+        if shape and shape not in seen:
+            seen.add(shape)
+            shapes.append(f"- `{shape}`")
+    if shapes:
+        parts.append("Observed argv patterns:\n")
+        parts.extend(shapes)
+        parts.append("")
+
+    flags = _extract_flags_from_intents(intents)
+    if flags:
+        parts.append("Flags observed: " + ", ".join(f"`{f}`" for f in sorted(flags)) + "\n")
+
+    state_model = _COMMAND_STATE_MODEL.get((prefix, cmd_spec.name))
+    if state_model:
+        parts.append("Behaviour & state expectations:\n")
+        parts.append(state_model + "\n")
+
+    by_tag = _group_by_tag(intents)
+    if by_tag.get("error"):
+        parts.append("Error cases:")
+        for intent in by_tag["error"]:
+            shape = _argv_shape(intent.cmdline_template) or "<argv>"
+            parts.append(f"- `{shape}` -> exit `{intent.expected_exit}`")
+        parts.append("")
+    return parts
+
+
+def _build_subset_instruction_md(
+    spec: CliSpec, cmd_specs: list[CommandSpec], intents: list[TestIntent]
+) -> str:
+    """Agent-facing instruction.md for a multi-command subset task.
+
+    Overview + one section per subcommand (interface + I/O + state) + a
+    cross-command behaviour section. Built ONLY from CliSpec + intents + the
+    hand-authored _COMMAND_STATE_MODEL — never from test code. `_assert_no_test_leakage`
+    is the safety net.
+    """
+    prefix = spec.command_prefix
+    names = sorted(c.name for c in cmd_specs)
+    label_list = ", ".join(f"`{prefix} {n}`" for n in names)
+    parts: list[str] = []
+
+    parts.append(f"# Build an `aws {prefix}` CLI (subset: {', '.join(names)})\n")
+    parts.append(
+        "## Application overview\n\n"
+        f"You are implementing a subset of the AWS CLI's `{prefix}` command family:\n"
+        f"{label_list}. The agent is given **no source code**, only this specification.\n"
+        "Your implementation is a single file, invoked as a subprocess:\n\n"
+        "```bash\n"
+        f"python /workspace/submission/main.py {prefix} <command> [args...]\n"
+        "```\n\n"
+        "Dispatch on the `<command>` token so one program handles every subcommand\n"
+        "above. The harness configures the runtime so that `boto3.client('s3')`\n"
+        "connects to a sandboxed, isolated S3 service. Use boto3's defaults — do not\n"
+        "override the service address, region, or credentials in your code; they are\n"
+        "set by the environment. Treat the S3 backend as real AWS S3, and keep state\n"
+        "consistent across commands so a sequence like upload, list, download, remove\n"
+        "behaves correctly end-to-end.\n"
+    )
+
+    parts.append("## Commands\n")
+    by_cmd: dict[str, list[TestIntent]] = {}
+    for i in intents:
+        by_cmd.setdefault(i.command, []).append(i)
+    for c in sorted(cmd_specs, key=lambda c: c.name):
+        parts.extend(_command_section_parts(spec, c, by_cmd.get(c.name, [])))
+
+    parts.append("## Cross-command behaviour (state must stay consistent)\n")
+    parts.append(_cross_command_invariants(prefix, names))
+
+    parts.append(
+        "## Implementation constraints\n\n"
+        "- **Python 3.11** standard library + `boto3` only.\n"
+        "- **Do NOT** import `awscli` or shell out to the real `aws` binary.\n"
+        "- Use `boto3.client('s3')` with its defaults. Do not set the service address,\n"
+        "  region, or credentials in code; the runtime environment configures them.\n"
+        "- Success messages go to **stdout**; errors go to **stderr**. Do not mix them.\n"
+        "- Exit code: `0` on success, `1` on application error, `2`/`255` on argument errors\n"
+        "  (matching aws-cli's conventions).\n"
+        "- Suppress raw `botocore.exceptions.ClientError` tracebacks — print only the\n"
+        "  user-facing error string.\n"
+        "- Everything lives in `/workspace/submission/main.py` — a single file that\n"
+        "  dispatches on the subcommand.\n"
+    )
+    return "\n".join(parts) + "\n"
+
+
 def _group_by_tag(intents: list[TestIntent]) -> dict[str, list[TestIntent]]:
     out: dict[str, list[TestIntent]] = {}
     for i in intents:
@@ -1383,4 +1937,119 @@ def _run_docker_gauntlet_g3g4(
         "g4_oracle_passed": g4["passed"],
         "g4_oracle_total": g4["total"],
         "g4_pass": g4["pass_rate"] >= oracle_min,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Reference grounding — real aws-cli as the ground-truth oracle
+#
+# The synthesised tests (translated from aws-cli's own functional tests) and
+# the synthesised oracle are generated independently, so they disagree on ~15-
+# 25% of assertions (error wording, output format, edge cases). Reference
+# grounding resolves this: it runs the test bank against (a) the REAL `aws`
+# binary, (b) the empty stub, and (c) the synthesised oracle, then ships only
+# the tests that the real aws CLI AND the oracle both pass and the empty stub
+# fails. Result: every shipped test matches real S3-CLI behaviour AND is solved
+# by the gold patch, while staying discriminative.
+#
+# `aws` is installed ONLY in the gauntlet image (a derived layer on top of the
+# task Dockerfile), never in the shipped task image — the agent must still build
+# the CLI from scratch.
+# ---------------------------------------------------------------------------
+
+# aws-cli v1 (pip-installable, botocore-based, honours AWS_ENDPOINT_URL → moto).
+PINNED_AWSCLI = "awscli==1.45.24"
+
+# Mounted as /workspace/submission/main.py during the reference run: forwards
+# argv to the real `aws` binary, so `cli("s3","mb",...)` runs `aws s3 mb ...`
+# against the same moto server the test fixtures point at.
+_REFERENCE_SHIM = (
+    "import subprocess\n"
+    "import sys\n"
+    "raise SystemExit(subprocess.run(['aws', *sys.argv[1:]]).returncode)\n"
+)
+
+_PERTEST_PASS_RE = _re_g34.compile(r"^(tests/\S+\.py)::\S+\s+PASSED", _re_g34.M)
+
+
+def _docker_run_pertest(
+    image_tag: str,
+    bundle_dir: Path,
+    timeout_sec: int,
+    override_path: Path | None = None,
+) -> set[str]:
+    """Run the test bank in the container; return the set of test-FILE names
+    that PASSED (one test function per file, so file-level == test-level).
+    """
+    cmd = [
+        "docker", "run", "--rm",
+        "--cpus=1.0", "--memory=1g", "--network=none",
+        "-v", f"{bundle_dir / 'tests'}:/workspace/tests:ro",
+    ]
+    if override_path is not None:
+        cmd.extend(["-v", f"{override_path}:/workspace/submission/main.py:ro"])
+    cmd.extend([image_tag, "bash", "/workspace/tests/test.sh"])
+    try:
+        result = _sp_g34.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+    except _sp_g34.TimeoutExpired:
+        return set()
+    out = result.stdout + "\n" + result.stderr
+    return {Path(m.group(1)).name for m in _PERTEST_PASS_RE.finditer(out)}
+
+
+def _run_reference_grounding(
+    *,
+    dockerfile_content: str,
+    tests_aux: dict[str, str],
+    test_script: str,
+    oracle_code: str,
+    timeout_sec: int,
+) -> dict:
+    """Ground the test bank against the real aws CLI + oracle + empty stub.
+
+    Returns {'skipped': True, ...} if docker unavailable. Otherwise returns the
+    grounded file set = (reference-pass ∩ oracle-pass) − empty-pass, plus counts.
+    """
+    ref_dockerfile = (
+        dockerfile_content
+        + "\n# Reference oracle for gauntlet grounding ONLY (not the shipped image)\n"
+        + f"RUN pip install --no-cache-dir {PINNED_AWSCLI}\n"
+    )
+    with _tmp_g34.TemporaryDirectory(prefix="r2e-refground-ctx-") as ctx_str:
+        ctx = Path(ctx_str)
+        (ctx / "Dockerfile").write_text(ref_dockerfile)
+        image = _build_or_reuse_docker_image(ref_dockerfile, ctx)
+    if image is None:
+        return {"skipped": True, "reason": "docker_unavailable"}
+
+    with _tmp_g34.TemporaryDirectory(prefix="r2e-refground-bundle-") as b_str:
+        bundle = Path(b_str)
+        (bundle / "tests").mkdir()
+        for rel, content in tests_aux.items():
+            if rel.startswith("tests/"):
+                tgt = bundle / rel
+                tgt.parent.mkdir(parents=True, exist_ok=True)
+                tgt.write_text(content)
+        (bundle / "tests" / "test.sh").write_text(test_script)
+        (bundle / "tests" / "test.sh").chmod(0o755)
+
+        ref_path = bundle / "reference_main.py"
+        ref_path.write_text(_REFERENCE_SHIM)
+        reference_pass = _docker_run_pertest(image, bundle, timeout_sec, ref_path)
+
+        empty_pass = _docker_run_pertest(image, bundle, timeout_sec, None)
+
+        oracle_path = bundle / "oracle_main.py"
+        oracle_path.write_text(oracle_code)
+        oracle_pass = _docker_run_pertest(image, bundle, timeout_sec, oracle_path)
+
+    grounded = (reference_pass & oracle_pass) - empty_pass
+    return {
+        "skipped": False,
+        "image_tag": image,
+        "grounded_files": grounded,
+        "n_reference": len(reference_pass),
+        "n_oracle": len(oracle_pass),
+        "n_empty": len(empty_pass),
+        "n_grounded": len(grounded),
     }
