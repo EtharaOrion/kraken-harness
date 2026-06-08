@@ -32,6 +32,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -513,6 +514,26 @@ def _build_one_task(
     cmd_slug = cmd_names[0] if not is_subset else "+".join(sorted(cmd_names))
     id_slug = cmd_names[0] if not is_subset else "_".join(sorted(cmd_names))
 
+    # Snapshot the run-cumulative LLM spend so this task records only ITS OWN
+    # incremental cost: metadata `llm_cost_usd` = delta (this task), while
+    # `run_llm_cost_usd` keeps the cumulative total so the dataset still
+    # reconciles to the provider bill. `pipeline._llm_cost_usd` itself stays
+    # cumulative for the max_llm_spend_usd cap; a rejected task's cost is NOT
+    # folded into the next emitted task.
+    #
+    # Known limitations (documented, not bugs):
+    #   * Assumes SEQUENTIAL task generation. If task building is ever
+    #     parallelised, this snapshot/delta on a shared counter would race;
+    #     switch to per-call accumulation then.
+    #   * In per_intent mode the per-command oracle is cached, so the FIRST
+    #     intent-task of a command carries the oracle-synthesis cost and later
+    #     intent-tasks of that command look translation-only. Subset/per-command
+    #     tasks each synthesise their own oracle, so their delta is complete.
+    #   * Sibling pipelines (code_instruct snippet, equivalence_tests,
+    #     mutation_bugs) still emit `llm_cost_usd` as a run-cumulative value;
+    #     this per-task semantics is cli_app-only by design (see docs).
+    _llm_cost_before = pipeline._llm_cost_usd
+
     # ----- LLM: translate each intent into a black-box test -----
     translated: list[str] = []
     for intent in intents:
@@ -698,7 +719,9 @@ def _build_one_task(
             "runtime_memory_mb": 1024,
             "runtime_network": "none",
             "runtime_timeout_sec": 300,
-            "llm_cost_usd": round(pipeline._llm_cost_usd, 6),
+            "llm_cost_usd": round(pipeline._llm_cost_usd - _llm_cost_before, 6),
+            "run_llm_cost_usd": round(pipeline._llm_cost_usd, 6),
+            "llm_cost_method": _llm_cost_method(),
             "behaviour_tags": sorted({i.behaviour_tag for i in intents}),
             "behaviour_tag_counts": _count_behaviour_tags(intents),
         },
@@ -1809,6 +1832,20 @@ def _count_behaviour_tags(intents: list[TestIntent]) -> dict[str, int]:
     for i in intents:
         counts[i.behaviour_tag] = counts.get(i.behaviour_tag, 0) + 1
     return counts
+
+
+def _llm_cost_method() -> str:
+    """Audit string for how `llm_cost_usd` was derived (it is an ESTIMATE).
+
+    litellm cannot price opaque Bedrock application-inference-profile ARNs, so
+    llm.py falls back to token_count x configured per-1M rates. Recording the
+    rates here makes the estimate reproducible and prevents false precision.
+    """
+    inp = os.environ.get("R2E_COST_INPUT_PER_1M")
+    out = os.environ.get("R2E_COST_OUTPUT_PER_1M")
+    if inp or out:
+        return f"estimated_from_rates(input_per_1m={inp or '?'},output_per_1m={out or '?'})"
+    return "litellm_native_or_zero"
 
 
 def _parse_test_sh_summary(text: str) -> dict:
