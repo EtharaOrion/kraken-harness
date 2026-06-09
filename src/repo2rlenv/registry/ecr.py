@@ -69,7 +69,45 @@ def _parse_ecr_ref(remote_ref: str) -> tuple[str, str, bool] | None:
     return (region, repo, False)
 
 
-def ensure_ecr_repository(remote_ref: str) -> ECRRepoResult:
+def is_ecr_registry(uri: str) -> bool:
+    """True iff `uri` looks like an ECR registry hostname (private or public)."""
+    body = uri.split(":", 1)[0].split("@", 1)[0]
+    host = body.split("/", 1)[0]
+    if host == "public.ecr.aws":
+        return True
+    return host.endswith(".amazonaws.com") and ".dkr.ecr." in host
+
+
+def parse_ecr_region(uri: str) -> str | None:
+    """Return the AWS region for an ECR ref/registry, None if not ECR."""
+    body = uri.split(":", 1)[0].split("@", 1)[0]
+    host = body.split("/", 1)[0]
+    if host == "public.ecr.aws":
+        return "us-east-1"
+    if not (host.endswith(".amazonaws.com") and ".dkr.ecr." in host):
+        return None
+    parts = host.split(".")
+    if len(parts) < 6 or parts[1] != "dkr" or parts[2] != "ecr":
+        return None
+    return parts[3]
+
+
+def ecr_registry_from_ref(remote_ref: str) -> str | None:
+    """Return the registry hostname (no /repo) from any ECR ref/registry URI."""
+    body = remote_ref.split(":", 1)[0].split("@", 1)[0]
+    host = body.split("/", 1)[0]
+    if host == "public.ecr.aws":
+        return host
+    if host.endswith(".amazonaws.com") and ".dkr.ecr." in host:
+        return host
+    return None
+
+
+def ensure_ecr_repository(
+    remote_ref: str,
+    *,
+    profile: str | None = None,
+) -> ECRRepoResult:
     """Idempotent: create the ECR repository for `remote_ref` if it doesn't exist."""
     parsed = _parse_ecr_ref(remote_ref)
     if parsed is None:
@@ -78,6 +116,8 @@ def ensure_ecr_repository(remote_ref: str) -> ECRRepoResult:
 
     if not _aws_available():
         raise ECRError("aws CLI not available on PATH")
+
+    profile_args = ["--profile", profile] if profile else []
 
     if is_public:
         describe_args = [
@@ -88,6 +128,7 @@ def ensure_ecr_repository(remote_ref: str) -> ECRRepoResult:
             repo,
             "--region",
             "us-east-1",  # ECR Public is single-region (us-east-1)
+            *profile_args,
         ]
         create_args = [
             "aws",
@@ -97,6 +138,7 @@ def ensure_ecr_repository(remote_ref: str) -> ECRRepoResult:
             repo,
             "--region",
             "us-east-1",
+            *profile_args,
         ]
     else:
         describe_args = [
@@ -107,6 +149,7 @@ def ensure_ecr_repository(remote_ref: str) -> ECRRepoResult:
             repo,
             "--region",
             region_or_alias,
+            *profile_args,
         ]
         create_args = [
             "aws",
@@ -116,6 +159,7 @@ def ensure_ecr_repository(remote_ref: str) -> ECRRepoResult:
             repo,
             "--region",
             region_or_alias,
+            *profile_args,
         ]
 
     describe = subprocess.run(
@@ -132,8 +176,54 @@ def ensure_ecr_repository(remote_ref: str) -> ECRRepoResult:
     return ECRRepoResult(repo=repo, created=True, is_public=is_public)
 
 
+def ensure_docker_login_ecr(
+    registry: str,
+    region: str,
+    *,
+    profile: str | None = None,
+    timeout: int = 60,
+) -> None:
+    """Idempotent: `aws ecr get-login-password | docker login` for `registry`."""
+    if not _aws_available():
+        raise ECRError("aws CLI not available on PATH")
+    if shutil.which("docker") is None:
+        raise ECRError("docker CLI not available on PATH")
+    is_public = registry == "public.ecr.aws" or registry.startswith("public.ecr.aws/")
+    aws_args = [
+        "aws",
+        "ecr-public" if is_public else "ecr",
+        "get-login-password",
+        "--region",
+        region,
+    ]
+    if profile:
+        aws_args += ["--profile", profile]
+    proc = subprocess.run(aws_args, capture_output=True, text=True, timeout=timeout, check=False)
+    if proc.returncode != 0:
+        raise ECRError(
+            f"aws ecr get-login-password failed: {proc.stderr.strip() or proc.stdout.strip()}"
+        )
+    password = proc.stdout.strip()
+    login = subprocess.run(
+        ["docker", "login", "--username", "AWS", "--password-stdin", registry],
+        input=password,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    if login.returncode != 0:
+        raise ECRError(
+            f"docker login {registry} failed: {login.stderr.strip() or login.stdout.strip()}"
+        )
+
+
 __all__ = [
     "ECRError",
     "ECRRepoResult",
+    "ecr_registry_from_ref",
+    "ensure_docker_login_ecr",
     "ensure_ecr_repository",
+    "is_ecr_registry",
+    "parse_ecr_region",
 ]
