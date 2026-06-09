@@ -55,6 +55,15 @@ from repo2rlenv.pipelines._cli_app_extract import (
 )
 from repo2rlenv.pipelines._oss_instruct import make_multi_file_diff
 from repo2rlenv.pipelines.base import PipelineResult
+from repo2rlenv.registry.buildx import (
+    build_and_push_multiarch,
+    manifest_exists,
+)
+from repo2rlenv.registry.ecr import (
+    ensure_docker_login_ecr,
+    ensure_ecr_repository,
+    parse_ecr_region,
+)
 
 if TYPE_CHECKING:
     from repo2rlenv.pipelines.code_instruct import CodeInstructPipeline
@@ -339,16 +348,16 @@ def run_cli_app_pipeline(
                 if missing:
                     logger.warning(
                         "cli_app: subset %r references unknown commands %s (available: %s)",
-                        raw, missing, sorted(by_name),
+                        raw,
+                        missing,
+                        sorted(by_name),
                     )
                 group = [by_name[n] for n in names if n in by_name]
                 candidates_seen += 1
                 slug = "+".join(sorted(c.name for c in group))
                 label = f"{owner_name}:{slug or raw}"
                 if len(group) < 2:
-                    skip_reasons["subset_too_small"] = (
-                        skip_reasons.get("subset_too_small", 0) + 1
-                    )
+                    skip_reasons["subset_too_small"] = skip_reasons.get("subset_too_small", 0) + 1
                     pipeline._emit_progress(label, "skip", "subset_too_small")
                     continue
                 intents: list[TestIntent] = []
@@ -363,7 +372,9 @@ def run_cli_app_pipeline(
                     )
                 logger.info(
                     "cli_app: subset %s -> %d intents across %d commands",
-                    slug, len(intents), len(group),
+                    slug,
+                    len(intents),
+                    len(group),
                 )
                 if not intents:
                     skip_reasons["no_intents_extracted"] = (
@@ -388,12 +399,8 @@ def run_cli_app_pipeline(
                     skip_reasons[exc.reason] = skip_reasons.get(exc.reason, 0) + 1
                     pipeline._emit_progress(label, "skip", exc.reason)
                 except Exception as exc:
-                    logger.exception(
-                        "cli_app: subset task synthesis failed for %s: %s", label, exc
-                    )
-                    skip_reasons["synthesis_error"] = (
-                        skip_reasons.get("synthesis_error", 0) + 1
-                    )
+                    logger.exception("cli_app: subset task synthesis failed for %s: %s", label, exc)
+                    skip_reasons["synthesis_error"] = skip_reasons.get("synthesis_error", 0) + 1
                     pipeline._emit_progress(label, "skip", f"synthesis_error: {exc}")
             return PipelineResult(
                 candidates=candidates_seen,
@@ -415,9 +422,7 @@ def run_cli_app_pipeline(
                 command_filter=cmd_spec.name,
                 max_intents=options.cli_app_max_intents,
             )
-            logger.info(
-                "cli_app: extracted %d intents for command=%s", len(intents), cmd_spec.name
-            )
+            logger.info("cli_app: extracted %d intents for command=%s", len(intents), cmd_spec.name)
             if not intents:
                 candidates_seen += 1
                 skip_reasons["no_intents_extracted"] = (
@@ -461,12 +466,8 @@ def run_cli_app_pipeline(
                     skip_reasons[exc.reason] = skip_reasons.get(exc.reason, 0) + 1
                     pipeline._emit_progress(label, "skip", exc.reason)
                 except Exception as exc:
-                    logger.exception(
-                        "cli_app: task synthesis failed for %s: %s", label, exc
-                    )
-                    skip_reasons["synthesis_error"] = (
-                        skip_reasons.get("synthesis_error", 0) + 1
-                    )
+                    logger.exception("cli_app: task synthesis failed for %s: %s", label, exc)
+                    skip_reasons["synthesis_error"] = skip_reasons.get("synthesis_error", 0) + 1
                     pipeline._emit_progress(label, "skip", f"synthesis_error: {exc}")
 
     return PipelineResult(
@@ -487,6 +488,60 @@ class _TaskRejected(Exception):
 
 
 _ORACLE_CACHE: dict[str, str] = {}
+
+
+def _resolve_platforms(options: CodeInstructOptions) -> list[str]:
+    if options.cli_app_platforms:
+        return list(options.cli_app_platforms)
+    return ["linux/amd64", "linux/arm64"]
+
+
+def _resolve_ecr_profile(options: CodeInstructOptions) -> str | None:
+    if options.cli_app_ecr_profile:
+        return options.cli_app_ecr_profile
+    return os.environ.get("R2E_ECR_PROFILE")
+
+
+def _safe_repo_segment(s: str) -> str:
+    safe = re.sub(r"[^a-z0-9._/-]", "-", s.lower())
+    safe = re.sub(r"-+", "-", safe).strip("-")
+    return safe or "x"
+
+
+def _build_and_push_task_image(
+    *,
+    registry: str,
+    profile: str | None,
+    platforms: list[str],
+    owner_name: str,
+    task_slug: str,
+    uid: str,
+    aux_files: dict[str, str],
+    test_script: str,
+) -> str:
+    repo_segment = f"{_safe_repo_segment(owner_name)}__{_safe_repo_segment(task_slug)}"
+    image_ref = f"{registry}/{repo_segment}:{uid}"
+    if manifest_exists(image_ref):
+        logger.info("cli_app: ECR image already exists, skipping build: %s", image_ref)
+        return image_ref
+    region = parse_ecr_region(registry)
+    if region is None:
+        raise _TaskRejected(f"cli_app_ecr_unsupported_registry_{registry}")
+    ensure_ecr_repository(image_ref, profile=profile)
+    ensure_docker_login_ecr(registry, region, profile=profile)
+    with tempfile.TemporaryDirectory() as ctx:
+        ctx_path = Path(ctx)
+        (ctx_path / "Dockerfile").write_text(_build_dockerfile(bake_tests=True))
+        for rel, content in aux_files.items():
+            target = ctx_path / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+        tests_dir = ctx_path / "tests"
+        tests_dir.mkdir(parents=True, exist_ok=True)
+        (tests_dir / "test.sh").write_text(test_script)
+        logger.info("cli_app: pushing multi-arch image to ECR: %s", image_ref)
+        build_and_push_multiarch(context_dir=ctx_path, image_ref=image_ref, platforms=platforms)
+    return image_ref
 
 
 def _build_one_task(
@@ -563,12 +618,19 @@ def _build_one_task(
     }
     # ----- Cross-command workflow tests (subset tasks only) -----
     if is_subset and options.cli_app_workflow_tests > 0:
-        workflow_tests = _synthesise_workflow_tests(
-            pipeline, options, spec, cmd_specs, intents
-        )
+        workflow_tests = _synthesise_workflow_tests(pipeline, options, spec, cmd_specs, intents)
         for j, code in enumerate(workflow_tests):
             test_files[f"test_{spec.command_prefix}_workflow_{j:02d}.py"] = code
-    dockerfile = _build_dockerfile()
+    _ecr_registry: str | None = None
+    _ecr_profile: str | None = None
+    _ecr_platforms: list[str] = []
+    if options.cli_app_ecr_push:
+        if not options.cli_app_ecr_registry:
+            raise _TaskRejected("cli_app_ecr_push_requires_registry")
+        _ecr_registry = options.cli_app_ecr_registry
+        _ecr_profile = _resolve_ecr_profile(options)
+        _ecr_platforms = _resolve_platforms(options)
+    dockerfile = _build_dockerfile(bake_tests=options.cli_app_ecr_push)
     test_script = _build_test_script()
 
     # ----- Gauntlet G1-G2 (cheap, no Docker) -----
@@ -607,13 +669,13 @@ def _build_one_task(
         logger.info(
             "reference grounding: %d ref-pass & %d oracle-pass -> %d grounded "
             "(empty-stub passed %d of all)",
-            reference_grounding["n_reference"], reference_grounding["n_oracle"],
-            len(grounded), reference_grounding["n_empty"],
+            reference_grounding["n_reference"],
+            reference_grounding["n_oracle"],
+            len(grounded),
+            reference_grounding["n_empty"],
         )
         if len(grounded) < options.cli_app_min_grounded_tests:
-            raise _TaskRejected(
-                f"reference_grounding_insufficient_tests_{len(grounded)}"
-            )
+            raise _TaskRejected(f"reference_grounding_insufficient_tests_{len(grounded)}")
         test_files = {f: c for f, c in test_files.items() if f in grounded}
 
     # ----- Assemble aux_files for Harbor (tests/ subdir) -----
@@ -665,10 +727,7 @@ def _build_one_task(
     # Without this, tests can be non-discriminative (pass on empty stub).
     # Builds image once per Dockerfile (cached), runs pytest twice per task.
     gauntlet_g34 = None
-    if (
-        not options.cli_app_skip_gauntlet
-        and getattr(options, "cli_app_docker_gauntlet", False)
-    ):
+    if not options.cli_app_skip_gauntlet and getattr(options, "cli_app_docker_gauntlet", False):
         gauntlet_g34 = _run_docker_gauntlet_g3g4(
             dockerfile_content=dockerfile,
             aux_files=aux_files,
@@ -756,6 +815,26 @@ def _build_one_task(
             "image_tag": gauntlet_g34.get("image_tag", ""),
         }
 
+    _task_ecr_ref: str | None = None
+    if options.cli_app_ecr_push and _ecr_registry is not None:
+        _uid = content_hash.split(":", 1)[-1][:12]
+        _task_ecr_ref = _build_and_push_task_image(
+            registry=_ecr_registry,
+            profile=_ecr_profile,
+            platforms=_ecr_platforms,
+            owner_name=spec.name,
+            task_slug=id_slug,
+            uid=_uid,
+            aux_files=aux_files,
+            test_script=test_script,
+        )
+        repo2env["reproducibility"] = {
+            "mode": "registry",
+            "image_ref": _task_ecr_ref,
+            "image_tag": _task_ecr_ref,
+            "image_visibility": "private",
+        }
+
     if is_subset:
         description = (
             f"Implement an `aws {spec.command_prefix}` CLI subset "
@@ -763,9 +842,7 @@ def _build_one_task(
         )[:120]
         keywords = [spec.name, "code_instruct", "cli_app", "subset", *sorted(cmd_names)]
     else:
-        description = (
-            f"Implement `aws {spec.command_prefix} {cmd_names[0]}` from scratch"
-        )[:120]
+        description = (f"Implement `aws {spec.command_prefix} {cmd_names[0]}` from scratch")[:120]
         keywords = [spec.name, "code_instruct", "cli_app", cmd_names[0]]
 
     task = HarborTask(
@@ -837,9 +914,7 @@ def _synthesise_oracle(
     behaviours = _summarise_behaviours_from_intents(intents)
     behaviours_bulleted = "\n".join(f"- {b}" for b in behaviours)
     if len(cmd_specs) > 1:
-        commands_csv = ", ".join(
-            f"`{spec.command_prefix} {c.name}`" for c in cmd_specs
-        )
+        commands_csv = ", ".join(f"`{spec.command_prefix} {c.name}`" for c in cmd_specs)
         system = ORACLE_SUBSET_SYSTEM
         user = ORACLE_SUBSET_USER_TEMPLATE.format(
             command_prefix=spec.command_prefix,
@@ -929,9 +1004,7 @@ def _synthesise_workflow_tests(
             temperature=options.llm_temperature,
         )
     except Exception as exc:
-        logger.warning(
-            "workflow-test synthesis failed for subset=%s: %s", subset_names, exc
-        )
+        logger.warning("workflow-test synthesis failed for subset=%s: %s", subset_names, exc)
         return []
     pipeline._llm_cost_usd += resp.cost_usd
     code = _strip_code_fence(resp.content)
@@ -940,9 +1013,7 @@ def _synthesise_workflow_tests(
     )
 
 
-def _split_workflow_functions(
-    code: str, *, allowed_commands: set[str], prefix: str
-) -> list[str]:
+def _split_workflow_functions(code: str, *, allowed_commands: set[str], prefix: str) -> list[str]:
     """Split a multi-function workflow blob into one self-contained module per
     `test_*` function. Functions whose `cli(...)` calls reference a subcommand
     outside the subset are dropped (the combined oracle won't implement it).
@@ -972,7 +1043,8 @@ def _split_workflow_functions(
         if stray:
             logger.info(
                 "workflow test %s references out-of-subset commands %s; dropping",
-                node.name, sorted(stray),
+                node.name,
+                sorted(stray),
             )
             continue
         src = ast.get_source_segment(code, node)
@@ -993,11 +1065,7 @@ def _commands_used_in_cli_calls(fn: ast.FunctionDef, prefix: str) -> set[str]:
     """
     used: set[str] = set()
     for node in ast.walk(fn):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "cli"
-        ):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "cli":
             literals = [
                 a.value
                 for a in node.args
@@ -1048,13 +1116,27 @@ def _gauntlet_static(test_code: str) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 
-def _build_dockerfile() -> str:
-    """Pinned python-slim + pinned deps + determinism env + git init."""
+def _build_dockerfile(*, bake_tests: bool = False) -> str:
+    """Pinned python-slim + pinned deps + determinism env + git init; bake_tests COPYs tests/ for ECR per-task variance."""
     deps_line = " ".join(f'"{d}"' for d in PINNED_DEPS)
+    copy_tests = "COPY tests/ /workspace/tests/\n" if bake_tests else ""
     return (
         "# Auto-generated by Repo2RLEnv code_instruct cli_app mode\n"
         f"FROM python:{PINNED_PYTHON}\n"
-        "ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \\\n"
+        'ARG HTTP_PROXY=""\n'
+        'ARG HTTPS_PROXY=""\n'
+        'ARG NO_PROXY="localhost,127.0.0.1,::1"\n'
+        'ARG CA_CERT_PATH="/etc/ssl/certs/ca-certificates.crt"\n'
+        "ENV HTTP_PROXY=${HTTP_PROXY} \\\n"
+        "    HTTPS_PROXY=${HTTPS_PROXY} \\\n"
+        "    NO_PROXY=${NO_PROXY} \\\n"
+        "    http_proxy=${HTTP_PROXY} \\\n"
+        "    https_proxy=${HTTPS_PROXY} \\\n"
+        "    no_proxy=${NO_PROXY} \\\n"
+        "    SSL_CERT_FILE=${CA_CERT_PATH} \\\n"
+        "    REQUESTS_CA_BUNDLE=${CA_CERT_PATH} \\\n"
+        "    CURL_CA_BUNDLE=${CA_CERT_PATH} \\\n"
+        "    PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \\\n"
         "    PYTHONHASHSEED=0 TZ=UTC LC_ALL=C.UTF-8 \\\n"
         "    AWS_ACCESS_KEY_ID=testing AWS_SECRET_ACCESS_KEY=testing \\\n"
         "    AWS_DEFAULT_REGION=us-east-1\n"
@@ -1063,6 +1145,7 @@ def _build_dockerfile() -> str:
         "      git ca-certificates && rm -rf /var/lib/apt/lists/*\n"
         "RUN pip install --no-cache-dir --upgrade pip\n"
         f"RUN pip install --no-cache-dir {deps_line}\n"
+        f"{copy_tests}"
         # NOTE: don't pre-create submission/main.py — the gold patch is a
         # `new file` diff which `git apply` rejects with "already exists" if
         # the file is present. Just make the dir + an empty .gitkeep so git
@@ -1151,7 +1234,7 @@ def _build_test_script() -> str:
     of where test.sh ends up). Using `$(dirname $0)` makes the script work
     regardless of mount path.
     """
-    return '''#!/bin/bash
+    return """#!/bin/bash
 set -uxo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd /workspace
@@ -1178,7 +1261,7 @@ fi
 echo "$REWARD" > /logs/verifier/reward.txt
 echo "passed=$PASSED failed=$FAILED errors=$ERRORS reward=$REWARD"
 exit 0
-'''
+"""
 
 
 # Per-command state model. Hardcoded because it's NOT inferable from the
@@ -1286,9 +1369,7 @@ _OP_TO_ENGLISH: dict[str, str] = {
 }
 
 
-def _build_instruction_md(
-    spec: CliSpec, cmd_spec: CommandSpec, intents: list[TestIntent]
-) -> str:
+def _build_instruction_md(spec: CliSpec, cmd_spec: CommandSpec, intents: list[TestIntent]) -> str:
     """Render the agent-facing instruction.md.
 
     Matches the client doc's deliverable shape (Pilot RL Environment Creation,
@@ -1327,10 +1408,7 @@ def _build_instruction_md(
     parts.append(f"## Command: `{cmd_label}`\n")
 
     # 2a. Interface (positional args + flags)
-    parts.append(
-        "### Interface\n\n"
-        "Observed argv patterns (after `python submission/main.py`):\n"
-    )
+    parts.append("### Interface\n\nObserved argv patterns (after `python submission/main.py`):\n")
     seen_shapes: set[str] = set()
     for intent in intents:
         shape = _argv_shape(intent.cmdline_template)
@@ -1347,7 +1425,9 @@ def _build_instruction_md(
         parts.append("")
 
     # 2b. Expected I/O
-    success_ops = sorted({op for i in intents if i.expected_exit == 0 for op in i.expected_state_calls})
+    success_ops = sorted(
+        {op for i in intents if i.expected_exit == 0 for op in i.expected_state_calls}
+    )
     parts.append("### Expected I/O\n")
     parts.append("**On success (exit 0):**")
     parts.append(
@@ -1373,9 +1453,7 @@ def _build_instruction_md(
         parts.append("- Specific error cases:")
         for intent in by_tag["error"]:
             shape = _argv_shape(intent.cmdline_template) or "<argv>"
-            parts.append(
-                f"  - `{shape}` → exit `{intent.expected_exit}`"
-            )
+            parts.append(f"  - `{shape}` → exit `{intent.expected_exit}`")
     else:
         parts.append("- No error cases specified for this slice.")
     parts.append("")
@@ -1623,7 +1701,7 @@ def _argv_shape(tokens: list[str]) -> str:
 
 def _humanise_test_name(name: str) -> str:
     """Turn `test_nonzero_exit_if_invalid_path_provided` into a short phrase."""
-    s = name[len("test_"):] if name.startswith("test_") else name
+    s = name[len("test_") :] if name.startswith("test_") else name
     return s.replace("_", " ")
 
 
@@ -1697,6 +1775,7 @@ def _assert_no_test_leakage(instruction_md: str, test_files: dict[str, str]) -> 
     # Git SHA fingerprint: 12-40 char lowercase hex. Catches future templates
     # that quote a commit ref without using one of the labelled phrases above.
     import re as _re
+
     if _re.search(r"\b[0-9a-f]{12,40}\b", instruction_md):
         raise RuntimeError("test-infrastructure leakage: git-SHA-shaped token in instruction.md")
 
@@ -1754,9 +1833,7 @@ def _strip_code_fence(text: str) -> str:
     return s.strip() + "\n"
 
 
-def _translation_model_id(
-    pipeline: "CodeInstructPipeline", options: "CodeInstructOptions"
-) -> str:
+def _translation_model_id(pipeline: "CodeInstructPipeline", options: "CodeInstructOptions") -> str:
     if options.cli_app_translation_model:
         return options.cli_app_translation_model
     return pipeline.input.llm.qualified_name
@@ -1858,18 +1935,14 @@ def _parse_test_sh_summary(text: str) -> dict:
     return {"passed": p, "total": p + f + e, "pass_rate": r, "summary": text[-500:]}
 
 
-def _build_or_reuse_docker_image(
-    dockerfile_content: str, ctx_dir: Path
-) -> str | None:
+def _build_or_reuse_docker_image(dockerfile_content: str, ctx_dir: Path) -> str | None:
     """Build the gauntlet image, or reuse cached. Returns None if docker missing."""
     sha = hashlib.sha256(dockerfile_content.encode()).hexdigest()[:16]
     if sha in _DOCKER_IMAGE_CACHE:
         return _DOCKER_IMAGE_CACHE[sha]
     tag = f"r2e-cliapp-gauntlet:{sha}"
     try:
-        _sp_g34.run(
-            ["docker", "version"], check=True, capture_output=True, timeout=10
-        )
+        _sp_g34.run(["docker", "version"], check=True, capture_output=True, timeout=10)
     except (_sp_g34.CalledProcessError, FileNotFoundError, _sp_g34.TimeoutExpired):
         logger.warning("docker not available; skipping G3+G4 gauntlet")
         return None
@@ -1877,7 +1950,9 @@ def _build_or_reuse_docker_image(
     try:
         _sp_g34.run(
             ["docker", "build", "-q", "-t", tag, str(ctx_dir)],
-            check=True, capture_output=True, timeout=900,
+            check=True,
+            capture_output=True,
+            timeout=900,
         )
     except _sp_g34.CalledProcessError as exc:
         err = (exc.stderr or b"")[-500:].decode("utf-8", errors="replace")
@@ -1895,19 +1970,25 @@ def _docker_run_test_sh(
 ) -> dict:
     """Run /workspace/tests/test.sh in the container. Returns parsed summary."""
     cmd = [
-        "docker", "run", "--rm",
-        "--cpus=1.0", "--memory=1g", "--network=none",
-        "-v", f"{bundle_dir / 'tests'}:/workspace/tests:ro",
+        "docker",
+        "run",
+        "--rm",
+        "--cpus=1.0",
+        "--memory=1g",
+        "--network=none",
+        "-v",
+        f"{bundle_dir / 'tests'}:/workspace/tests:ro",
     ]
     if oracle_override_path is not None:
-        cmd.extend([
-            "-v", f"{oracle_override_path}:/workspace/submission/main.py:ro",
-        ])
+        cmd.extend(
+            [
+                "-v",
+                f"{oracle_override_path}:/workspace/submission/main.py:ro",
+            ]
+        )
     cmd.extend([image_tag, "bash", "/workspace/tests/test.sh"])
     try:
-        result = _sp_g34.run(
-            cmd, capture_output=True, text=True, timeout=timeout_sec
-        )
+        result = _sp_g34.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
         out = (result.stdout + "\n" + result.stderr)[-4000:]
     except _sp_g34.TimeoutExpired:
         return {"passed": 0, "total": 0, "pass_rate": 0.0, "summary": "TIMEOUT"}
@@ -1951,7 +2032,10 @@ def _run_docker_gauntlet_g3g4(
         g3 = _docker_run_test_sh(image, bundle, timeout_sec, oracle_override_path=None)
         logger.info(
             "G3 empty stub: %d/%d passed (rate=%.2f, max=%.2f)",
-            g3["passed"], g3["total"], g3["pass_rate"], empty_max,
+            g3["passed"],
+            g3["total"],
+            g3["pass_rate"],
+            empty_max,
         )
 
         # G4: oracle override
@@ -1960,7 +2044,10 @@ def _run_docker_gauntlet_g3g4(
         g4 = _docker_run_test_sh(image, bundle, timeout_sec, oracle_override_path=oracle_path)
         logger.info(
             "G4 oracle: %d/%d passed (rate=%.2f, min=%.2f)",
-            g4["passed"], g4["total"], g4["pass_rate"], oracle_min,
+            g4["passed"],
+            g4["total"],
+            g4["pass_rate"],
+            oracle_min,
         )
 
     return {
@@ -2019,9 +2106,14 @@ def _docker_run_pertest(
     that PASSED (one test function per file, so file-level == test-level).
     """
     cmd = [
-        "docker", "run", "--rm",
-        "--cpus=1.0", "--memory=1g", "--network=none",
-        "-v", f"{bundle_dir / 'tests'}:/workspace/tests:ro",
+        "docker",
+        "run",
+        "--rm",
+        "--cpus=1.0",
+        "--memory=1g",
+        "--network=none",
+        "-v",
+        f"{bundle_dir / 'tests'}:/workspace/tests:ro",
     ]
     if override_path is not None:
         cmd.extend(["-v", f"{override_path}:/workspace/submission/main.py:ro"])
