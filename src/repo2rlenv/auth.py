@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import subprocess
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from repo2rlenv.spec.input import AuthSpec, RepoSpec
@@ -83,10 +87,43 @@ def resolve_llm_api_key(provider: str, llm_api_key_env: str | None = None) -> st
     return None
 
 
-def auth_clone_url(repo_url: str, token: str | None) -> str:
-    """Inject token into URL for private clone. Token never logged."""
+@contextmanager
+def git_credentials_env(token: str | None) -> Iterator[dict[str, str]]:
+    """Yield an env dict that authenticates `git` over HTTPS via GIT_ASKPASS.
+
+    The token never enters the URL, the process arglist, or .git/config.
+    The helper is a temp shell script that emits "x-access-token" for
+    Username prompts and the token (read from $GIT_TOKEN) for Password
+    prompts. The script is removed on context exit.
+
+    When `token` is None, yields a copy of os.environ unchanged so callers
+    can use the same pattern for both public and private clones.
+
+    Pass the yielded dict via `env=` to subprocess.run / subprocess.Popen
+    when invoking `git clone|fetch|pull|push`.
+    """
     if not token:
-        return repo_url
-    if repo_url.startswith("https://github.com/"):
-        return repo_url.replace("https://", f"https://x-access-token:{token}@")
-    return repo_url
+        yield os.environ.copy()
+        return
+
+    fd, askpass_path = tempfile.mkstemp(prefix="r2e-askpass-", suffix=".sh")
+    try:
+        os.write(
+            fd,
+            b"#!/bin/sh\n"
+            b'case "$1" in\n'
+            b'  Username*) printf "%s" "x-access-token" ;;\n'
+            b'  Password*) printf "%s" "$GIT_TOKEN" ;;\n'
+            b"esac\n",
+        )
+        os.close(fd)
+        os.chmod(askpass_path, 0o700)
+
+        env = os.environ.copy()
+        env["GIT_ASKPASS"] = askpass_path
+        env["GIT_TOKEN"] = token
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        yield env
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(askpass_path)

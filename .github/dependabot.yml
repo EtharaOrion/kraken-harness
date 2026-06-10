@@ -9,3 +9,12 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    groups:
+      python:
+        patterns: ["*"]

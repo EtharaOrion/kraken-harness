@@ -45,23 +45,23 @@ logger = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class CommandSpec:
-    name: str                                       # e.g. "mb"
-    synopsis: str = ""                              # one-line help text if present
-    args: list[str] = field(default_factory=list)   # positional arg names
+    name: str  # e.g. "mb"
+    synopsis: str = ""  # one-line help text if present
+    args: list[str] = field(default_factory=list)  # positional arg names
     flags: list[str] = field(default_factory=list)  # flag names (--region, ...)
     behaviours: list[str] = field(default_factory=list)  # human-derived from intents
 
 
 @dataclass(slots=True)
 class CliSpec:
-    name: str                                       # e.g. "aws_cli_s3"
-    command_prefix: str                             # e.g. "s3"
-    repo: str                                       # e.g. "aws/aws-cli"
-    git_sha: str                                    # resolved git ref
-    entry_point: str                                # relative to clone root
-    tests_dir: str                                  # relative to clone root
+    name: str  # e.g. "aws_cli_s3"
+    command_prefix: str  # e.g. "s3"
+    repo: str  # e.g. "aws/aws-cli"
+    git_sha: str  # resolved git ref
+    entry_point: str  # relative to clone root
+    tests_dir: str  # relative to clone root
     commands: list[CommandSpec] = field(default_factory=list)
-    spec_sha256: str = ""                           # canonical hash of (name, prefix, commands)
+    spec_sha256: str = ""  # canonical hash of (name, prefix, commands)
 
 
 @dataclass(slots=True)
@@ -69,13 +69,13 @@ class TestIntent:
     source_file: str
     test_name: str
     source_method_sha256: str
-    command: str                                    # which subcommand (mb/rb/cp/ls/...)
-    cmdline_template: list[str]                     # argv tokens after the program name
+    command: str  # which subcommand (mb/rb/cp/ls/...)
+    cmdline_template: list[str]  # argv tokens after the program name
     expected_exit: int = 0
     expected_state_calls: list[str] = field(default_factory=list)
     expected_stdout_pattern: str | None = None
     behaviour_tag: Literal["happy_path", "error", "edge", "workflow"] = "happy_path"
-    raw_source: str = ""                            # original method source (for LLM context)
+    raw_source: str = ""  # original method source (for LLM context)
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +94,9 @@ _DEFAULT_EXCLUDE_DIRS = (
 )
 
 
-def _walk_python_files(clone_dir: Path, exclude: tuple[str, ...] = _DEFAULT_EXCLUDE_DIRS) -> list[Path]:
+def _walk_python_files(
+    clone_dir: Path, exclude: tuple[str, ...] = _DEFAULT_EXCLUDE_DIRS
+) -> list[Path]:
     out: list[Path] = []
     for p in clone_dir.rglob("*.py"):
         rel = str(p.relative_to(clone_dir))
@@ -214,12 +216,8 @@ def extract_cli_spec(
     across many files via plugin loaders. Each `test_<cmd>_command.py`
     file is one CLI command.
     """
-    entry_point = auto_detect_entry_point(
-        clone_dir, command_prefix, override=entry_point_override
-    )
-    tests_dir = auto_detect_tests_dir(
-        clone_dir, command_prefix, override=tests_dir_override
-    )
+    entry_point = auto_detect_entry_point(clone_dir, command_prefix, override=entry_point_override)
+    tests_dir = auto_detect_tests_dir(clone_dir, command_prefix, override=tests_dir_override)
 
     commands: list[CommandSpec] = []
     for test_file in sorted(tests_dir.glob("test_*_command.py")):
@@ -410,9 +408,12 @@ def _extract_intent_from_method(
                     full = prefix_value + literal
                     cmdline = full.strip().split()
             for kw in stmt.keywords:
-                if kw.arg == "expected_rc" and isinstance(kw.value, ast.Constant):
-                    if isinstance(kw.value.value, int):
-                        expected_exit = kw.value.value
+                if (
+                    kw.arg == "expected_rc"
+                    and isinstance(kw.value, ast.Constant)
+                    and isinstance(kw.value.value, int)
+                ):
+                    expected_exit = kw.value.value
 
         # self.operations_called[N][0].name -> capture via assertEqual
         if (

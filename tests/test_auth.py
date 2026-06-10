@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import os
+import subprocess
+from pathlib import Path
 from unittest import mock
 
 from repo2rlenv.auth import (
-    auth_clone_url,
+    git_credentials_env,
     resolve_github_token,
     resolve_hf_token,
     resolve_llm_api_key,
@@ -35,14 +37,50 @@ def test_returns_none_when_nothing_set():
         assert resolve_github_token(repo, auth) is None
 
 
-def test_clone_url_injects_token():
-    url = auth_clone_url("https://github.com/huggingface/trl", "ghp_xxx")
-    assert url == "https://x-access-token:ghp_xxx@github.com/huggingface/trl"
+def test_git_credentials_env_with_token_sets_askpass_helper():
+    token = "ghp_test_token_value"
+    with git_credentials_env(token) as env:
+        assert env["GIT_TOKEN"] == token
+        assert env["GIT_TERMINAL_PROMPT"] == "0"
+        askpass = env["GIT_ASKPASS"]
+        askpass_path = Path(askpass)
+        assert askpass_path.exists()
+        assert askpass_path.stat().st_mode & 0o700
+        script_body = askpass_path.read_text()
+        assert token not in script_body
+        assert "$GIT_TOKEN" in script_body
+
+        user_proc = subprocess.run(
+            [askpass, "Username for 'https://github.com':"],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=5,
+            check=False,
+        )
+        assert user_proc.returncode == 0
+        assert user_proc.stdout.strip() == "x-access-token"
+
+        pass_proc = subprocess.run(
+            [askpass, "Password for 'https://x-access-token@github.com':"],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=5,
+            check=False,
+        )
+        assert pass_proc.returncode == 0
+        assert pass_proc.stdout.strip() == token
+
+    assert not askpass_path.exists()
 
 
-def test_clone_url_passthrough_without_token():
-    url = auth_clone_url("https://github.com/huggingface/trl", None)
-    assert url == "https://github.com/huggingface/trl"
+def test_git_credentials_env_without_token_passes_env_through():
+    with mock.patch.dict(os.environ, {"PATH": "/test/path"}, clear=True):
+        with git_credentials_env(None) as env:
+            assert "GIT_ASKPASS" not in env
+            assert "GIT_TOKEN" not in env
+            assert env["PATH"] == "/test/path"
 
 
 def test_llm_api_key_resolution_uses_provider_default():

@@ -855,7 +855,7 @@ def pull_from_github(
     import subprocess
     import tempfile
 
-    from repo2rlenv.auth import auth_clone_url, resolve_github_token
+    from repo2rlenv.auth import git_credentials_env, resolve_github_token
     from repo2rlenv.spec.input import AuthSpec, RepoSpec
 
     if not shutil.which("git"):
@@ -867,7 +867,6 @@ def pull_from_github(
 
     repo_spec = RepoSpec(url=f"https://github.com/{owner_repo}", access="auto")
     token = resolve_github_token(repo_spec, AuthSpec())
-    clone_url = auth_clone_url(repo_spec.url, token)
 
     if force and local_dir.exists():
         shutil.rmtree(local_dir)
@@ -878,9 +877,12 @@ def pull_from_github(
         args = ["git", "clone", "--depth", "1"]
         if ref:
             args += ["--branch", ref]
-        args += [clone_url, str(clone_dir)]
+        args += [repo_spec.url, str(clone_dir)]
         logger.info("running: git clone --depth 1 [...] %s", owner_repo)
-        proc = subprocess.run(args, capture_output=True, text=True, timeout=300, check=False)
+        with git_credentials_env(token) as env:
+            proc = subprocess.run(
+                args, capture_output=True, text=True, timeout=300, check=False, env=env
+            )
         if proc.returncode != 0:
             stderr = proc.stderr.replace(token, "***") if token else proc.stderr
             raise RuntimeError(f"git clone failed (exit {proc.returncode}): {stderr.strip()[:400]}")

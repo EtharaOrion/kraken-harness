@@ -34,13 +34,11 @@ import hashlib
 import logging
 import os
 import re
-import shutil
 import subprocess
-import sys
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING
 
 from repo2rlenv.auth import resolve_github_token
 from repo2rlenv.bootstrap.runner import _shallow_clone_at_ref
@@ -271,8 +269,8 @@ non-empty bucket must fail and leave it intact). Use ONLY subcommands from {subs
 
 
 def run_cli_app_pipeline(
-    pipeline: "CodeInstructPipeline",
-    options: "CodeInstructOptions",
+    pipeline: CodeInstructPipeline,
+    options: CodeInstructOptions,
     out_dir: Path,
 ) -> PipelineResult:
     """Top-level entry point called from CodeInstructPipeline.run()."""
@@ -546,8 +544,8 @@ def _build_and_push_task_image(
 
 def _build_one_task(
     *,
-    pipeline: "CodeInstructPipeline",
-    options: "CodeInstructOptions",
+    pipeline: CodeInstructPipeline,
+    options: CodeInstructOptions,
     spec: CliSpec,
     cmd_specs: list[CommandSpec],
     intents: list[TestIntent],
@@ -569,24 +567,8 @@ def _build_one_task(
     cmd_slug = cmd_names[0] if not is_subset else "+".join(sorted(cmd_names))
     id_slug = cmd_names[0] if not is_subset else "_".join(sorted(cmd_names))
 
-    # Snapshot the run-cumulative LLM spend so this task records only ITS OWN
-    # incremental cost: metadata `llm_cost_usd` = delta (this task), while
-    # `run_llm_cost_usd` keeps the cumulative total so the dataset still
-    # reconciles to the provider bill. `pipeline._llm_cost_usd` itself stays
-    # cumulative for the max_llm_spend_usd cap; a rejected task's cost is NOT
-    # folded into the next emitted task.
-    #
-    # Known limitations (documented, not bugs):
-    #   * Assumes SEQUENTIAL task generation. If task building is ever
-    #     parallelised, this snapshot/delta on a shared counter would race;
-    #     switch to per-call accumulation then.
-    #   * In per_intent mode the per-command oracle is cached, so the FIRST
-    #     intent-task of a command carries the oracle-synthesis cost and later
-    #     intent-tasks of that command look translation-only. Subset/per-command
-    #     tasks each synthesise their own oracle, so their delta is complete.
-    #   * Sibling pipelines (code_instruct snippet, equivalence_tests,
-    #     mutation_bugs) still emit `llm_cost_usd` as a run-cumulative value;
-    #     this per-task semantics is cli_app-only by design (see docs).
+    # Snapshot pipeline-wide cost before this task's LLM work so the per-task
+    # record reflects ONLY this task's delta, not the cumulative run total.
     _llm_cost_before = pipeline._llm_cost_usd
 
     # ----- LLM: translate each intent into a black-box test -----
@@ -780,7 +762,7 @@ def _build_one_task(
             "runtime_timeout_sec": 300,
             "llm_cost_usd": round(pipeline._llm_cost_usd - _llm_cost_before, 6),
             "run_llm_cost_usd": round(pipeline._llm_cost_usd, 6),
-            "llm_cost_method": _llm_cost_method(),
+            "llm_cost_method": "litellm_native",
             "behaviour_tags": sorted({i.behaviour_tag for i in intents}),
             "behaviour_tag_counts": _count_behaviour_tags(intents),
         },
@@ -868,8 +850,8 @@ def _build_one_task(
 
 
 def _translate_intent(
-    pipeline: "CodeInstructPipeline",
-    options: "CodeInstructOptions",
+    pipeline: CodeInstructPipeline,
+    options: CodeInstructOptions,
     spec: CliSpec,
     intent: TestIntent,
 ) -> str | None:
@@ -899,8 +881,8 @@ def _translate_intent(
 
 
 def _synthesise_oracle(
-    pipeline: "CodeInstructPipeline",
-    options: "CodeInstructOptions",
+    pipeline: CodeInstructPipeline,
+    options: CodeInstructOptions,
     spec: CliSpec,
     cmd_specs: list[CommandSpec],
     intents: list[TestIntent],
@@ -956,8 +938,8 @@ _WF_IMPORT_PREAMBLE = "import boto3\nimport botocore\nimport botocore.exceptions
 
 
 def _synthesise_workflow_tests(
-    pipeline: "CodeInstructPipeline",
-    options: "CodeInstructOptions",
+    pipeline: CodeInstructPipeline,
+    options: CodeInstructOptions,
     spec: CliSpec,
     cmd_specs: list[CommandSpec],
     intents: list[TestIntent],
@@ -1833,7 +1815,7 @@ def _strip_code_fence(text: str) -> str:
     return s.strip() + "\n"
 
 
-def _translation_model_id(pipeline: "CodeInstructPipeline", options: "CodeInstructOptions") -> str:
+def _translation_model_id(pipeline: CodeInstructPipeline, options: CodeInstructOptions) -> str:
     if options.cli_app_translation_model:
         return options.cli_app_translation_model
     return pipeline.input.llm.qualified_name
@@ -1870,14 +1852,8 @@ def _resolve_git_sha(clone_dir: Path) -> str:
 # for the same command reuse one build.
 # ---------------------------------------------------------------------------
 
-import re as _re_g34
-import subprocess as _sp_g34
-import tempfile as _tmp_g34
-
 _DOCKER_IMAGE_CACHE: dict[str, str] = {}
-_TEST_SH_SUMMARY_RE = _re_g34.compile(
-    r"passed=(\d+)\s+failed=(\d+)\s+errors=(\d+)\s+reward=([\d.]+)"
-)
+_TEST_SH_SUMMARY_RE = re.compile(r"passed=(\d+)\s+failed=(\d+)\s+errors=(\d+)\s+reward=([\d.]+)")
 
 
 def _summarise_behaviours_from_intents(intents: list[TestIntent]) -> list[str]:
@@ -1911,20 +1887,6 @@ def _count_behaviour_tags(intents: list[TestIntent]) -> dict[str, int]:
     return counts
 
 
-def _llm_cost_method() -> str:
-    """Audit string for how `llm_cost_usd` was derived (it is an ESTIMATE).
-
-    litellm cannot price opaque Bedrock application-inference-profile ARNs, so
-    llm.py falls back to token_count x configured per-1M rates. Recording the
-    rates here makes the estimate reproducible and prevents false precision.
-    """
-    inp = os.environ.get("R2E_COST_INPUT_PER_1M")
-    out = os.environ.get("R2E_COST_OUTPUT_PER_1M")
-    if inp or out:
-        return f"estimated_from_rates(input_per_1m={inp or '?'},output_per_1m={out or '?'})"
-    return "litellm_native_or_zero"
-
-
 def _parse_test_sh_summary(text: str) -> dict:
     """Parse `passed=N failed=N errors=N reward=R` line from test.sh stdout."""
     m = _TEST_SH_SUMMARY_RE.search(text)
@@ -1942,19 +1904,19 @@ def _build_or_reuse_docker_image(dockerfile_content: str, ctx_dir: Path) -> str 
         return _DOCKER_IMAGE_CACHE[sha]
     tag = f"r2e-cliapp-gauntlet:{sha}"
     try:
-        _sp_g34.run(["docker", "version"], check=True, capture_output=True, timeout=10)
-    except (_sp_g34.CalledProcessError, FileNotFoundError, _sp_g34.TimeoutExpired):
+        subprocess.run(["docker", "version"], check=True, capture_output=True, timeout=10)
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
         logger.warning("docker not available; skipping G3+G4 gauntlet")
         return None
     logger.info("docker build %s (one-time per Dockerfile content)", tag)
     try:
-        _sp_g34.run(
+        subprocess.run(
             ["docker", "build", "-q", "-t", tag, str(ctx_dir)],
             check=True,
             capture_output=True,
             timeout=900,
         )
-    except _sp_g34.CalledProcessError as exc:
+    except subprocess.CalledProcessError as exc:
         err = (exc.stderr or b"")[-500:].decode("utf-8", errors="replace")
         logger.error("docker build failed: %s", err)
         return None
@@ -1988,9 +1950,9 @@ def _docker_run_test_sh(
         )
     cmd.extend([image_tag, "bash", "/workspace/tests/test.sh"])
     try:
-        result = _sp_g34.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
         out = (result.stdout + "\n" + result.stderr)[-4000:]
-    except _sp_g34.TimeoutExpired:
+    except subprocess.TimeoutExpired:
         return {"passed": 0, "total": 0, "pass_rate": 0.0, "summary": "TIMEOUT"}
     return _parse_test_sh_summary(out)
 
@@ -2010,14 +1972,14 @@ def _run_docker_gauntlet_g3g4(
     Returns {'skipped': True, ...} if docker unavailable. Otherwise returns
     {g3_empty_pass_rate, g3_pass, g4_oracle_pass_rate, g4_pass, ...}.
     """
-    with _tmp_g34.TemporaryDirectory(prefix="r2e-gauntlet-ctx-") as ctx_str:
+    with tempfile.TemporaryDirectory(prefix="r2e-gauntlet-ctx-") as ctx_str:
         ctx = Path(ctx_str)
         (ctx / "Dockerfile").write_text(dockerfile_content)
         image = _build_or_reuse_docker_image(dockerfile_content, ctx)
     if image is None:
         return {"skipped": True, "reason": "docker_unavailable"}
 
-    with _tmp_g34.TemporaryDirectory(prefix="r2e-gauntlet-bundle-") as b_str:
+    with tempfile.TemporaryDirectory(prefix="r2e-gauntlet-bundle-") as b_str:
         bundle = Path(b_str)
         (bundle / "tests").mkdir()
         for rel, content in aux_files.items():
@@ -2093,7 +2055,7 @@ _REFERENCE_SHIM = (
     "raise SystemExit(subprocess.run(['aws', *sys.argv[1:]]).returncode)\n"
 )
 
-_PERTEST_PASS_RE = _re_g34.compile(r"^(tests/\S+\.py)::\S+\s+PASSED", _re_g34.M)
+_PERTEST_PASS_RE = re.compile(r"^(tests/\S+\.py)::\S+\s+PASSED", re.M)
 
 
 def _docker_run_pertest(
@@ -2119,8 +2081,8 @@ def _docker_run_pertest(
         cmd.extend(["-v", f"{override_path}:/workspace/submission/main.py:ro"])
     cmd.extend([image_tag, "bash", "/workspace/tests/test.sh"])
     try:
-        result = _sp_g34.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
-    except _sp_g34.TimeoutExpired:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+    except subprocess.TimeoutExpired:
         return set()
     out = result.stdout + "\n" + result.stderr
     return {Path(m.group(1)).name for m in _PERTEST_PASS_RE.finditer(out)}
@@ -2144,14 +2106,14 @@ def _run_reference_grounding(
         + "\n# Reference oracle for gauntlet grounding ONLY (not the shipped image)\n"
         + f"RUN pip install --no-cache-dir {PINNED_AWSCLI}\n"
     )
-    with _tmp_g34.TemporaryDirectory(prefix="r2e-refground-ctx-") as ctx_str:
+    with tempfile.TemporaryDirectory(prefix="r2e-refground-ctx-") as ctx_str:
         ctx = Path(ctx_str)
         (ctx / "Dockerfile").write_text(ref_dockerfile)
         image = _build_or_reuse_docker_image(ref_dockerfile, ctx)
     if image is None:
         return {"skipped": True, "reason": "docker_unavailable"}
 
-    with _tmp_g34.TemporaryDirectory(prefix="r2e-refground-bundle-") as b_str:
+    with tempfile.TemporaryDirectory(prefix="r2e-refground-bundle-") as b_str:
         bundle = Path(b_str)
         (bundle / "tests").mkdir()
         for rel, content in tests_aux.items():

@@ -17,7 +17,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from repo2rlenv.auth import auth_clone_url, resolve_github_token
+from repo2rlenv.auth import git_credentials_env, resolve_github_token
 from repo2rlenv.bootstrap import cache as cache_mod
 from repo2rlenv.bootstrap.agent import run_agent_loop
 from repo2rlenv.bootstrap.docker import (
@@ -76,6 +76,7 @@ def _run_git_streaming(
     token: str | None,
     timeout: int,
     on_progress: Callable[[str], None] | None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run git with --progress, streaming its stderr to on_progress.
 
@@ -89,6 +90,7 @@ def _run_git_streaming(
             text=True,
             timeout=timeout,
             check=False,
+            env=env,
         )
 
     proc = subprocess.Popen(
@@ -97,6 +99,7 @@ def _run_git_streaming(
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
+        env=env,
     )
     err_buf: list[str] = []
     out_buf: list[str] = []
@@ -162,78 +165,98 @@ def _shallow_clone_at_ref(
       3. Otherwise (commit SHA / fallback) → bare clone + `git fetch origin <ref>`
          + `git checkout`.
     """
-    url = auth_clone_url(repo_url, token)
+    with git_credentials_env(token) as env:
+        if ref in ("", "HEAD"):
+            r = _run_git_streaming(
+                ["git", "clone", "--progress", "--depth", str(depth), repo_url, str(dest)],
+                token=token,
+                timeout=300,
+                on_progress=on_progress,
+                env=env,
+            )
+            if r.returncode != 0:
+                raise BootstrapError(
+                    f"git clone failed: {_scrub_token(r.stderr, token).strip()[:400]}"
+                )
+            return
 
-    if ref in ("", "HEAD"):
         r = _run_git_streaming(
-            ["git", "clone", "--progress", "--depth", str(depth), url, str(dest)],
+            [
+                "git",
+                "clone",
+                "--progress",
+                "--depth",
+                str(depth),
+                "--branch",
+                ref,
+                repo_url,
+                str(dest),
+            ],
             token=token,
             timeout=300,
             on_progress=on_progress,
+            env=env,
+        )
+        if r.returncode == 0:
+            return
+
+        logger.info("clone --branch %r failed, falling back to fetch-by-ref", ref)
+        if dest.exists():
+            shutil.rmtree(dest, ignore_errors=True)
+        r = _run_git_streaming(
+            [
+                "git",
+                "clone",
+                "--progress",
+                "--filter=blob:none",
+                "--no-checkout",
+                repo_url,
+                str(dest),
+            ],
+            token=token,
+            timeout=300,
+            on_progress=on_progress,
+            env=env,
         )
         if r.returncode != 0:
-            raise BootstrapError(f"git clone failed: {_scrub_token(r.stderr, token).strip()[:400]}")
-        return
-
-    # Try clone --branch first; works for branches and tags
-    r = _run_git_streaming(
-        ["git", "clone", "--progress", "--depth", str(depth), "--branch", ref, url, str(dest)],
-        token=token,
-        timeout=300,
-        on_progress=on_progress,
-    )
-    if r.returncode == 0:
-        return
-
-    # Fallback: clone default, then fetch + checkout the ref (handles SHAs)
-    logger.info("clone --branch %r failed, falling back to fetch-by-ref", ref)
-    if dest.exists():
-        shutil.rmtree(dest, ignore_errors=True)
-    r = _run_git_streaming(
-        ["git", "clone", "--progress", "--filter=blob:none", "--no-checkout", url, str(dest)],
-        token=token,
-        timeout=300,
-        on_progress=on_progress,
-    )
-    if r.returncode != 0:
-        raise BootstrapError(
-            f"git clone (fallback) failed: {_scrub_token(r.stderr, token).strip()[:400]}"
+            raise BootstrapError(
+                f"git clone (fallback) failed: {_scrub_token(r.stderr, token).strip()[:400]}"
+            )
+        r = _run_git_streaming(
+            ["git", "-C", str(dest), "fetch", "--progress", "--depth", str(depth), "origin", ref],
+            token=token,
+            timeout=120,
+            on_progress=on_progress,
+            env=env,
         )
-    r = _run_git_streaming(
-        ["git", "-C", str(dest), "fetch", "--progress", "--depth", str(depth), "origin", ref],
-        token=token,
-        timeout=120,
-        on_progress=on_progress,
-    )
-    if r.returncode != 0:
-        raise BootstrapError(
-            f"git fetch origin {ref!r} failed (is this a valid branch/tag/commit?): "
-            f"{_scrub_token(r.stderr, token).strip()[:400]}"
+        if r.returncode != 0:
+            raise BootstrapError(
+                f"git fetch origin {ref!r} failed (is this a valid branch/tag/commit?): "
+                f"{_scrub_token(r.stderr, token).strip()[:400]}"
+            )
+        r = subprocess.run(
+            ["git", "-C", str(dest), "checkout", ref],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+            env=env,
         )
-    r = subprocess.run(
-        ["git", "-C", str(dest), "checkout", ref],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-    if r.returncode != 0:
-        raise BootstrapError(
-            f"git checkout {ref!r} failed: {_scrub_token(r.stderr, token).strip()[:400]}"
-        )
+        if r.returncode != 0:
+            raise BootstrapError(
+                f"git checkout {ref!r} failed: {_scrub_token(r.stderr, token).strip()[:400]}"
+            )
 
 
 def _scrub_clone_credentials(clone_dir: Path, repo_url: str) -> None:
-    """Reset the clone's remote URL to a token-free form.
+    """Reset the clone's remote URL to a token-free form (defense in depth).
 
-    `auth_clone_url()` embeds the GitHub PAT into the clone URL so the
-    private fetch works, but git records that exact URL in `.git/config`.
-    We later `docker cp <clone>/. <container>:/workspace` and `docker commit`,
-    which bakes `.git/config` (token and all) into the published image.
-
-    Stripping the remote URL post-clone is the simplest fix; alternatively
-    we could drop `.git/` entirely, but the bootstrap agent sometimes needs
-    git metadata (tags, blame) to make sense of the repo.
+    With `git_credentials_env()` the token is supplied via GIT_ASKPASS and
+    never enters the URL or `.git/config`, so in the happy path this is a
+    no-op rewrite of an already-clean remote URL. We keep it as belt-and-
+    suspenders: the clone gets baked into the published image via
+    `docker cp` + `docker commit`, so any future regression that lets a
+    token re-enter the URL form would otherwise leak into the registry.
     """
     try:
         subprocess.run(
