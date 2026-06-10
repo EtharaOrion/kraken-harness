@@ -47,6 +47,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import ClassVar
+from uuid import uuid4
 
 import repo2rlenv
 from repo2rlenv.auth import resolve_github_token
@@ -856,6 +857,7 @@ class CodeInstructPipeline:
             environment_dockerfile=dockerfile,
             test_script=eval_script,
             aux_files={f"tests/{test_filename}": parsed.test_code},
+            task_uuid=str(uuid4()),
         )
 
 

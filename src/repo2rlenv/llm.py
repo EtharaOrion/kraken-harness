@@ -12,6 +12,7 @@ import re
 from dataclasses import dataclass
 
 from repo2rlenv.auth import resolve_llm_api_key
+# from repo2rlenv.compression import maybe_compress
 from repo2rlenv.spec.input import LLMSpec
 
 logger = logging.getLogger(__name__)
@@ -123,7 +124,7 @@ def _resolve_cost_usd(
 #   - bedrock: AWS_BEARER_TOKEN_BEDROCK  *or*  AWS_ACCESS_KEY_ID/SECRET/REGION
 # Only bedrock is listed because it's the only one tested end-to-end. Add
 # vertex_ai / azure here when they're actually verified — not speculatively.
-ENV_AUTH_PROVIDERS = {"bedrock"}
+ENV_AUTH_PROVIDERS = {"bedrock", "vertex_ai"}
 
 
 @dataclass(slots=True)
@@ -178,6 +179,8 @@ def _do_complete(
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": user})
+
+    # messages = maybe_compress(messages, spec.qualified_name)
 
     kwargs: dict = {
         "model": spec.qualified_name,

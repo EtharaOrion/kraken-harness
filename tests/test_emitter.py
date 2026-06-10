@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tomllib
 from pathlib import Path
+from uuid import UUID
 
 from repo2rlenv.emitter.harbor import HarborTask, write_harbor_task
 
@@ -26,7 +27,8 @@ def _make_task(name: str = "demo__repo-1") -> HarborTask:
 def test_writes_full_directory(tmp_path: Path):
     task = _make_task()
     out = write_harbor_task(task, tmp_path)
-    assert out == tmp_path / "demo__repo-1"
+    assert out.parent == tmp_path
+    UUID(out.name)  # dir name is a valid UUID
     assert (out / "task.toml").is_file()
     assert (out / "instruction.md").is_file()
     assert (out / "solution" / "patch.diff").is_file()
@@ -37,10 +39,8 @@ def test_task_toml_is_valid_toml_with_harbor_layout(tmp_path: Path):
     out = write_harbor_task(task, tmp_path)
     data = tomllib.loads((out / "task.toml").read_text())
     assert data["version"] == "1.0"
-    # Harbor requires task.name in `org/name` format — we emit the qualified form
     assert data["task"]["name"] == "myorg/demo__repo-1"
-    # Directory name still uses the bench-friendly slug (filesystem-safe)
-    assert out.name == "demo__repo-1"
+    UUID(out.name)  # dir is UUID, slug lives in task.toml only
     r2e = data["metadata"]["repo2env"]
     assert r2e["pipeline"] == "pr_diff"
     assert r2e["spec_version"] == "0.2.0"
@@ -166,3 +166,28 @@ def test_reproducibility_caller_override_preserved(tmp_path: Path):
     repro = data["metadata"]["repo2env"]["reproducibility"]
     assert repro["mode"] == "registry"
     assert repro["image_ref"] == "ghcr.io/foo/bar@sha256:abc"
+
+
+def test_explicit_uuid_dir_naming(tmp_path: Path):
+    task = _make_task()
+    task.task_uuid = "0c8f28fe-c9cb-4291-8cfc-8e683f08039b"
+    out = write_harbor_task(task, tmp_path)
+    assert out.name == "0c8f28fe-c9cb-4291-8cfc-8e683f08039b"
+    data = tomllib.loads((out / "task.toml").read_text())
+    assert data["task"]["name"] == "myorg/demo__repo-1"
+
+
+def test_auto_generated_uuid_dir(tmp_path: Path):
+    task = _make_task()
+    out = write_harbor_task(task, tmp_path)
+    UUID(out.name)
+    data = tomllib.loads((out / "task.toml").read_text())
+    assert data["task"]["name"] == "myorg/demo__repo-1"
+
+
+def test_two_tasks_get_distinct_uuids(tmp_path: Path):
+    a = write_harbor_task(_make_task("a"), tmp_path)
+    b = write_harbor_task(_make_task("b"), tmp_path)
+    assert a.name != b.name
+    UUID(a.name)
+    UUID(b.name)

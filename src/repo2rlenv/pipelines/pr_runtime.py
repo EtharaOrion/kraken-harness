@@ -44,6 +44,7 @@ import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import ClassVar
+from uuid import uuid4
 
 from repo2rlenv.auth import resolve_github_token
 from repo2rlenv.bootstrap.spec import BootstrapResult
@@ -1120,4 +1121,5 @@ class PRRuntimePipeline:
             # Ship verifier.py + f2p.json + p2p.json as plain, inspectable task
             # artifacts that test.sh reads from /tests (no base64 in test.sh).
             aux_files=_runtime_aux_files(fail_to_pass, pass_to_pass) if fail_to_pass else {},
+            task_uuid=str(uuid4()),
         )

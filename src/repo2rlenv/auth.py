@@ -74,6 +74,7 @@ def resolve_llm_api_key(provider: str, llm_api_key_env: str | None = None) -> st
     defaults = {
         "anthropic": "ANTHROPIC_API_KEY",
         "openai": "OPENAI_API_KEY",
+        "gemini": "GEMINI_API_KEY",
         "huggingface": "HF_TOKEN",
         "together": "TOGETHER_API_KEY",
         "groq": "GROQ_API_KEY",

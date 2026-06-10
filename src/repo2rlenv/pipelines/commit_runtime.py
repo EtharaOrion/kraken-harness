@@ -40,6 +40,7 @@ import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import ClassVar
+from uuid import uuid4
 
 from repo2rlenv.auth import resolve_github_token
 from repo2rlenv.bootstrap.runner import _shallow_clone_at_ref
@@ -522,4 +523,5 @@ class CommitRuntimePipeline:
             # falls back to the exit-code reward and reward.json is never
             # written, so tracked/command_resolved + the breakdown are lost.
             aux_files=_runtime_aux_files(fail_to_pass, pass_to_pass) if fail_to_pass else {},
+            task_uuid=str(uuid4()),
         )

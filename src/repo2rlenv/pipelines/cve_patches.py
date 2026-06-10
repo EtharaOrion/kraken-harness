@@ -43,6 +43,7 @@ import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import ClassVar
+from uuid import uuid4
 
 from repo2rlenv.auth import resolve_github_token
 from repo2rlenv.bootstrap.spec import BootstrapResult
@@ -364,4 +365,5 @@ class CVEPatchesPipeline:
             keywords=[name, "cve_patches", "security"],
             environment_dockerfile=dockerfile,
             test_script=eval_script,
+            task_uuid=str(uuid4()),
         )

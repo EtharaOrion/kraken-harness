@@ -42,6 +42,7 @@ import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import ClassVar
+from uuid import uuid4
 
 from repo2rlenv.auth import resolve_github_token
 from repo2rlenv.bootstrap.runner import _shallow_clone_at_ref
@@ -459,4 +460,5 @@ class RefactorSynthesisPipeline:
             keywords=[name, "refactor_synthesis", "rename"],
             environment_dockerfile=dockerfile,
             test_script=eval_script,
+            task_uuid=str(uuid4()),
         )

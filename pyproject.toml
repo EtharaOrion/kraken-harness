@@ -30,6 +30,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
+    "google-cloud-aiplatform>=1.156.0",
     "huggingface-hub>=1.13.0",
     "litellm>=1.83.14",
     "pydantic>=2.12.5",

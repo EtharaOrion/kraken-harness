@@ -38,7 +38,8 @@ import subprocess
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
+from uuid import uuid4
 
 from repo2rlenv.auth import resolve_github_token
 from repo2rlenv.bootstrap.runner import _shallow_clone_at_ref
@@ -86,7 +87,7 @@ PINNED_DEPS = (
     "werkzeug==3.0.4",
     "flask==3.0.3",
 )
-PINNED_PYTHON = "3.11-slim"
+PINNED_PYTHON = "3.12-slim"
 
 
 # ---------------------------------------------------------------------------
@@ -840,6 +841,7 @@ def _build_one_task(
         environment_dockerfile=dockerfile,
         test_script=test_script,
         aux_files=aux_files,
+        task_uuid=str(uuid4()),
     )
     return write_harbor_task(task, out_dir)
 

@@ -44,6 +44,7 @@ import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import ClassVar
+from uuid import uuid4
 
 from repo2rlenv.auth import resolve_github_token
 from repo2rlenv.emitter.harbor import HarborTask, write_harbor_task
@@ -588,4 +589,5 @@ class PRDiffPipeline:
             keywords=[name, "pr_diff"],
             environment_dockerfile=dockerfile,
             test_script=eval_script,
+            task_uuid=str(uuid4()),
         )

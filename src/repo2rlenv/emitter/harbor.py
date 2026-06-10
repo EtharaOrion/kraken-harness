@@ -38,6 +38,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import tomli_w
 
@@ -62,6 +63,11 @@ class HarborTask:
     # {"tests/verifier.py": ..., "tests/f2p.json": ...}. Harbor exposes tests/
     # at /tests in the container so test.sh can read them.
     aux_files: dict[str, str] = field(default_factory=dict)
+    # UUID-based directory name (Final/ convention). When set, the task dir is
+    # named after this UUID instead of the human-readable slug in ``name``.
+    # When None, ``write_harbor_task`` auto-generates a UUID.  The slug is
+    # always preserved in task.toml as ``task.name = "<org>/<slug>"``.
+    task_uuid: str | None = None
 
 
 def _content_hash(task: HarborTask) -> str:
@@ -73,8 +79,14 @@ def _content_hash(task: HarborTask) -> str:
 
 
 def write_harbor_task(task: HarborTask, dest_dir: Path) -> Path:
-    """Materialize the task directory at dest_dir/<task.name>. Returns the path."""
-    task_path = dest_dir / task.name
+    """Materialize the task directory under *dest_dir* and return the path.
+
+    The directory is named after ``task.task_uuid`` (or an auto-generated UUID
+    when the field is *None*).  ``task.toml`` inside it still carries the
+    human-readable slug via ``task.name``.
+    """
+    dir_name = task.task_uuid if task.task_uuid else str(uuid4())
+    task_path = dest_dir / dir_name
     task_path.mkdir(parents=True, exist_ok=True)
 
     # task.toml
@@ -112,10 +124,9 @@ def write_harbor_task(task: HarborTask, dest_dir: Path) -> Path:
         }
 
     # Harbor's task.toml requires `task.name` in `<org>/<name>` format —
-    # validated at load-time by harbor.models.task.config.PackageInfo. We
-    # keep the filesystem-safe slug (with `__` for path safety) as the
-    # directory name, but emit the schema-required `org/slug` form in
-    # task.toml so harbor accepts the task.
+    # validated at load-time by harbor.models.task.config.PackageInfo. The
+    # directory is a UUID; task.toml keeps the human-readable `org/slug`
+    # form so harbor accepts the task.
     qualified_name = f"{task.org}/{task.name}"
     payload: dict[str, Any] = {
         "version": "1.0",
