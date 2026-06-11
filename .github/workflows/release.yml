@@ -2,13 +2,19 @@ name: Release
 
 # Triggered when a GitHub Release is published.
 # Build the sdist + wheel, attach them to the Release, then publish to PyPI
-# using the PYPI_API_TOKEN repo secret.
+# using OIDC Trusted Publishing (no long-lived API token).
 #
-# Prerequisite: add a project-scoped PyPI API token as a GitHub repo secret
-# named PYPI_API_TOKEN. Generate at:
-#   https://pypi.org/manage/account/token/
-# Add at:
-#   https://github.com/adithya-s-k/Repo2RLEnv/settings/secrets/actions/new
+# Prerequisite (one-time, by project owner on pypi.org):
+#   pypi.org -> manage 'repo2rlenv' -> Publishing -> Add a new pending publisher
+#     Owner:         <github-org>          (e.g. huggingface)
+#     Repository:    Repo2RLEnv
+#     Workflow:      release.yml
+#     Environment:   pypi
+#   Until this is configured, the publish-pypi job will fail with
+#   "OIDC token exchange failed" -- there is NO fallback to API token.
+#
+# After OIDC is configured, the PYPI_API_TOKEN repo secret is unused and
+# should be deleted from repo Settings -> Secrets and variables -> Actions.
 #
 # To cut a release:
 #   git tag v0.3.0 && git push origin v0.3.0
@@ -103,16 +109,21 @@ jobs:
           retention-days: 30
 
   publish-pypi:
-    name: Publish to PyPI (API token)
+    name: Publish to PyPI (OIDC trusted publishing)
     runs-on: ubuntu-latest
     needs: [build]
-    # Environment protection rules (required reviewers, deployment branch policy,
-    # wait timer) cannot be expressed in workflow YAML — they live in the repo
-    # Settings UI. Configure them at:
-    #   https://github.com/Ethara-Ai/Repo2RLEnv/settings/environments
-    # Required minimum for S-001:
+    # OIDC token-exchange requires `id-token: write` on this job. No other
+    # permissions are needed -- the upload is to PyPI, not to the repo.
+    permissions:
+      id-token: write
+    # Environment protection rules (required reviewers, deployment branch
+    # policy, wait timer) cannot be expressed in workflow YAML -- they live
+    # in the repo Settings UI and remain a valuable second gate even under
+    # OIDC. Configure at:
+    #   https://github.com/<owner>/Repo2RLEnv/settings/environments
+    # Recommended:
     #   - Required reviewers: at least one maintainer (manual approval gate)
-    #   - Deployment branches: "Protected branches only" or restrict to tags v*
+    #   - Deployment branches: restrict to tags matching v*
     environment:
       name: pypi
       url: https://pypi.org/p/repo2rlenv
@@ -125,10 +136,9 @@ jobs:
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          # API-token auth via the PYPI_API_TOKEN repo secret. (We can move
-          # to OIDC trusted-publishing later by deleting `password:` and adding
-          # `permissions: id-token: write` + a pending publisher on pypi.org.)
-          password: ${{ secrets.PYPI_API_TOKEN }}
+          # No `password:` -- pypa/gh-action-pypi-publish auto-negotiates an
+          # OIDC token against PyPI's trusted-publisher endpoint. Requires the
+          # pending publisher on pypi.org to be configured (see file header).
           packages-dir: dist/
           # Skip if PyPI already has this version (allows re-runs after fix)
           skip-existing: true
