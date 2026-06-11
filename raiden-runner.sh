@@ -343,7 +343,7 @@ _do_git_push() {
   local task_name
   task_name=$(basename "$task_dir")
 
-  local data_dest="$DATASET_DIR/data/$task_name"
+  local data_dest="$DATASET_DIR/dataset/$task_name"
   local traj_dest="$DATASET_DIR/trajectory/$task_name"
 
   # Sync with remote before touching anything
@@ -360,12 +360,12 @@ _do_git_push() {
     cp -a "$traj_dir/." "$traj_dest/"
   fi
 
-  git -C "$DATASET_DIR" add "data/$task_name" "trajectory/$task_name" 2>/dev/null || true
+  git -C "$DATASET_DIR" add "dataset/$task_name" "trajectory/$task_name" 2>/dev/null || true
   if git -C "$DATASET_DIR" diff --cached --quiet 2>/dev/null; then
     return 0
   fi
 
-  git -C "$DATASET_DIR" commit -q -m "add: $task_name (data + trajectory)"
+  git -C "$DATASET_DIR" commit -q -m "add: $task_name (dataset + trajectory)"
 
   # Resolve the current local branch so the first push to an empty remote
   # can set upstream explicitly (a fresh repo has no origin/main to track).
@@ -402,7 +402,7 @@ prepare_dataset_repo() {
     log_info "Cloning dataset repo → $DATASET_DIR"
     git clone --quiet "$DATASET_REPO" "$DATASET_DIR"
   fi
-  mkdir -p "$DATASET_DIR/data" "$DATASET_DIR/trajectory"
+  mkdir -p "$DATASET_DIR/dataset" "$DATASET_DIR/trajectory"
 }
 
 # ─── Verify a harbor run actually succeeded ──────────────────────────────────
