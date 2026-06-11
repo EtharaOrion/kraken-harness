@@ -53,6 +53,26 @@ bedrock = [
     "boto3>=1.43.19",
 ]
 
+# Transitive CVE floors. These packages are pulled in indirectly (aiohttp via
+# litellm; urllib3 + idna via the broader HTTP stack) so they cannot be
+# expressed in [project.dependencies] without lying about our direct API
+# surface. `constraint-dependencies` enforces the floor at lock time without
+# adding to the direct dep set.
+#
+# Pinned against the CVE audit at commit 6899e0ff (2026-06):
+#   aiohttp <3.14.0 -> CVE-2026-34993 (RCE via CookieJar.load),
+#                     CVE-2026-47265 (cookie cross-origin leak)
+#   urllib3 <2.7.0  -> PYSEC-2026-141, PYSEC-2026-142
+#   idna    <3.15   -> CVE-2026-45409 (IDN spoofing via input validation)
+#
+# Re-evaluate when these dependencies are dropped or their parents pin them.
+[tool.uv]
+constraint-dependencies = [
+    "aiohttp>=3.14.0",
+    "urllib3>=2.7.0",
+    "idna>=3.15",
+]
+
 [build-system]
 requires = ["uv_build>=0.11.2,<0.12.0"]
 build-backend = "uv_build"
