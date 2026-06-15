@@ -27,8 +27,11 @@ HARBOR_ENV="docker"
 BASE_OUT="./datasets/raiden"
 TRAJ_BASE="/tmp/raiden-trajectories"
 LOG_DIR="./logs/raiden-runner"
-DATASET_REPO="https://github.com/Ethara-Ai/raiden_dataset_testing.git"
+DATASET_REPO="https://github.com/Ethara-Ai/raiden-dataset.git"
 DATASET_DIR="./.raiden-dataset"
+# Top-level partition inside the dataset repo. Each model/eval run lands in its own
+# sample_N folder so multiple runs coexist: $SAMPLE_DIR/dataset/<task> + $SAMPLE_DIR/trajectory/<task>.
+SAMPLE_DIR="sample_1"
 UV_EXTRA="bedrock"
 ENV_FILE=".env"
 # GOOGLE_APPLICATION_CREDENTIALS must be a file path, not inline JSON (google.auth
@@ -38,7 +41,7 @@ SA_CONTAINER_PATH="/tmp/raiden-sa.json"
 # max_iterations caps the agent's tool-call loop; reasoning_effort controls whether
 # gemini-3.1-pro-preview's thinking mode is active (none = off, saves tokens).
 MAX_ITERATIONS=1000
-REASONING_EFFORT="none"
+REASONING_EFFORT="high"
 AGENT_SETUP_TIMEOUT_MULTIPLIER="5.0"
 DRY_RUN=false
 RESUME=false
@@ -108,8 +111,9 @@ Flags:
   --out DIR                    Base output directory     (default: ./datasets/raiden)
   --traj-dir DIR               Trajectory output base   (default: /tmp/raiden-trajectories)
   --log-dir DIR                Log directory             (default: ./logs/raiden-runner)
-  --dataset-repo URL           Push target repo          (default: Ethara-Ai/raiden_dataset_testing)
+  --dataset-repo URL           Push target repo          (default: Ethara-Ai/raiden-dataset)
   --dataset-dir DIR            Local dataset clone       (default: ./.raiden-dataset)
+  --sample-dir DIR             Sample partition in repo  (default: sample_1)
   --parallel N                 Max parallel jobs (0=auto)(default: 0)
   --limit N                    Tasks per subset          (default: 8)
   --uv-extra EXTRA             UV extra for harbor       (default: bedrock)
@@ -148,6 +152,7 @@ while [[ $# -gt 0 ]]; do
     --log-dir)        LOG_DIR="$2";        shift 2 ;;
     --dataset-repo)   DATASET_REPO="$2";   shift 2 ;;
     --dataset-dir)    DATASET_DIR="$2";    shift 2 ;;
+    --sample-dir)     SAMPLE_DIR="$2";     shift 2 ;;
     --parallel)       PARALLEL="$2";       shift 2 ;;
     --limit)          LIMIT="$2";          shift 2 ;;
     --uv-extra)       UV_EXTRA="$2";       shift 2 ;;
@@ -217,6 +222,7 @@ build_agent_args() {
     --ak "max_iterations=$MAX_ITERATIONS"
     --agent-setup-timeout-multiplier "$AGENT_SETUP_TIMEOUT_MULTIPLIER"
     --ae "LLM_REASONING_EFFORT=$REASONING_EFFORT"
+    --ae "LITELLM_DROP_PARAMS=1"
   )
 
   if [[ "$MODEL" == vertex_ai/* ]]; then
@@ -343,8 +349,8 @@ _do_git_push() {
   local task_name
   task_name=$(basename "$task_dir")
 
-  local data_dest="$DATASET_DIR/dataset/$task_name"
-  local traj_dest="$DATASET_DIR/trajectory/$task_name"
+  local data_dest="$DATASET_DIR/$SAMPLE_DIR/dataset/$task_name"
+  local traj_dest="$DATASET_DIR/$SAMPLE_DIR/trajectory/$task_name"
 
   # Sync with remote before touching anything
   git -C "$DATASET_DIR" fetch --quiet origin 2>/dev/null || true
@@ -360,7 +366,7 @@ _do_git_push() {
     cp -a "$traj_dir/." "$traj_dest/"
   fi
 
-  git -C "$DATASET_DIR" add "dataset/$task_name" "trajectory/$task_name" 2>/dev/null || true
+  git -C "$DATASET_DIR" add "$SAMPLE_DIR/dataset/$task_name" "$SAMPLE_DIR/trajectory/$task_name" 2>/dev/null || true
   if git -C "$DATASET_DIR" diff --cached --quiet 2>/dev/null; then
     return 0
   fi
@@ -402,7 +408,7 @@ prepare_dataset_repo() {
     log_info "Cloning dataset repo → $DATASET_DIR"
     git clone --quiet "$DATASET_REPO" "$DATASET_DIR"
   fi
-  mkdir -p "$DATASET_DIR/dataset" "$DATASET_DIR/trajectory"
+  mkdir -p "$DATASET_DIR/$SAMPLE_DIR/dataset" "$DATASET_DIR/$SAMPLE_DIR/trajectory"
 }
 
 # ─── Verify a harbor run actually succeeded ──────────────────────────────────
