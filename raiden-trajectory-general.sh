@@ -76,6 +76,7 @@ GEN_CLI_APP_DOCKER_TIMEOUT_SEC=300
 readonly VALID_S3_COMMANDS="mb cp ls mv rm rb sync"
 
 DRY_RUN=false
+NO_PUSH=false
 DATASET_DIR_EXPLICIT=false
 
 # ─── Colors / helpers ──────────────────────────────────────────────────────────
@@ -124,6 +125,7 @@ Common flags:
   --reasoning-effort L   LLM reasoning effort          (default: none)
   --uv-extra EXTRA       UV extra for harbor           (default: bedrock)
   --env-file FILE        Source env vars from          (default: .env)
+  --no-push              Run harbor + write trajectory locally, skip git push
   --dry-run              Preview commands, no execution
   -h, --help             Show this help
 
@@ -191,6 +193,7 @@ while [[ $# -gt 0 ]]; do
     --gen-subset)       GEN_SUBSETS+=("$2"); shift 2 ;;
     --gen-max-llm-tokens) GEN_MAX_LLM_TOKENS="$2"; shift 2 ;;
     --gen-max-llm-spend)  GEN_MAX_LLM_SPEND_USD="$2"; shift 2 ;;
+    --no-push)          NO_PUSH=true;        shift ;;
     --dry-run)          DRY_RUN=true;        shift ;;
     -h|--help)          usage ;;
     -*)                 die "Unknown flag: $1" ;;
@@ -464,6 +467,11 @@ run_one_task() {
     log_warn "[$MODEL_SLUG] Trial errored (harbor exit 0 but result.json shows errors): $task_name"
   fi
 
+  if $NO_PUSH; then
+    log_ok "[$MODEL_SLUG] Done (no-push): $task_name -> $task_traj"
+    return 0
+  fi
+
   if push_result "$task_dir" "$task_traj" "$MODEL_SLUG"; then
     log_ok "[$MODEL_SLUG] Pushed: $task_name"
     return 0
@@ -545,6 +553,7 @@ main() {
     log_info "Generate: $GEN_REPO@${GEN_REF:0:8} pipeline=$GEN_PIPELINE subsets=${GEN_SUBSETS[*]:-<none>}"
   fi
   $DRY_RUN && log_warn "DRY RUN — no harbor execution, no pushes"
+  $NO_PUSH && log_warn "NO-PUSH — harbor runs, trajectory stays local under $TRAJ_BASE"
 
   mkdir -p "$TRAJ_BASE" "$LOG_DIR"
 
@@ -552,7 +561,7 @@ main() {
   local -a model_args=()
   while IFS= read -r line; do model_args+=("$line"); done < <(build_model_args)
 
-  if ! $DRY_RUN; then
+  if ! $DRY_RUN && ! $NO_PUSH; then
     prepare_dataset_repo
   fi
 
