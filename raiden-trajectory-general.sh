@@ -51,6 +51,7 @@ SA_CONTAINER_PATH="/tmp/raiden-sa.json"
 # openhands-sdk agent config (matched to the sample_1 reference trajectory).
 MAX_ITERATIONS=1000
 REASONING_EFFORT="high"
+FORCE_ADAPTIVE_THINKING=false
 AGENT_SETUP_TIMEOUT_MULTIPLIER="5.0"
 HARBOR_TIMEOUT_SEC=28800
 
@@ -182,6 +183,7 @@ while [[ $# -gt 0 ]]; do
     --harbor-env)       HARBOR_ENV="$2";     shift 2 ;;
     --max-iterations)   MAX_ITERATIONS="$2"; shift 2 ;;
     --reasoning-effort) REASONING_EFFORT="$2"; shift 2 ;;
+    --force-adaptive-thinking) FORCE_ADAPTIVE_THINKING=true; shift ;;
     --uv-extra)         UV_EXTRA="$2";       shift 2 ;;
     --env-file)         ENV_FILE="$2";       shift 2 ;;
     --dataset-src)      DATASET_SRC="$2";    shift 2 ;;
@@ -293,6 +295,10 @@ build_model_args() {
     --ae "LLM_REASONING_EFFORT=$REASONING_EFFORT"
     --ae "LITELLM_DROP_PARAMS=1"
   )
+
+  if $FORCE_ADAPTIVE_THINKING; then
+    args+=(--ak "force_adaptive_thinking=true")
+  fi
 
   case "$AUTH_KIND" in
     vertex)
