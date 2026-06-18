@@ -4,7 +4,7 @@ This file is auto-loaded by Claude Code in this repo. Keep it tight; longer pros
 
 ## What this is
 
-**Repo2RLEnv** (`repo2rlenv` on PyPI) turns any GitHub repository into a verifiable RL training/eval dataset. End-to-end: **synthesis → standardize → train + eval**, focus on training. We emit datasets in the [Harbor](https://github.com/harbor-framework/harbor) task format so they drop straight into Harbor's runtime ecosystem (Local Docker / Modal / Daytona / E2B / Runloop + 22 agent harnesses).
+**Repo2RLEnv** (`repo2rlenv` on PyPI) turns any GitHub repository into a verifiable RL training/eval dataset. End-to-end: **synthesis → standardize → train + eval**, focus on training. We emit datasets in the [Harbor](https://github.com/Ethara-Ai/harbor) task format so they drop straight into Harbor's runtime ecosystem (Local Docker / Modal / Daytona / E2B / Runloop + 22 agent harnesses).
 
 GitHub: https://github.com/huggingface/Repo2RLEnv · PyPI: `repo2rlenv` · License: Apache-2.0.
 
@@ -196,7 +196,7 @@ uv add --dev <pkg>      # dev only
 
 ## Key external dependencies
 
-- **Harbor** (`uv tool install harbor`) — runs our generated tasks. We don't ship a parallel runtime.
+- **Harbor** (`source .env && uv tool install git+https://${GITHUB_TOKEN}@github.com/Ethara-Ai/harbor`) — runs our generated tasks. We don't ship a parallel runtime. (Private repo — requires `GITHUB_TOKEN` in `.env`.)
 - **Docker** — required for the `bootstrap` phase and any `_runtime` pipeline. `pr_diff` *generates* without Docker, but its emitted task *runs* in Docker (thin `python:3.12-slim` env); set `emit_harbor_env=False` for pure-text output that needs no Docker at all.
 - **LiteLLM** — single client across all LLM providers (Anthropic / OpenAI / HF Router / Bedrock / Ollama / vLLM).
 - **Rich** — every CLI surface; foundation of `src/repo2rlenv/ui/`.

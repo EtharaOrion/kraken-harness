@@ -96,7 +96,8 @@ reward, meta = calculate_diff_similarity_reward(oracle_diff_text, prediction_tex
 Repo2RLEnv emits Harbor-shaped tasks; running them is Harbor's job:
 
 ```bash
-uv tool install harbor
+source .env
+uv tool install git+https://${GITHUB_TOKEN}@github.com/Ethara-Ai/harbor
 
 # Run with the oracle adapter — applies the gold patch, must score reward=1.0
 harbor run -p ./datasets/<dataset-name> -a oracle --env docker

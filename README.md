@@ -10,7 +10,7 @@
   <a href="https://pypi.org/project/repo2rlenv/"><img alt="Python versions" src="https://img.shields.io/pypi/pyversions/repo2rlenv"></a>
   <a href="https://github.com/huggingface/Repo2RLEnv/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/huggingface/Repo2RLEnv/actions/workflows/ci.yml/badge.svg"></a>
   <a href="./LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache%202.0-green"></a>
-  <a href="https://github.com/harbor-framework/harbor"><img alt="Harbor" src="https://img.shields.io/badge/spec-Harbor-FFD21F"></a>
+  <a href="https://github.com/Ethara-Ai/harbor"><img alt="Harbor" src="https://img.shields.io/badge/spec-Harbor-FFD21F"></a>
 </p>
 
 <p align="center">
@@ -24,7 +24,7 @@
   <img src="assets/banner.png" alt="Repo2RLEnv — turn any repo into verifiable RL environments" width="100%">
 </p>
 
-Repo2RLEnv synthesizes **verifiable** training and evaluation data from existing repositories, exports it into a uniform spec, and pushes it straight to the Hugging Face Hub. The output spec is [Harbor](https://github.com/harbor-framework/harbor)'s, so every dataset you produce drops directly into any Harbor-compatible runtime — no glue code.
+Repo2RLEnv synthesizes **verifiable** training and evaluation data from existing repositories, exports it into a uniform spec, and pushes it straight to the Hugging Face Hub. The output spec is [Harbor](https://github.com/Ethara-Ai/harbor)'s, so every dataset you produce drops directly into any Harbor-compatible runtime — no glue code.
 
 
 ## Quickstart
@@ -157,7 +157,7 @@ A dataset that:
 
 ## Under the hood
 
-Our focus is **synthesis** — we don't reimplement sandboxes, agent harnesses, or a registry. Tasks are emitted in the [Harbor](https://github.com/harbor-framework/harbor) format (with a small `[metadata.repo2env]` block for provenance: pipeline, base commit, PR URL, content hash, reward kinds), so they run on Harbor's existing stack — Local Docker / Modal / Daytona / E2B / Runloop, 25+ agent harnesses, parallel execution, and the publishing CLI.
+Our focus is **synthesis** — we don't reimplement sandboxes, agent harnesses, or a registry. Tasks are emitted in the [Harbor](https://github.com/Ethara-Ai/harbor) format (with a small `[metadata.repo2env]` block for provenance: pipeline, base commit, PR URL, content hash, reward kinds), so they run on Harbor's existing stack — Local Docker / Modal / Daytona / E2B / Runloop, 25+ agent harnesses, parallel execution, and the publishing CLI.
 
 ## Contributing a pipeline
 
@@ -185,7 +185,7 @@ Full cookbook (oracle invariant, reward design, QA gate): [**`docs/contributing/
 
 ## Adjacent projects
 
-- [**Harbor**](https://github.com/harbor-framework/harbor) — the task format + runtime we **adopt** as our output spec
+- [**Harbor**](https://github.com/Ethara-Ai/harbor) — the task format + runtime we **adopt** as our output spec
 - [**RepoLaunch**](https://github.com/microsoft/RepoLaunch) (Microsoft) — LLM-agent env setup; our `bootstrap` is an independent reimplementation
 - [**OpenReward**](https://docs.openreward.ai) — ORS protocol + extra trainer integrations above Harbor
 - [**SWE-Gym**](https://github.com/SWE-Gym/SWE-Gym) — RL-environment framing for SWE-bench-style tasks

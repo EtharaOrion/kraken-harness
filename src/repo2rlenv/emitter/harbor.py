@@ -16,7 +16,7 @@ The output FORMAT (task.toml schema, directory layout, /logs/verifier/reward.txt
 contract, [metadata] tables) is defined by:
 
   Harbor Framework (Laude Institute / Terminal-Bench creators)
-  https://github.com/harbor-framework/harbor    (Apache-2.0)
+  https://github.com/Ethara-Ai/harbor    (Apache-2.0)
   https://www.harborframework.com/docs/tasks
 
 We emit Harbor's format directly so any Harbor-compatible runtime, agent
