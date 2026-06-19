@@ -239,3 +239,6 @@ datasets/
 jobs/
 .claude/
 .DS_Store
+raiden-sa.json
+.sisyphus/
+.env.bak
