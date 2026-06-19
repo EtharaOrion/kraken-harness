@@ -2,18 +2,30 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest import mock
 
 import pytest
 
+from repo2rlenv.bootstrap import cache as cache_mod
 from repo2rlenv.bootstrap import runner
+from repo2rlenv.bootstrap.agent import AgentAction, AgentTurn
 from repo2rlenv.bootstrap.runner import (
     BootstrapError,
+    _check_bootstrap_cache,
+    _ensure_git_in_image,
+    _make_image_tag,
+    _push_and_resolve_digest,
+    _resolve_language_and_base_image,
     _resolve_repo_digest,
+    _run_smoke_gate,
+    _safe_emit,
+    _save_agent_transcript,
     _scrub_token,
     _shallow_clone_at_ref,
 )
+from repo2rlenv.bootstrap.spec import LanguageHint
 
 
 def test_scrub_token_replaces_secret():
@@ -185,3 +197,300 @@ def test_scrub_clone_credentials_strips_token(tmp_path: Path):
     config = (clone_dir / ".git" / "config").read_text()
     assert fake_token not in config, "scrub must remove the embedded token"
     assert bare_url in config, "remote URL should now be the clean form"
+
+
+def test_safe_emit_calls_callback():
+    calls = []
+    _safe_emit(lambda p, d: calls.append((p, d)), "started", {"k": 1})
+    assert calls == [("started", {"k": 1})]
+
+
+def test_safe_emit_swallows_exception():
+    def boom(phase, details):
+        raise RuntimeError("oops")
+
+    _safe_emit(boom, "started")
+
+
+def test_safe_emit_noop_when_none():
+    _safe_emit(None, "started")
+
+
+def test_safe_emit_defaults_details_to_empty_dict():
+    calls = []
+    _safe_emit(lambda p, d: calls.append(d), "started")
+    assert calls == [{}]
+
+
+def test_make_image_tag_with_registry():
+    repo = mock.Mock()
+    repo.owner_name = ("acme", "myrepo")
+    spec = mock.Mock()
+    spec.image_registry = "ghcr.io/acme"
+    tag = _make_image_tag(repo, spec, "abc123def456789")
+    assert tag == "ghcr.io/acme/acme__myrepo:abc123def456"
+
+
+def test_make_image_tag_without_registry():
+    repo = mock.Mock()
+    repo.owner_name = ("owner", "name")
+    spec = mock.Mock()
+    spec.image_registry = None
+    tag = _make_image_tag(repo, spec, "deadbeef123456")
+    assert tag == "local/r2e-bootstrap/owner__name:deadbeef1234"
+
+
+def test_run_smoke_gate_empty_cmds():
+    assert _run_smoke_gate(mock.Mock(), []) is True
+
+
+@pytest.mark.parametrize("exit_code", [0, 1, 5])
+def test_run_smoke_gate_acceptable_codes(exit_code):
+    sandbox = mock.Mock()
+    sandbox.exec.return_value = mock.Mock(exit_code=exit_code)
+    assert _run_smoke_gate(sandbox, ["pytest"]) is True
+
+
+def test_run_smoke_gate_env_broken():
+    sandbox = mock.Mock()
+    sandbox.exec.return_value = mock.Mock(exit_code=2)
+    assert _run_smoke_gate(sandbox, ["pytest"]) is False
+
+
+def test_run_smoke_gate_joins_commands():
+    sandbox = mock.Mock()
+    sandbox.exec.return_value = mock.Mock(exit_code=0)
+    _run_smoke_gate(sandbox, ["pip install -e .", "pytest"])
+    cmd = sandbox.exec.call_args[0][0]
+    assert cmd == "pip install -e . && pytest"
+
+
+def test_save_agent_transcript_writes_jsonl(tmp_path: Path):
+    turns = [
+        AgentTurn(
+            step=1,
+            thought="install deps",
+            action=AgentAction(name="BASH", input="pip install -e ."),
+            observation="ok",
+        ),
+        AgentTurn(
+            step=2,
+            thought="run tests",
+            action=AgentAction(name="BASH", input="pytest"),
+            observation="passed",
+        ),
+    ]
+    slot = tmp_path / "slot"
+    _save_agent_transcript(turns, slot)
+    content = (slot / "transcript.jsonl").read_text().strip().split("\n")
+    assert len(content) == 2
+    first = json.loads(content[0])
+    assert first["step"] == 1
+    assert first["action"] == "BASH"
+    assert first["input"] == "pip install -e ."
+    assert first["thought"] == "install deps"
+    assert first["observation"] == "ok"
+
+
+def test_save_agent_transcript_creates_dirs(tmp_path: Path):
+    turns = [
+        AgentTurn(
+            step=1,
+            thought="t",
+            action=AgentAction(name="BASH", input="x"),
+            observation="o",
+        ),
+    ]
+    deep = tmp_path / "a" / "b" / "c"
+    _save_agent_transcript(turns, deep)
+    assert (deep / "transcript.jsonl").exists()
+
+
+def test_save_agent_transcript_handles_oserror(tmp_path: Path):
+    turns = [
+        AgentTurn(
+            step=1,
+            thought="t",
+            action=AgentAction(name="BASH", input="x"),
+            observation="o",
+        ),
+    ]
+    slot = tmp_path / "slot"
+    slot.mkdir()
+    with mock.patch("builtins.open", side_effect=OSError("read-only")):
+        _save_agent_transcript(turns, slot)
+
+
+def test_check_bootstrap_cache_hit():
+    cached = mock.Mock()
+    cached.image_digest = "sha256:abc"
+    phases = []
+    with mock.patch.object(cache_mod, "load", return_value=cached):
+        result = _check_bootstrap_cache(
+            "owner/repo",
+            "abc123",
+            Path("/cache"),
+            {},
+            lambda p, d: phases.append(p),
+        )
+    assert result is cached
+    assert "pull_skipped" in phases
+    assert "push_skipped" in phases
+
+
+def test_check_bootstrap_cache_miss():
+    with mock.patch.object(cache_mod, "load", return_value=None):
+        result = _check_bootstrap_cache(
+            "owner/repo",
+            "abc123",
+            Path("/cache"),
+            {},
+            lambda p, d: None,
+        )
+    assert result is None
+
+
+def test_check_bootstrap_cache_no_digest():
+    """Cache hit but missing image_digest should be treated as a miss."""
+    cached = mock.Mock()
+    cached.image_digest = ""
+    with mock.patch.object(cache_mod, "load", return_value=cached):
+        result = _check_bootstrap_cache(
+            "owner/repo",
+            "abc123",
+            Path("/cache"),
+            {},
+            lambda p, d: None,
+        )
+    assert result is None
+
+
+def test_ensure_git_in_image_present():
+    sandbox = mock.Mock()
+    sandbox.exec.return_value = mock.Mock(ok=True, stdout="OK")
+    emit = mock.Mock()
+    _ensure_git_in_image(sandbox, emit)
+    sandbox.exec.assert_called_once()
+    emit.assert_not_called()
+
+
+def test_ensure_git_in_image_installs():
+    check = mock.Mock(ok=False, stdout="")
+    install = mock.Mock(ok=True, exit_code=0)
+    sandbox = mock.Mock()
+    sandbox.exec.side_effect = [check, install]
+    emit = mock.Mock()
+    _ensure_git_in_image(sandbox, emit)
+    assert sandbox.exec.call_count == 2
+    emit.assert_called_once_with("git_install", {"detail": "ensuring git in image"})
+
+
+def test_resolve_language_and_base_image_with_hint():
+    spec = mock.Mock()
+    spec.languages_hint = ["python"]
+    spec.base_image = None
+    emit = mock.Mock()
+    with mock.patch.object(runner, "base_image_for", return_value="python:3.12-slim"):
+        lang, image = _resolve_language_and_base_image(spec, Path("/clone"), emit)
+    assert lang == LanguageHint.PYTHON
+    assert image == "python:3.12-slim"
+    emit.assert_called_once()
+
+
+def test_resolve_language_and_base_image_auto_detect():
+    spec = mock.Mock()
+    spec.languages_hint = []
+    spec.base_image = "custom:latest"
+    emit = mock.Mock()
+    with mock.patch.object(runner, "detect_language", return_value=LanguageHint.GO):
+        lang, image = _resolve_language_and_base_image(spec, Path("/clone"), emit)
+    assert lang == LanguageHint.GO
+    assert image == "custom:latest"
+
+
+def test_resolve_language_and_base_image_invalid_hint_falls_back():
+    spec = mock.Mock()
+    spec.languages_hint = ["not_a_real_language"]
+    spec.base_image = None
+    emit = mock.Mock()
+    with (
+        mock.patch.object(runner, "detect_language", return_value=LanguageHint.RUST),
+        mock.patch.object(runner, "base_image_for", return_value="rust:1.78"),
+    ):
+        lang, image = _resolve_language_and_base_image(spec, Path("/clone"), emit)
+    assert lang == LanguageHint.RUST
+    assert image == "rust:1.78"
+
+
+def test_push_and_resolve_digest_no_registry():
+    spec = mock.Mock()
+    spec.image_registry = None
+    phases = []
+    pushed, digest = _push_and_resolve_digest(
+        mock.Mock(),
+        "tag:v1",
+        "sha256:orig",
+        spec,
+        lambda p, d: phases.append(p),
+    )
+    assert not pushed
+    assert digest == "sha256:orig"
+    assert "push_skipped" in phases
+
+
+def test_push_and_resolve_digest_registry_no_slash():
+    """Registry without '/' is treated as no registry."""
+    spec = mock.Mock()
+    spec.image_registry = "localonly"
+    phases = []
+    pushed, _digest = _push_and_resolve_digest(
+        mock.Mock(),
+        "tag:v1",
+        "sha256:orig",
+        spec,
+        lambda p, d: phases.append(p),
+    )
+    assert not pushed
+    assert "push_skipped" in phases
+
+
+def test_push_and_resolve_digest_success():
+    spec = mock.Mock()
+    spec.image_registry = "ghcr.io/owner"
+    sandbox = mock.Mock()
+    sandbox.push.return_value = True
+    phases = []
+    with mock.patch.object(
+        runner,
+        "_resolve_repo_digest",
+        return_value="ghcr.io/owner/r@sha256:new123",
+    ):
+        pushed, digest = _push_and_resolve_digest(
+            sandbox,
+            "tag:v1",
+            "sha256:orig",
+            spec,
+            lambda p, d: phases.append(p),
+        )
+    assert pushed
+    assert digest == "ghcr.io/owner/r@sha256:new123"
+    assert "push_start" in phases
+    assert "push_done" in phases
+
+
+def test_push_and_resolve_digest_push_fails():
+    spec = mock.Mock()
+    spec.image_registry = "ghcr.io/owner"
+    sandbox = mock.Mock()
+    sandbox.push.return_value = False
+    phases = []
+    pushed, digest = _push_and_resolve_digest(
+        sandbox,
+        "tag:v1",
+        "sha256:orig",
+        spec,
+        lambda p, d: phases.append(p),
+    )
+    assert not pushed
+    assert digest == "sha256:orig"
+    assert "push_failed" in phases

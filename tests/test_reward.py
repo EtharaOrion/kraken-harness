@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
-from repo2rlenv.reward import calculate_diff_similarity_reward
+import math
+
+from repo2rlenv.reward import (
+    ExecutionReport,
+    _clamp_unit,
+    calculate_diff_similarity_reward,
+)
 
 SAMPLE_DIFF = """diff --git a/foo.py b/foo.py
 index abc..def 100644
@@ -77,3 +83,45 @@ def test_partial_match_scores_in_between():
     b = SAMPLE_DIFF.replace("hello, world", "goodbye")
     reward, _ = calculate_diff_similarity_reward(a, b)
     assert 0.5 < reward < 1.0
+
+
+def test_clamp_unit_bounds_out_of_range_and_nonfinite():
+    assert _clamp_unit(-1.0) == 0.0
+    assert _clamp_unit(2.0) == 1.0
+    assert _clamp_unit(0.5) == 0.5
+    assert _clamp_unit(0.0) == 0.0
+    assert _clamp_unit(1.0) == 1.0
+    assert _clamp_unit(float("nan")) == 0.0
+    assert _clamp_unit(float("inf")) == 1.0
+    assert _clamp_unit(float("-inf")) == 0.0
+
+
+def test_diff_reward_always_in_unit_interval_for_adversarial_inputs():
+    cases = [
+        ("diff x", ""),
+        ("", "diff x"),
+        ("", ""),
+        ("diff x", "   \n  "),
+        ("a\nb\nc", "a\nb\nc"),
+        ("aaa", "zzz"),
+        ("a", "x\n" * 10000),
+        ("\x00\x01\x02", "\xff\xfe"),
+        ("caf\u00e9\n\u2014\n", "cafe\n-\n"),
+    ]
+    for oracle, pred in cases:
+        reward, _ = calculate_diff_similarity_reward(oracle, pred)
+        assert 0.0 <= reward <= 1.0
+        assert math.isfinite(reward)
+
+
+def test_execution_report_rates_always_in_unit_interval():
+    cases = [
+        ExecutionReport([], [], [], []),
+        ExecutionReport(["a", "b"], [], [], []),
+        ExecutionReport([], ["a", "b"], [], []),
+        ExecutionReport(["a"], [], ["k1"], ["k2"]),
+        ExecutionReport(["a"], ["b"], ["k1", "k2"], ["k3"]),
+    ]
+    for report in cases:
+        assert 0.0 <= report.f2p_rate <= 1.0
+        assert 0.0 <= report.p2p_rate <= 1.0

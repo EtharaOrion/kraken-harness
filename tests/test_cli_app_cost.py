@@ -42,6 +42,7 @@ class _Input:
 class _Pipe:
     def __init__(self) -> None:
         self._llm_cost_usd = 0.0
+        self._llm = _LLM()
         self.input = _Input()
 
 

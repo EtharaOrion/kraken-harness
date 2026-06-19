@@ -16,11 +16,15 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from repo2rlenv import __version__
 from repo2rlenv.emitter.harbor import NETWORK_DISALLOW_COMPOSE
 from repo2rlenv.ui import console, install_logging
+
+if TYPE_CHECKING:
+    from repo2rlenv.bootstrap.spec import BootstrapResult
+    from repo2rlenv.spec.input import GenerationInput
 
 logger = logging.getLogger("repo2rlenv")
 
@@ -56,12 +60,8 @@ def _parse_pipeline_opts(items: list[str] | None) -> dict[str, Any]:
     return out
 
 
-def cmd_generate(args: argparse.Namespace) -> int:
-    from repo2rlenv.config import load_generation_input
-    from repo2rlenv.pipelines import PIPELINES
-    from repo2rlenv.spec.options import parse_options
-    from repo2rlenv.ui.views.generation import generation_view_or_plain
-
+def _build_generate_overrides(args: argparse.Namespace) -> dict[str, Any]:
+    """Build the config-override dict; raises SystemExit on malformed --llm values."""
     overrides: dict[str, Any] = {}
     if args.repo:
         overrides["repo"] = {"url": args.repo, "ref": args.ref, "access": args.access}
@@ -89,6 +89,153 @@ def cmd_generate(args: argparse.Namespace) -> int:
             "dataset_name": args.dataset_name or Path(args.out).name,
             "visibility": args.visibility,
         }
+    return overrides
+
+
+def _check_language_support(
+    pipeline_cls: type,
+    gen_input: GenerationInput,
+    *,
+    force_language: bool,
+) -> int:
+    """Fail-fast language pre-flight; returns 2 on mismatch, 0 to continue."""
+    from repo2rlenv.auth import resolve_github_token
+    from repo2rlenv.bootstrap.language import language_from_github_name
+    from repo2rlenv.github import get_primary_language
+    from repo2rlenv.pipelines.base import (
+        LanguageMismatchError,
+        check_language_compatibility,
+    )
+
+    owner, name = gen_input.repo.owner_name
+    gh_token = resolve_github_token(gen_input.repo, gen_input.auth)
+    gh_lang_name = get_primary_language(owner, name, token=gh_token)
+    detected = language_from_github_name(gh_lang_name)
+    try:
+        check_language_compatibility(pipeline_cls, detected, force=force_language)
+    except LanguageMismatchError as exc:
+        console.error(str(exc))
+        return 2
+    return 0
+
+
+def _run_bootstrap_phase(
+    pipeline_cls: type,
+    gen_input: GenerationInput,
+    args: argparse.Namespace,
+    *,
+    cli_app_mode: bool,
+) -> tuple[BootstrapResult | None, int | None]:
+    """Run bootstrap if required; returns (result, error_code), error_code None to continue."""
+    if cli_app_mode or not getattr(pipeline_cls, "requires_bootstrap", False):
+        return None, None
+    if gen_input.llm is None:
+        console.error(
+            f"pipeline {gen_input.pipeline.name.value!r} requires --llm "
+            f"(bootstrap needs an LLM to build the sandbox image)"
+        )
+        return None, 2
+
+    from repo2rlenv.bootstrap import LanguageHint, ensure_bootstrap
+    from repo2rlenv.bootstrap.runner import BootstrapError
+    from repo2rlenv.ui.views.bootstrap import bootstrap_view_or_plain
+
+    # Mutate spec with CLI overrides (language / base-image / budget / force / --bootstrap-opt)
+    bspec = gen_input.bootstrap.model_copy(deep=True)
+    if args.language:
+        try:
+            bspec.languages_hint = [LanguageHint(args.language).value]
+        except ValueError as exc:
+            raise SystemExit(f"unknown --language: {args.language!r}") from exc
+    if args.base_image:
+        bspec.base_image = args.base_image
+    # --max-spend-usd=0 ⇒ no cap; map to None
+    if args.max_spend_usd is not None:
+        bspec.max_llm_spend_usd = args.max_spend_usd if args.max_spend_usd > 0 else None
+    # Generic --bootstrap-opt key=value for any other BootstrapSpec field
+    # (cache_dir / max_iterations / max_seconds / image_registry / platform / ...)
+    for k, v in _parse_pipeline_opts(getattr(args, "bootstrap_opt", None)).items():
+        if not hasattr(bspec, k):
+            raise SystemExit(f"--bootstrap-opt: unknown BootstrapSpec field {k!r}")
+        # Pydantic will coerce types as needed (str→Path, str→int, etc.)
+        try:
+            bspec = bspec.model_copy(update={k: v})
+        except Exception as exc:
+            raise SystemExit(f"--bootstrap-opt {k}={v!r}: {exc}") from exc
+    with bootstrap_view_or_plain(
+        repo=gen_input.repo.url,
+        ref=gen_input.repo.ref,
+        model=gen_input.llm.qualified_name if gen_input.llm else "none",
+        max_iterations=bspec.max_iterations,
+        language=(bspec.languages_hint[0] if bspec.languages_hint else "unknown"),
+        base_image=bspec.base_image or "(auto-detect)",
+        force_plain=args.no_ui,
+    ) as bs_view:
+        try:
+            bootstrap_result = ensure_bootstrap(
+                gen_input.repo,
+                bspec,
+                gen_input.llm,
+                gen_input.auth,
+                force=args.force_bootstrap,
+                on_turn=bs_view.on_turn if bs_view else None,
+                on_thinking=bs_view.on_thinking if bs_view else None,
+                on_executing=bs_view.on_executing if bs_view else None,
+                on_phase=bs_view.on_phase if bs_view else None,
+            )
+        except BootstrapError as exc:
+            if bs_view is not None:
+                bs_view.set_outcome(success=False, reason=str(exc))
+            else:
+                console.error(f"bootstrap error: {exc}")
+            return None, 1
+        if bs_view is not None:
+            bs_view.set_outcome(
+                success=True,
+                image_digest=bootstrap_result.image_digest,
+                image_tag=bootstrap_result.image_tag,
+                rebuild_cmds=bootstrap_result.rebuild_cmds,
+                test_cmds=bootstrap_result.test_cmds,
+            )
+    return bootstrap_result, None
+
+
+def _maybe_push_to_hub(
+    gen_input: GenerationInput,
+    result: Any,
+    out_dir: Path,
+    repo_id: str,
+    dest: str,
+) -> None:
+    from repo2rlenv.hub import push_to_hub
+
+    with console.section(f"Pushing to {dest}"):
+        push_result = push_to_hub(
+            local_dataset_dir=out_dir,
+            repo_id=repo_id,
+            auth=gen_input.auth,
+            private=(gen_input.output.visibility == "private"),
+            pipeline=gen_input.pipeline.name.value,
+            repo_source=f"{gen_input.repo.owner_name[0]}/{gen_input.repo.owner_name[1]}",
+        )
+        console.kv(
+            {
+                "repo_id": push_result.repo_id,
+                "commit": push_result.commit_sha,
+                "task_count": push_result.task_count,
+                "registry_url": push_result.registry_url,
+            },
+            title="HF Hub push",
+        )
+
+
+def cmd_generate(args: argparse.Namespace) -> int:
+    from repo2rlenv.config import load_generation_input
+    from repo2rlenv.pipelines import PIPELINES
+    from repo2rlenv.spec.options import parse_options
+    from repo2rlenv.ui.views.generation import generation_view_or_plain
+
+    overrides = _build_generate_overrides(args)
 
     config_path = Path(args.config) if args.config else None
     gen_input = load_generation_input(config_path, overrides)
@@ -118,103 +265,18 @@ def cmd_generate(args: argparse.Namespace) -> int:
         and getattr(options, "mode", "snippet") == "cli_app"
     )
 
-    # Pre-flight: does this pipeline support this repo's primary language?
-    # Cheap GitHub API call; runs BEFORE bootstrap so we fail fast on a
-    # Go/Rust/Node repo + Python-only pipeline mismatch (~2s vs ~5 min).
     if getattr(pipeline_cls, "supported_languages", None) is not None and not _cli_app_mode:
-        from repo2rlenv.auth import resolve_github_token
-        from repo2rlenv.bootstrap.language import language_from_github_name
-        from repo2rlenv.github import get_primary_language
-        from repo2rlenv.pipelines.base import (
-            LanguageMismatchError,
-            check_language_compatibility,
+        lang_rc = _check_language_support(
+            pipeline_cls, gen_input, force_language=args.force_language
         )
+        if lang_rc != 0:
+            return lang_rc
 
-        owner, name = gen_input.repo.owner_name
-        gh_token = resolve_github_token(gen_input.repo, gen_input.auth)
-        gh_lang_name = get_primary_language(owner, name, token=gh_token)
-        detected = language_from_github_name(gh_lang_name)
-        try:
-            check_language_compatibility(pipeline_cls, detected, force=args.force_language)
-        except LanguageMismatchError as exc:
-            console.error(str(exc))
-            return 2
-
-    # Auto-trigger bootstrap for sandbox-required pipelines (requires_bootstrap=True).
-    # Cache hit ⇒ instant; cache miss ⇒ full LLM-agent run with the live UI.
-    bootstrap_result = None
-    if (
-        getattr(pipeline_cls, "requires_bootstrap", False)
-        and gen_input.llm is None
-        and not _cli_app_mode
-    ):
-        console.error(
-            f"pipeline {gen_input.pipeline.name.value!r} requires --llm "
-            f"(bootstrap needs an LLM to build the sandbox image)"
-        )
-        return 2
-    if getattr(pipeline_cls, "requires_bootstrap", False) and not _cli_app_mode:
-        from repo2rlenv.bootstrap import LanguageHint, ensure_bootstrap
-        from repo2rlenv.bootstrap.runner import BootstrapError
-        from repo2rlenv.ui.views.bootstrap import bootstrap_view_or_plain
-
-        # Mutate spec with CLI overrides (language / base-image / budget / force / --bootstrap-opt)
-        bspec = gen_input.bootstrap.model_copy(deep=True)
-        if args.language:
-            try:
-                bspec.languages_hint = [LanguageHint(args.language).value]
-            except ValueError as exc:
-                raise SystemExit(f"unknown --language: {args.language!r}") from exc
-        if args.base_image:
-            bspec.base_image = args.base_image
-        # --max-spend-usd=0 ⇒ no cap; map to None
-        if args.max_spend_usd is not None:
-            bspec.max_llm_spend_usd = args.max_spend_usd if args.max_spend_usd > 0 else None
-        # Generic --bootstrap-opt key=value for any other BootstrapSpec field
-        # (cache_dir / max_iterations / max_seconds / image_registry / platform / ...)
-        for k, v in _parse_pipeline_opts(getattr(args, "bootstrap_opt", None)).items():
-            if not hasattr(bspec, k):
-                raise SystemExit(f"--bootstrap-opt: unknown BootstrapSpec field {k!r}")
-            # Pydantic will coerce types as needed (str→Path, str→int, etc.)
-            try:
-                bspec = bspec.model_copy(update={k: v})
-            except Exception as exc:
-                raise SystemExit(f"--bootstrap-opt {k}={v!r}: {exc}") from exc
-        with bootstrap_view_or_plain(
-            repo=gen_input.repo.url,
-            ref=gen_input.repo.ref,
-            model=gen_input.llm.qualified_name if gen_input.llm else "none",
-            max_iterations=bspec.max_iterations,
-            language=(bspec.languages_hint[0] if bspec.languages_hint else "unknown"),
-            base_image=bspec.base_image or "(auto-detect)",
-            force_plain=args.no_ui,
-        ) as bs_view:
-            try:
-                bootstrap_result = ensure_bootstrap(
-                    gen_input.repo,
-                    bspec,
-                    gen_input.llm,
-                    gen_input.auth,
-                    force=args.force_bootstrap,
-                    on_turn=bs_view.on_turn if bs_view else None,
-                    on_thinking=bs_view.on_thinking if bs_view else None,
-                    on_executing=bs_view.on_executing if bs_view else None,
-                    on_phase=bs_view.on_phase if bs_view else None,
-                )
-            except BootstrapError as exc:
-                if bs_view is not None:
-                    bs_view.set_outcome(success=False, reason=str(exc))
-                else:
-                    console.error(f"bootstrap error: {exc}")
-                return 1
-            if bs_view is not None:
-                bs_view.set_outcome(
-                    success=True,
-                    image_digest=bootstrap_result.image_digest,
-                    image_tag=bootstrap_result.image_tag,
-                    rebuild_cmds=bootstrap_result.rebuild_cmds,
-                    test_cmds=bootstrap_result.test_cmds,
-                )
+    bootstrap_result, bootstrap_rc = _run_bootstrap_phase(
+        pipeline_cls, gen_input, args, cli_app_mode=_cli_app_mode
+    )
+    if bootstrap_rc is not None:
+        return bootstrap_rc
 
     pipeline = pipeline_cls(gen_input, options, bootstrap=bootstrap_result)
 
@@ -272,26 +334,7 @@ def cmd_generate(args: argparse.Namespace) -> int:
         )
 
     if push_to_hub_after and result.emitted > 0:
-        from repo2rlenv.hub import push_to_hub
-
-        with console.section(f"Pushing to {dest}"):
-            push_result = push_to_hub(
-                local_dataset_dir=out_dir,
-                repo_id=repo_id,
-                auth=gen_input.auth,
-                private=(gen_input.output.visibility == "private"),
-                pipeline=gen_input.pipeline.name.value,
-                repo_source=f"{gen_input.repo.owner_name[0]}/{gen_input.repo.owner_name[1]}",
-            )
-            console.kv(
-                {
-                    "repo_id": push_result.repo_id,
-                    "commit": push_result.commit_sha,
-                    "task_count": push_result.task_count,
-                    "registry_url": push_result.registry_url,
-                },
-                title="HF Hub push",
-            )
+        _maybe_push_to_hub(gen_input, result, out_dir, repo_id, dest)
 
     return 0 if result.emitted > 0 else 1
 

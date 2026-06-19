@@ -367,6 +367,96 @@ def _extract_class_prefix(class_node: ast.ClassDef) -> str | None:
     return None
 
 
+def _try_cmdline_from_assignment(stmt: ast.AST, prefix_value: str) -> list[str] | None:
+    if not (
+        isinstance(stmt, ast.Assign)
+        and len(stmt.targets) == 1
+        and isinstance(stmt.targets[0], ast.Name)
+        and stmt.targets[0].id in ("cmdline", "command")
+    ):
+        return None
+    literal_tail = _extract_string_concat_tail(stmt.value)
+    if literal_tail is None:
+        return None
+    return (prefix_value + literal_tail).strip().split()
+
+
+def _try_cmdline_and_rc_from_call(
+    stmt: ast.AST, prefix_value: str
+) -> tuple[list[str] | None, int | None]:
+    if not (
+        isinstance(stmt, ast.Call)
+        and isinstance(stmt.func, ast.Attribute)
+        and stmt.func.attr in ("run_cmd", "assert_params_for_cmd")
+    ):
+        return None, None
+
+    cmdline: list[str] | None = None
+    if stmt.args:
+        literal = _extract_string_concat_tail(stmt.args[0])
+        if literal is not None:
+            cmdline = (prefix_value + literal).strip().split()
+
+    expected_rc: int | None = None
+    for kw in stmt.keywords:
+        if (
+            kw.arg == "expected_rc"
+            and isinstance(kw.value, ast.Constant)
+            and isinstance(kw.value.value, int)
+        ):
+            expected_rc = kw.value.value
+    return cmdline, expected_rc
+
+
+def _collect_operation_names(stmt: ast.AST) -> list[str]:
+    if not (
+        isinstance(stmt, ast.Call)
+        and isinstance(stmt.func, ast.Attribute)
+        and stmt.func.attr in ("assertEqual", "assertEquals")
+        and len(stmt.args) >= 2
+    ):
+        return []
+    names: list[str] = []
+    for arg in stmt.args:
+        op_name = _maybe_extract_operation_name(arg)
+        if op_name:
+            names.append(op_name)
+    return names
+
+
+def _resolve_cmdline_with_fallbacks(
+    method: ast.FunctionDef,
+    prefix_value: str,
+    command: str,
+    full_source: str,
+    primary: list[str] | None,
+) -> list[str]:
+    if primary:
+        return primary
+
+    # Fallback A: presign-style wrapper — scan BinOp(Add) for self.prefix concat
+    for stmt in ast.walk(method):
+        if isinstance(stmt, ast.BinOp):
+            literal_tail = _extract_string_concat_tail(stmt)
+            if literal_tail and (
+                literal_tail.startswith("s3://")
+                or literal_tail.startswith("--")
+                or " " in literal_tail
+            ):
+                return (prefix_value + literal_tail).strip().split()
+
+    # Fallback B: regex on raw source for any literal containing the command name
+    method_source = ast.get_source_segment(full_source, method) or ""
+    m = re.search(
+        r"['\"]\s*((?:[a-z0-9_]+\s+){0,3}" + re.escape(command) + r"\b[^'\"]*)['\"]",
+        method_source,
+    )
+    if m:
+        return m.group(1).strip().split()
+
+    return [command]
+
+
 def _extract_intent_from_method(
     *,
     method: ast.FunctionDef,
@@ -375,90 +465,27 @@ def _extract_intent_from_method(
     source_file: str,
     full_source: str,
 ) -> TestIntent | None:
-    """Best-effort intent extraction. Returns None on irreducible patterns."""
     cmdline: list[str] | None = None
     expected_exit = 0
     expected_state_calls: list[str] = []
     expected_stdout_pattern: str | None = None
 
     for stmt in ast.walk(method):
-        # cmdline = self.prefix + '<rest>'  OR  cmdline = self.prefix + 's3://...'
-        if (
-            isinstance(stmt, ast.Assign)
-            and len(stmt.targets) == 1
-            and isinstance(stmt.targets[0], ast.Name)
-            and stmt.targets[0].id in ("cmdline", "command")
-        ):
-            literal_tail = _extract_string_concat_tail(stmt.value)
-            if literal_tail is not None:
-                full = prefix_value + literal_tail
-                cmdline = full.strip().split()
+        assigned = _try_cmdline_from_assignment(stmt, prefix_value)
+        if assigned is not None:
+            cmdline = assigned
 
-        # self.run_cmd(cmdline, expected_rc=N)
-        if (
-            isinstance(stmt, ast.Call)
-            and isinstance(stmt.func, ast.Attribute)
-            and stmt.func.attr in ("run_cmd", "assert_params_for_cmd")
-        ):
-            # If cmdline wasn't extracted yet, try positional argument
-            if cmdline is None and stmt.args:
-                first = stmt.args[0]
-                literal = _extract_string_concat_tail(first)
-                if literal is not None:
-                    full = prefix_value + literal
-                    cmdline = full.strip().split()
-            for kw in stmt.keywords:
-                if (
-                    kw.arg == "expected_rc"
-                    and isinstance(kw.value, ast.Constant)
-                    and isinstance(kw.value.value, int)
-                ):
-                    expected_exit = kw.value.value
+        call_cmd, call_rc = _try_cmdline_and_rc_from_call(stmt, prefix_value)
+        if cmdline is None and call_cmd is not None:
+            cmdline = call_cmd
+        if call_rc is not None:
+            expected_exit = call_rc
 
-        # self.operations_called[N][0].name -> capture via assertEqual
-        if (
-            isinstance(stmt, ast.Call)
-            and isinstance(stmt.func, ast.Attribute)
-            and stmt.func.attr in ("assertEqual", "assertEquals")
-            and len(stmt.args) >= 2
-        ):
-            for arg in stmt.args:
-                op_name = _maybe_extract_operation_name(arg)
-                if op_name and op_name not in expected_state_calls:
-                    expected_state_calls.append(op_name)
+        for op in _collect_operation_names(stmt):
+            if op not in expected_state_calls:
+                expected_state_calls.append(op)
 
-    # Fallback A: presign-style wrapper calls (`helper(self.prefix + 'literal')`)
-    # — scan ALL BinOp(Add) inside the method body for a self.prefix
-    # concatenation tail, even when wrapped in non-canonical calls.
-    if cmdline is None or not cmdline:
-        for stmt in ast.walk(method):
-            if isinstance(stmt, ast.BinOp):
-                literal_tail = _extract_string_concat_tail(stmt)
-                if literal_tail and (
-                    literal_tail.startswith("s3://")
-                    or literal_tail.startswith("--")
-                    or " " in literal_tail
-                ):
-                    full = prefix_value + literal_tail
-                    cmdline = full.strip().split()
-                    break
-
-    # Fallback B: regex on raw method source for any literal that includes
-    # the command name as a token (e.g. ls's direct `run_cmd('s3 ls ...')`).
-    if cmdline is None or not cmdline:
-        method_source = ast.get_source_segment(full_source, method) or ""
-        m = re.search(
-            r"['\"]\s*((?:[a-z0-9_]+\s+){0,3}" + re.escape(command) + r"\b[^'\"]*)['\"]",
-            method_source,
-        )
-        if m:
-            cmdline = m.group(1).strip().split()
-
-    # Last-resort placeholder so the method isn't silently dropped. The LLM
-    # gets the full raw_source and translates from that — cmdline_template
-    # is only a hint.
-    if cmdline is None or not cmdline:
-        cmdline = [command]
+    cmdline = _resolve_cmdline_with_fallbacks(method, prefix_value, command, full_source, cmdline)
 
     behaviour_tag = _infer_behaviour_tag(method.name, expected_exit)
 

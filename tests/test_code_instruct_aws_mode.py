@@ -154,6 +154,7 @@ def test_synthesis_prompt_picked_by_flag():
     class _Pipeline:
         def __init__(self, aws_mode):
             self.input = _Input()
+            self._llm = _LLM()
             self.options = CodeInstructOptions(aws_mode=aws_mode)
             self.bootstrap = _Bootstrap()
             self._llm_cost_usd = 0.0

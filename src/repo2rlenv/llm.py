@@ -12,6 +12,7 @@ import re
 from dataclasses import dataclass
 
 from repo2rlenv.auth import resolve_llm_api_key
+
 # from repo2rlenv.compression import maybe_compress
 from repo2rlenv.spec.input import LLMSpec
 

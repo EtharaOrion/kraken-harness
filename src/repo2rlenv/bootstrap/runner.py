@@ -19,7 +19,7 @@ from pathlib import Path
 
 from repo2rlenv.auth import git_credentials_env, resolve_github_token
 from repo2rlenv.bootstrap import cache as cache_mod
-from repo2rlenv.bootstrap.agent import run_agent_loop
+from repo2rlenv.bootstrap.agent import AgentTurn, run_agent_loop
 from repo2rlenv.bootstrap.docker import (
     DockerSandbox,
     _run,
@@ -459,6 +459,161 @@ def _reconstruct_dockerfile(base_image: str, turns: list) -> str:
     return "\n".join(lines)
 
 
+def _safe_emit(
+    on_phase: Callable[[str, dict], None] | None,
+    phase: str,
+    details: dict | None = None,
+) -> None:
+    """Fire a phase callback, swallowing exceptions."""
+    if on_phase is not None:
+        try:
+            on_phase(phase, details or {})
+        except Exception as exc:
+            logger.debug("on_phase callback failed: %s", exc)
+
+
+def _resolve_language_and_base_image(
+    spec: BootstrapSpec,
+    clone_dir: Path,
+    emit: Callable[[str, dict | None], None],
+) -> tuple[LanguageHint, str]:
+
+    lang = LanguageHint.UNKNOWN
+    if spec.languages_hint:
+        try:
+            lang = LanguageHint(spec.languages_hint[0])
+        except ValueError:
+            pass
+    if lang == LanguageHint.UNKNOWN:
+        lang = detect_language(clone_dir)
+    base_image = spec.base_image or base_image_for(lang)
+    emit("detected", {"language": lang.value, "base_image": base_image})
+    return lang, base_image
+
+
+def _check_bootstrap_cache(
+    owner_name: str,
+    ref_sha: str,
+    cache_dir: Path,
+    cache_opts: dict[str, object],
+    emit: Callable[[str, dict | None], None],
+) -> BootstrapResult | None:
+
+    cached = cache_mod.load(owner_name, ref_sha, cache_dir, options=cache_opts)
+    if cached is not None and cached.image_digest:
+        logger.info("bootstrap cache hit: %s", cached.image_digest)
+        for p in ("pull", "sandbox", "agent", "commit"):
+            emit(f"{p}_skipped", {"detail": "cache hit"})
+        emit("push_skipped", {"detail": "cache hit"})
+        return cached
+    return None
+
+
+def _save_agent_transcript(transcript: list[AgentTurn], slot_path: Path) -> None:
+    """Persist the agent transcript to ``slot_path / transcript.jsonl``."""
+    slot_path.mkdir(parents=True, exist_ok=True)
+    try:
+        with (slot_path / "transcript.jsonl").open("w", encoding="utf-8") as f:
+            for turn in transcript:
+                f.write(
+                    json.dumps(
+                        {
+                            "step": turn.step,
+                            "thought": turn.thought,
+                            "action": turn.action.name,
+                            "input": turn.action.input,
+                            "observation": turn.observation,
+                        }
+                    )
+                    + "\n"
+                )
+    except OSError as exc:
+        logger.warning("could not write transcript: %s", exc)
+
+
+def _run_smoke_gate(sandbox: DockerSandbox, test_cmds: list[str]) -> bool:
+    # exit 0/1/5 = env OK (1 = tests failed but ran, 5 = nothing collected)
+    if not test_cmds:
+        return True
+    smoke_script = " && ".join(test_cmds)
+    r = sandbox.exec(smoke_script, timeout=300)
+    if r.exit_code not in (0, 1, 5):
+        logger.warning(
+            "smoke test exited %d: %s (env issue, not just test failures)",
+            r.exit_code,
+            smoke_script[:200],
+        )
+        return False
+    return True
+
+
+def _ensure_git_in_image(
+    sandbox: DockerSandbox,
+    emit: Callable[[str, dict | None], None],
+) -> None:
+
+    git_check = sandbox.exec("command -v git >/dev/null 2>&1 && echo OK", timeout=10)
+    if git_check.ok and "OK" in git_check.stdout:
+        return
+    emit("git_install", {"detail": "ensuring git in image"})
+    install = sandbox.exec(
+        "(apt-get update >/dev/null 2>&1 && "
+        "apt-get install -y --no-install-recommends git >/dev/null 2>&1 && "
+        "rm -rf /var/lib/apt/lists/*) || "
+        "apk add --no-cache git >/dev/null 2>&1 || true",
+        timeout=180,
+    )
+    if not install.ok:
+        logger.warning(
+            "post-bootstrap git install returned exit=%d; downstream pipelines "
+            "may need to install git themselves",
+            install.exit_code,
+        )
+
+
+def _make_image_tag(repo: RepoSpec, spec: BootstrapSpec, ref_sha: str) -> str:
+
+    tag_base = spec.image_registry or "local/r2e-bootstrap"
+    owner, name = repo.owner_name
+    slug = f"{owner}__{name}".replace("/", "__").lower()
+    return f"{tag_base}/{slug}:{ref_sha[:12]}".lstrip("/")
+
+
+def _push_and_resolve_digest(
+    sandbox: DockerSandbox,
+    tag: str,
+    image_digest: str,
+    spec: BootstrapSpec,
+    emit: Callable[[str, dict | None], None],
+) -> tuple[bool, str]:
+
+    if not (spec.image_registry and "/" in spec.image_registry):
+        emit("push_skipped", {"detail": "no --image-registry"})
+        return False, image_digest
+
+    emit("push_start", {"detail": tag})
+    pushed = sandbox.push(tag)
+    if not pushed:
+        emit("push_failed", {"detail": "see logs"})
+        return False, image_digest
+
+    # After push, `docker image inspect` now returns RepoDigests like
+    # `ghcr.io/owner/foo@sha256:...` — the registry-qualified, pullable
+    # digest. Re-resolve so downstream sandboxes can pull.
+    resolved = _resolve_repo_digest(tag)
+    if resolved:
+        image_digest = resolved
+    else:
+        logger.warning(
+            "push %s succeeded but RepoDigests not populated; "
+            "image_digest stays at the local id %s",
+            tag,
+            image_digest,
+        )
+    emit("push_done", {"detail": image_digest[-24:]})
+    return True, image_digest
+
+
 def ensure_bootstrap(
     repo: RepoSpec,
     spec: BootstrapSpec,
@@ -508,11 +663,7 @@ def ensure_bootstrap(
         return _bootstrap_from_user_dockerfile(repo, spec, llm, token, force=force)
 
     def _emit(phase: str, details: dict | None = None) -> None:
-        if on_phase is not None:
-            try:
-                on_phase(phase, details or {})
-            except Exception as exc:
-                logger.debug("on_phase callback failed: %s", exc)
+        _safe_emit(on_phase, phase, details)
 
     with tempfile.TemporaryDirectory(prefix="r2e-clone-") as tmp:
         clone_dir = Path(tmp) / "repo"
@@ -536,33 +687,11 @@ def ensure_bootstrap(
         owner_name = "/".join(repo.owner_name)
         cache_opts = _cache_options(spec)
         if not force:
-            cached = cache_mod.load(owner_name, ref_sha, spec.cache_dir, options=cache_opts)
-            if cached is not None and cached.image_digest:
-                logger.info("bootstrap cache hit: %s", cached.image_digest)
-                for p in ("pull", "sandbox", "agent", "commit"):
-                    _emit(f"{p}_skipped", {"detail": "cache hit"})
-                _emit("push_skipped", {"detail": "cache hit"})
+            cached = _check_bootstrap_cache(owner_name, ref_sha, spec.cache_dir, cache_opts, _emit)
+            if cached is not None:
                 return cached
 
-        # Decide language + base image
-        lang = LanguageHint.UNKNOWN
-        if spec.languages_hint:
-            try:
-                lang = LanguageHint(spec.languages_hint[0])
-            except ValueError:
-                pass
-        if lang == LanguageHint.UNKNOWN:
-            lang = detect_language(clone_dir)
-        base_image = spec.base_image or base_image_for(lang)
-
-        # Tell any listening UI about the resolved language/base so it can
-        # update its header (the CLI fills these in as "unknown" / "ubuntu" at
-        # construction time, before the clone has happened).
-        if on_phase is not None:
-            try:
-                on_phase("detected", {"language": lang.value, "base_image": base_image})
-            except Exception as exc:
-                logger.debug("on_phase callback failed: %s", exc)
+        lang, base_image = _resolve_language_and_base_image(spec, clone_dir, _emit)
 
         # Spin up sandbox (emits its own pull_*/sandbox_* phase events)
         start = time.monotonic()
@@ -594,24 +723,7 @@ def ensure_bootstrap(
             failure_slot = cache_mod.cache_key(
                 owner_name, ref_sha, spec.cache_dir, options=cache_opts
             )
-            failure_slot.mkdir(parents=True, exist_ok=True)
-            try:
-                with (failure_slot / "transcript.jsonl").open("w", encoding="utf-8") as f:
-                    for turn in outcome.transcript:
-                        f.write(
-                            json.dumps(
-                                {
-                                    "step": turn.step,
-                                    "thought": turn.thought,
-                                    "action": turn.action.name,
-                                    "input": turn.action.input,
-                                    "observation": turn.observation,
-                                }
-                            )
-                            + "\n"
-                        )
-            except OSError as exc:
-                logger.warning("could not write transcript: %s", exc)
+            _save_agent_transcript(outcome.transcript, failure_slot)
 
             if not outcome.success:
                 _emit("agent_failed", {"detail": outcome.reason[:80]})
@@ -622,53 +734,11 @@ def ensure_bootstrap(
                 )
             _emit("agent_done", {"detail": f"{outcome.iterations} iters"})
 
-            # Soft smoke gate — runs ALL test_cmds JOINED in one shell so PATH
-            # exports etc. carry over. Treats individual test failures as fine
-            # (pytest exit 1 = tests failed but ran; 5 = no tests collected
-            # but pytest ran). We only flag as failed for env-level errors.
-            # The agent's SAVE_SETUP call is the real success signal.
-            smoke_ok = True
-            if outcome.test_cmds:
-                smoke_script = " && ".join(outcome.test_cmds)
-                r = sandbox.exec(smoke_script, timeout=300)
-                if r.exit_code not in (0, 1, 5):
-                    smoke_ok = False
-                    logger.warning(
-                        "smoke test exited %d: %s (env issue, not just test failures)",
-                        r.exit_code,
-                        smoke_script[:200],
-                    )
+            smoke_ok = _run_smoke_gate(sandbox, outcome.test_cmds)
 
-            # Make sure git is available in the image. Several base images
-            # (python:slim, node:slim, alpine variants) don't ship git, and the
-            # agent installs it only when its own build commands need it. But
-            # downstream pipelines (pr_runtime / commit_runtime / cve_patches)
-            # all need git inside the container to fetch base commits, reset
-            # working trees, and apply patches. Adding it here — once,
-            # idempotent, captured in the commit — beats every consumer running
-            # its own defensive install.
-            git_check = sandbox.exec("command -v git >/dev/null 2>&1 && echo OK", timeout=10)
-            if not (git_check.ok and "OK" in git_check.stdout):
-                _emit("git_install", {"detail": "ensuring git in image"})
-                install = sandbox.exec(
-                    "(apt-get update >/dev/null 2>&1 && "
-                    "apt-get install -y --no-install-recommends git >/dev/null 2>&1 && "
-                    "rm -rf /var/lib/apt/lists/*) || "
-                    "apk add --no-cache git >/dev/null 2>&1 || true",
-                    timeout=180,
-                )
-                if not install.ok:
-                    logger.warning(
-                        "post-bootstrap git install returned exit=%d; downstream pipelines "
-                        "may need to install git themselves",
-                        install.exit_code,
-                    )
+            _ensure_git_in_image(sandbox, _emit)
 
-            # Commit the container regardless — caller decides whether to push
-            tag_base = spec.image_registry or "local/r2e-bootstrap"
-            owner, name = repo.owner_name
-            slug = f"{owner}__{name}".replace("/", "__").lower()
-            tag = f"{tag_base}/{slug}:{ref_sha[:12]}".lstrip("/")
+            tag = _make_image_tag(repo, spec, ref_sha)
             _emit("commit_start", {"detail": tag})
             image_digest = sandbox.commit(tag, message=f"r2e bootstrap {owner_name}@{ref_sha[:12]}")
             _emit("commit_done", {"detail": image_digest[-24:]})
@@ -690,29 +760,7 @@ def ensure_bootstrap(
                     verify_detail[:200],
                 )
 
-            pushed = False
-            if spec.image_registry and "/" in spec.image_registry:
-                _emit("push_start", {"detail": tag})
-                pushed = sandbox.push(tag)
-                if pushed:
-                    # After push, `docker image inspect` now returns RepoDigests
-                    # like `ghcr.io/owner/foo@sha256:...` — the registry-qualified,
-                    # pullable digest. Re-resolve so downstream sandboxes can pull.
-                    resolved = _resolve_repo_digest(tag)
-                    if resolved:
-                        image_digest = resolved
-                    else:
-                        logger.warning(
-                            "push %s succeeded but RepoDigests not populated; "
-                            "image_digest stays at the local id %s",
-                            tag,
-                            image_digest,
-                        )
-                    _emit("push_done", {"detail": image_digest[-24:]})
-                else:
-                    _emit("push_failed", {"detail": "see logs"})
-            else:
-                _emit("push_skipped", {"detail": "no --image-registry"})
+            pushed, image_digest = _push_and_resolve_digest(sandbox, tag, image_digest, spec, _emit)
 
         build_time = time.monotonic() - start
         dockerfile = _reconstruct_dockerfile(base_image, outcome.transcript)

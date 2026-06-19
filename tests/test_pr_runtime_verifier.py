@@ -136,6 +136,29 @@ def test_grade_no_untracked_failure_resolves():
     assert r["untracked_failed_count"] == 0
 
 
+def test_grade_empty_sets_do_not_divide_by_zero():
+    r = grade([], [], {})
+    assert 0.0 <= r["reward"] <= 1.0
+    assert r["f2p_rate"] == 0.0
+    assert r["p2p_rate"] == 1.0
+
+
+def test_grade_reward_always_in_unit_interval():
+    cases = [
+        ([], [], {}),
+        (["f1", "f2"], [], {}),
+        (["f1"], ["k1"], {"f1": "PASSED", "k1": "PASSED"}),
+        (["f1"], ["k1", "k2"], {"f1": "PASSED"}),
+        ([f"f{i}" for i in range(2000)], [], {f"f{i}": "PASSED" for i in range(2000)}),
+        (["f1"], ["k1"], {"f1": "WAT", "k1": None}),
+    ]
+    for f2p, p2p, status_map in cases:
+        r = grade(f2p, p2p, status_map)
+        assert 0.0 <= r["reward"] <= 1.0
+        assert 0.0 <= r["f2p_rate"] <= 1.0
+        assert 0.0 <= r["p2p_rate"] <= 1.0
+
+
 # --- main() / IO -------------------------------------------------------------
 
 

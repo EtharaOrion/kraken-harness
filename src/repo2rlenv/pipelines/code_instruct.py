@@ -67,6 +67,7 @@ from repo2rlenv.pipelines._oss_instruct import (
     parse_task_response,
     references_task_module,
     sample_seed,
+    solution_leaks_into_problem,
 )
 from repo2rlenv.pipelines.base import PipelineResult
 from repo2rlenv.pipelines.mutation_bugs import build_mutation_eval_script
@@ -417,6 +418,7 @@ class CodeInstructPipeline:
             )
         if input.llm is None:
             raise ValueError("code_instruct requires --llm (provider/model)")
+        self._llm = input.llm
         self.input = input
         self.options = options
         self.bootstrap = bootstrap
@@ -533,6 +535,12 @@ class CodeInstructPipeline:
                             )
                             self._emit_progress(label, "skip", "benchmark_overlap")
                             continue
+                        if solution_leaks_into_problem(parsed.problem, parsed.solution_code):
+                            skip_reasons["solution_leaks_into_problem"] = (
+                                skip_reasons.get("solution_leaks_into_problem", 0) + 1
+                            )
+                            self._emit_progress(label, "skip", "solution_leaks_into_problem")
+                            continue
 
                     # Syntactic: test must reference task_module
                     if not references_task_module(parsed.test_code):
@@ -613,7 +621,7 @@ class CodeInstructPipeline:
         )
         try:
             resp = complete(
-                self.input.llm,
+                self._llm,
                 system=PROMPT_SYSTEM_AWS if self.options.aws_mode else PROMPT_SYSTEM,
                 user=user,
                 max_tokens=self.options.max_llm_tokens,
@@ -628,6 +636,7 @@ class CodeInstructPipeline:
     # ----- sandbox -----------------------------------------------------------
 
     def _start_sandbox(self):
+        assert self.bootstrap is not None
         from repo2rlenv.bootstrap.docker import DockerSandbox
 
         marker = Path(tempfile.mkdtemp(prefix="r2e-code-instruct-"))
@@ -785,6 +794,7 @@ class CodeInstructPipeline:
         test_filename: str,
         expected_names: list[str],
     ) -> HarborTask:
+        assert self.bootstrap is not None
         owner, name = self.input.repo.owner_name
         h = hashlib.sha256()
         h.update(seed.relative_path.encode())
@@ -832,7 +842,7 @@ class CodeInstructPipeline:
             ),
             "source_access": self.input.repo.access,
             "built_at": datetime.now(UTC).isoformat(),
-            "synthesis_llm": self.input.llm.qualified_name,
+            "synthesis_llm": self._llm.qualified_name,
             "reward_kinds": ["test_execution"],
             "code_instruct": {
                 "seed_path": seed.relative_path,

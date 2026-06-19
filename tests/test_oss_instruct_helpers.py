@@ -17,6 +17,8 @@ from repo2rlenv.pipelines._oss_instruct import (
     parse_task_response,
     references_task_module,
     sample_seed,
+    solution_leaks_into_problem,
+    substantive_solution_lines,
 )
 
 # ---------------------------------------------------------------------------
@@ -141,6 +143,86 @@ def test_benchmark_overlap_does_not_flag_numpy_pandas_idioms():
     pandas_solution = "import pandas as pd\n\ndef to_frame(rows):\n    return pd.DataFrame(rows)\n"
     assert not has_benchmark_overlap(numpy_solution)
     assert not has_benchmark_overlap(pandas_solution)
+
+
+# ---------------------------------------------------------------------------
+# substantive_solution_lines + solution_leaks_into_problem
+# ---------------------------------------------------------------------------
+
+
+_LEAKY_SOLUTION = (
+    "def luhn_checksum(number):\n"
+    "    digits = [int(d) for d in str(number)]\n"
+    "    odd_digits = digits[-1::-2]\n"
+    "    even_digits = digits[-2::-2]\n"
+    "    checksum = sum(odd_digits)\n"
+    "    for d in even_digits:\n"
+    "        checksum += sum(divmod(d * 2, 10))\n"
+    "    return checksum % 10\n"
+)
+
+
+def test_substantive_lines_excludes_signature_and_imports():
+    code = "import os\n\ndef f(x):\n    y = x + 1\n    return y\n"
+    lines = substantive_solution_lines(code)
+    assert "y = x + 1" in lines
+    assert all(not ln.startswith("def ") for ln in lines)
+    assert all(not ln.startswith("import ") for ln in lines)
+
+
+def test_substantive_lines_excludes_docstrings_and_trivial_lines():
+    code = 'def f(x):\n    """Add one."""\n    pass\n    return x + 100\n'
+    lines = substantive_solution_lines(code)
+    assert "return x + 100" in lines
+    assert "pass" not in lines
+    assert all("Add one" not in ln for ln in lines)
+
+
+def test_substantive_lines_empty_on_syntax_error():
+    assert substantive_solution_lines("def broken(:::") == []
+
+
+def test_leak_detected_when_solution_body_copied_into_problem():
+    problem = (
+        "Implement luhn_checksum(number). For reference, the algorithm is:\n"
+        "digits = [int(d) for d in str(number)]\n"
+        "odd_digits = digits[-1::-2]\n"
+        "even_digits = digits[-2::-2]\n"
+        "checksum = sum(odd_digits)\n"
+    )
+    assert solution_leaks_into_problem(problem, _LEAKY_SOLUTION)
+
+
+def test_no_leak_for_clean_problem_with_only_examples():
+    problem = (
+        "Implement luhn_checksum(number) that returns the Luhn checksum mod 10.\n"
+        "Example: luhn_checksum(7992739871) == 3.\n"
+        "Example: luhn_checksum(1234567890) == 3.\n"
+    )
+    assert not solution_leaks_into_problem(problem, _LEAKY_SOLUTION)
+
+
+def test_leak_threshold_two_lines_is_not_enough():
+    """Two leaked lines stay under the default threshold of three."""
+    problem = (
+        "Implement luhn_checksum(number).\n"
+        "digits = [int(d) for d in str(number)]\n"
+        "odd_digits = digits[-1::-2]\n"
+    )
+    assert not solution_leaks_into_problem(problem, _LEAKY_SOLUTION)
+
+
+def test_small_solution_fully_reproduced_is_a_total_leak():
+    """A one-line body echoed in the problem leaks the whole answer even though
+    it can never reach three distinct matches.
+    """
+    solution = "def double(x):\n    return x * 2 + 1\n"
+    problem = "Write double(x). The body is simply: return x * 2 + 1\n"
+    assert solution_leaks_into_problem(problem, solution)
+
+
+def test_no_leak_on_solution_syntax_error():
+    assert not solution_leaks_into_problem("anything", "def broken(:::")
 
 
 # ---------------------------------------------------------------------------

@@ -38,7 +38,7 @@ import subprocess
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from repo2rlenv.auth import resolve_github_token
@@ -265,6 +265,195 @@ non-empty bucket must fail and leave it intact). Use ONLY subcommands from {subs
 
 
 # ---------------------------------------------------------------------------
+# Orchestrator helpers
+# ---------------------------------------------------------------------------
+
+
+class _TaskRejected(Exception):
+    """Raised internally to short-circuit a task build with a logged reason."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _try_emit_task(
+    pipeline: CodeInstructPipeline,
+    options: CodeInstructOptions,
+    spec: CliSpec,
+    cmd_specs: list[CommandSpec],
+    intents: list[TestIntent],
+    out_dir: Path,
+    intent_idx: int | None,
+    label: str,
+    skip_reasons: dict[str, int],
+) -> Path | None:
+    """Attempt to build and emit one task. Returns task_path on success, None on skip."""
+    try:
+        return _build_one_task(
+            pipeline=pipeline,
+            options=options,
+            spec=spec,
+            cmd_specs=cmd_specs,
+            intents=intents,
+            out_dir=out_dir,
+            intent_idx=intent_idx,
+        )
+    except _TaskRejected as exc:
+        skip_reasons[exc.reason] = skip_reasons.get(exc.reason, 0) + 1
+        pipeline._emit_progress(label, "skip", exc.reason)
+        return None
+    except Exception as exc:
+        logger.exception("cli_app: task synthesis failed for %s: %s", label, exc)
+        skip_reasons["synthesis_error"] = skip_reasons.get("synthesis_error", 0) + 1
+        pipeline._emit_progress(label, "skip", f"synthesis_error: {exc}")
+        return None
+
+
+def _run_subset_mode(
+    pipeline: CodeInstructPipeline,
+    options: CodeInstructOptions,
+    spec: CliSpec,
+    subsets: list[str],
+    tests_dir_path: Path,
+    out_dir: Path,
+    owner_name: str,
+    skip_reasons: dict[str, int],
+) -> tuple[int, int]:
+    """Process subset specs. Returns (candidates_seen, emitted)."""
+    candidates_seen = 0
+    emitted = 0
+    by_name = {c.name: c for c in spec.commands}
+
+    for raw in subsets:
+        if emitted >= options.limit:
+            logger.info("cli_app: limit=%d reached", options.limit)
+            break
+        # dedupe while preserving order (a repeated command would bloat the
+        # slug/keywords and double the translation cost)
+        names = list(dict.fromkeys(n.strip() for n in raw.split(",") if n.strip()))
+        missing = [n for n in names if n not in by_name]
+        if missing:
+            logger.warning(
+                "cli_app: subset %r references unknown commands %s (available: %s)",
+                raw,
+                missing,
+                sorted(by_name),
+            )
+        group = [by_name[n] for n in names if n in by_name]
+        candidates_seen += 1
+        slug = "+".join(sorted(c.name for c in group))
+        label = f"{owner_name}:{slug or raw}"
+        if len(group) < 2:
+            skip_reasons["subset_too_small"] = skip_reasons.get("subset_too_small", 0) + 1
+            pipeline._emit_progress(label, "skip", "subset_too_small")
+            continue
+        intents: list[TestIntent] = []
+        for c in group:
+            intents.extend(
+                extract_test_intents(
+                    tests_dir_path,
+                    spec,
+                    command_filter=c.name,
+                    max_intents=options.cli_app_max_intents,
+                )
+            )
+        logger.info(
+            "cli_app: subset %s -> %d intents across %d commands",
+            slug,
+            len(intents),
+            len(group),
+        )
+        if not intents:
+            skip_reasons["no_intents_extracted"] = skip_reasons.get("no_intents_extracted", 0) + 1
+            pipeline._emit_progress(label, "skip", "no_intents_extracted")
+            continue
+        task_path = _try_emit_task(
+            pipeline=pipeline,
+            options=options,
+            spec=spec,
+            cmd_specs=group,
+            intents=intents,
+            out_dir=out_dir,
+            intent_idx=None,
+            label=label,
+            skip_reasons=skip_reasons,
+        )
+        if task_path is not None:
+            emitted += 1
+            logger.info("cli_app: emitted %s", task_path.name)
+            pipeline._emit_progress(task_path.name, "emit")
+
+    return candidates_seen, emitted
+
+
+def _run_per_command_mode(
+    pipeline: CodeInstructPipeline,
+    options: CodeInstructOptions,
+    spec: CliSpec,
+    target_commands: list[CommandSpec],
+    tests_dir_path: Path,
+    out_dir: Path,
+    owner_name: str,
+    skip_reasons: dict[str, int],
+) -> tuple[int, int]:
+    """Process per-command (or per-intent) mode. Returns (candidates_seen, emitted)."""
+    candidates_seen = 0
+    emitted = 0
+
+    for cmd_spec in target_commands:
+        if emitted >= options.limit:
+            logger.info("cli_app: limit=%d reached", options.limit)
+            break
+        intents = extract_test_intents(
+            tests_dir_path,
+            spec,
+            command_filter=cmd_spec.name,
+            max_intents=options.cli_app_max_intents,
+        )
+        logger.info("cli_app: extracted %d intents for command=%s", len(intents), cmd_spec.name)
+        if not intents:
+            candidates_seen += 1
+            skip_reasons["no_intents_extracted"] = skip_reasons.get("no_intents_extracted", 0) + 1
+            pipeline._emit_progress(f"{owner_name}:{cmd_spec.name}", "skip", "no_intents_extracted")
+            continue
+
+        # per-intent: each intent becomes a separate task (shared oracle via cache);
+        # per-command: all intents bundled into one task
+        slices: list[tuple[int | None, list[TestIntent]]] = (
+            [(i, [intent]) for i, intent in enumerate(intents)]
+            if options.cli_app_per_intent
+            else [(None, intents)]
+        )
+        for intent_idx, intent_slice in slices:
+            if emitted >= options.limit:
+                break
+            candidates_seen += 1
+            label = (
+                f"{owner_name}:{cmd_spec.name}#i{intent_idx:02d}"
+                if intent_idx is not None
+                else f"{owner_name}:{cmd_spec.name}"
+            )
+            task_path = _try_emit_task(
+                pipeline=pipeline,
+                options=options,
+                spec=spec,
+                cmd_specs=[cmd_spec],
+                intents=intent_slice,
+                out_dir=out_dir,
+                intent_idx=intent_idx,
+                label=label,
+                skip_reasons=skip_reasons,
+            )
+            if task_path is not None:
+                emitted += 1
+                logger.info("cli_app: emitted %s", task_path.name)
+                pipeline._emit_progress(task_path.name, "emit")
+
+    return candidates_seen, emitted
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
@@ -287,8 +476,6 @@ def run_cli_app_pipeline(
     owner, name = pipeline.input.repo.owner_name
     owner_name = f"{owner}/{name}"
     skip_reasons: dict[str, int] = {}
-    emitted = 0
-    candidates_seen = 0
 
     with tempfile.TemporaryDirectory(prefix="r2e-cli-app-") as tmp:
         clone_dir = Path(tmp) / "repo"
@@ -318,7 +505,6 @@ def run_cli_app_pipeline(
             spec.tests_dir,
         )
 
-        # Filter commands per --pipeline-opt cli_app_command
         target_commands: list[CommandSpec] = (
             [c for c in spec.commands if c.name == options.cli_app_command]
             if options.cli_app_command
@@ -330,144 +516,29 @@ def run_cli_app_pipeline(
                 f"Available: {[c.name for c in spec.commands]}"
             )
 
-        # --- Subset mode: one multi-command task per compatible subset ---
-        # When cli_app_subsets is set we emit subset tasks and return; the
-        # per-command path below is left byte-identical for the default case.
+        tests_dir_path = clone_dir / spec.tests_dir
         if options.cli_app_subsets:
-            tests_dir_path = clone_dir / spec.tests_dir
-            by_name = {c.name: c for c in spec.commands}
-            for raw in options.cli_app_subsets:
-                if emitted >= options.limit:
-                    logger.info("cli_app: limit=%d reached", options.limit)
-                    break
-                # dedupe while preserving order (a repeated command would
-                # bloat the slug/keywords and double the translation cost)
-                names = list(dict.fromkeys(n.strip() for n in raw.split(",") if n.strip()))
-                missing = [n for n in names if n not in by_name]
-                if missing:
-                    logger.warning(
-                        "cli_app: subset %r references unknown commands %s (available: %s)",
-                        raw,
-                        missing,
-                        sorted(by_name),
-                    )
-                group = [by_name[n] for n in names if n in by_name]
-                candidates_seen += 1
-                slug = "+".join(sorted(c.name for c in group))
-                label = f"{owner_name}:{slug or raw}"
-                if len(group) < 2:
-                    skip_reasons["subset_too_small"] = skip_reasons.get("subset_too_small", 0) + 1
-                    pipeline._emit_progress(label, "skip", "subset_too_small")
-                    continue
-                intents: list[TestIntent] = []
-                for c in group:
-                    intents.extend(
-                        extract_test_intents(
-                            tests_dir_path,
-                            spec,
-                            command_filter=c.name,
-                            max_intents=options.cli_app_max_intents,
-                        )
-                    )
-                logger.info(
-                    "cli_app: subset %s -> %d intents across %d commands",
-                    slug,
-                    len(intents),
-                    len(group),
-                )
-                if not intents:
-                    skip_reasons["no_intents_extracted"] = (
-                        skip_reasons.get("no_intents_extracted", 0) + 1
-                    )
-                    pipeline._emit_progress(label, "skip", "no_intents_extracted")
-                    continue
-                try:
-                    task_path = _build_one_task(
-                        pipeline=pipeline,
-                        options=options,
-                        spec=spec,
-                        cmd_specs=group,
-                        intents=intents,
-                        out_dir=out_dir,
-                        intent_idx=None,
-                    )
-                    emitted += 1
-                    logger.info("cli_app: emitted %s", task_path.name)
-                    pipeline._emit_progress(task_path.name, "emit")
-                except _TaskRejected as exc:
-                    skip_reasons[exc.reason] = skip_reasons.get(exc.reason, 0) + 1
-                    pipeline._emit_progress(label, "skip", exc.reason)
-                except Exception as exc:
-                    logger.exception("cli_app: subset task synthesis failed for %s: %s", label, exc)
-                    skip_reasons["synthesis_error"] = skip_reasons.get("synthesis_error", 0) + 1
-                    pipeline._emit_progress(label, "skip", f"synthesis_error: {exc}")
-            return PipelineResult(
-                candidates=candidates_seen,
-                emitted=emitted,
-                skipped=sum(skip_reasons.values()),
+            candidates_seen, emitted = _run_subset_mode(
+                pipeline=pipeline,
+                options=options,
+                spec=spec,
+                subsets=options.cli_app_subsets,
+                tests_dir_path=tests_dir_path,
                 out_dir=out_dir,
+                owner_name=owner_name,
                 skip_reasons=skip_reasons,
             )
-
-        # Emit per_command (default) or per_intent (one task per (cmd, intent))
-        for cmd_spec in target_commands:
-            if emitted >= options.limit:
-                logger.info("cli_app: limit=%d reached", options.limit)
-                break
-            tests_dir_path = clone_dir / spec.tests_dir
-            intents = extract_test_intents(
-                tests_dir_path,
-                spec,
-                command_filter=cmd_spec.name,
-                max_intents=options.cli_app_max_intents,
+        else:
+            candidates_seen, emitted = _run_per_command_mode(
+                pipeline=pipeline,
+                options=options,
+                spec=spec,
+                target_commands=target_commands,
+                tests_dir_path=tests_dir_path,
+                out_dir=out_dir,
+                owner_name=owner_name,
+                skip_reasons=skip_reasons,
             )
-            logger.info("cli_app: extracted %d intents for command=%s", len(intents), cmd_spec.name)
-            if not intents:
-                candidates_seen += 1
-                skip_reasons["no_intents_extracted"] = (
-                    skip_reasons.get("no_intents_extracted", 0) + 1
-                )
-                pipeline._emit_progress(
-                    f"{owner_name}:{cmd_spec.name}", "skip", "no_intents_extracted"
-                )
-                continue
-
-            # Per-intent: each intent becomes a separate task (shared oracle via cache)
-            # Per-command: all intents bundled into one task
-            slices = (
-                [(i, [intent]) for i, intent in enumerate(intents)]
-                if options.cli_app_per_intent
-                else [(None, intents)]
-            )
-            for intent_idx, intent_slice in slices:
-                if emitted >= options.limit:
-                    break
-                candidates_seen += 1
-                label = (
-                    f"{owner_name}:{cmd_spec.name}#i{intent_idx:02d}"
-                    if intent_idx is not None
-                    else f"{owner_name}:{cmd_spec.name}"
-                )
-                try:
-                    task_path = _build_one_task(
-                        pipeline=pipeline,
-                        options=options,
-                        spec=spec,
-                        cmd_specs=[cmd_spec],
-                        intents=intent_slice,
-                        out_dir=out_dir,
-                        intent_idx=intent_idx,
-                    )
-                    emitted += 1
-                    logger.info("cli_app: emitted %s", task_path.name)
-                    pipeline._emit_progress(task_path.name, "emit")
-                except _TaskRejected as exc:
-                    skip_reasons[exc.reason] = skip_reasons.get(exc.reason, 0) + 1
-                    pipeline._emit_progress(label, "skip", exc.reason)
-                except Exception as exc:
-                    logger.exception("cli_app: task synthesis failed for %s: %s", label, exc)
-                    skip_reasons["synthesis_error"] = skip_reasons.get("synthesis_error", 0) + 1
-                    pipeline._emit_progress(label, "skip", f"synthesis_error: {exc}")
 
     return PipelineResult(
         candidates=candidates_seen,
@@ -476,14 +547,6 @@ def run_cli_app_pipeline(
         out_dir=out_dir,
         skip_reasons=skip_reasons,
     )
-
-
-class _TaskRejected(Exception):
-    """Raised internally to short-circuit a task build with a logged reason."""
-
-    def __init__(self, reason: str):
-        super().__init__(reason)
-        self.reason = reason
 
 
 _ORACLE_CACHE: dict[str, str] = {}
@@ -541,6 +604,200 @@ def _build_and_push_task_image(
         logger.info("cli_app: pushing multi-arch image to ECR: %s", image_ref)
         build_and_push_multiarch(context_dir=ctx_path, image_ref=image_ref, platforms=platforms)
     return image_ref
+
+
+def _compute_cliapp_task_id(
+    *,
+    spec: CliSpec,
+    cmd_slug: str,
+    id_slug: str,
+    intent_idx: int | None,
+    intents: list[TestIntent],
+) -> str:
+    """Derive task_id from spec sha + command + prompt version (+ intent_idx)."""
+    h = hashlib.sha256()
+    h.update(spec.spec_sha256.encode())
+    h.update(b"\0")
+    h.update(cmd_slug.encode())
+    h.update(b"\0")
+    h.update(PROMPT_TEMPLATE_VERSION.encode())
+    if intent_idx is not None:
+        h.update(b"\0")
+        h.update(f"i{intent_idx:02d}".encode())
+        if intents:
+            h.update(b"\0")
+            h.update(intents[0].test_name.encode())
+        idx_suffix = f"-i{intent_idx:02d}"
+    else:
+        idx_suffix = ""
+    return f"{spec.name}-cliapp-{id_slug}{idx_suffix}-{h.hexdigest()[:10]}"
+
+
+def _apply_static_gauntlet(test_files: dict[str, str]) -> dict[str, str]:
+    """Gauntlet G1-G2 (cheap, no Docker). Returns survivors; raises if none survive."""
+    survivors: dict[str, str] = {}
+    for fname, code in test_files.items():
+        ok, reason = _gauntlet_static(code)
+        if ok:
+            survivors[fname] = code
+        else:
+            logger.info("gauntlet reject %s: %s", fname, reason)
+    if not survivors:
+        raise _TaskRejected("all_tests_failed_static_gauntlet")
+    return survivors
+
+
+def _apply_reference_grounding(
+    *,
+    options: CodeInstructOptions,
+    dockerfile: str,
+    conftest: str,
+    test_files: dict[str, str],
+    test_script: str,
+    oracle_code: str,
+) -> tuple[dict, dict[str, str]]:
+    """Filter tests via real-aws + oracle reference. Returns (result, filtered_test_files)."""
+    tests_aux = {"tests/conftest.py": conftest, "tests/__init__.py": ""}
+    for fname, code in test_files.items():
+        tests_aux[f"tests/{fname}"] = code
+    reference_grounding = _run_reference_grounding(
+        dockerfile_content=dockerfile,
+        tests_aux=tests_aux,
+        test_script=test_script,
+        oracle_code=oracle_code,
+        timeout_sec=options.cli_app_docker_timeout_sec,
+    )
+    if reference_grounding.get("skipped"):
+        raise _TaskRejected("reference_grounding_unavailable")
+    grounded = reference_grounding["grounded_files"]
+    logger.info(
+        "reference grounding: %d ref-pass & %d oracle-pass -> %d grounded "
+        "(empty-stub passed %d of all)",
+        reference_grounding["n_reference"],
+        reference_grounding["n_oracle"],
+        len(grounded),
+        reference_grounding["n_empty"],
+    )
+    if len(grounded) < options.cli_app_min_grounded_tests:
+        raise _TaskRejected(f"reference_grounding_insufficient_tests_{len(grounded)}")
+    test_files = {f: c for f, c in test_files.items() if f in grounded}
+    return reference_grounding, test_files
+
+
+def _run_g3g4_gauntlet_gate(
+    *,
+    options: CodeInstructOptions,
+    dockerfile: str,
+    aux_files: dict[str, str],
+    test_script: str,
+    oracle_code: str,
+) -> dict:
+    """Gauntlet G3 (empty-stub-fails) + G4 (oracle-passes). Raises on non-discriminative."""
+    gauntlet_g34 = _run_docker_gauntlet_g3g4(
+        dockerfile_content=dockerfile,
+        aux_files=aux_files,
+        test_script=test_script,
+        oracle_code=oracle_code,
+        empty_max=options.cli_app_docker_empty_pass_max,
+        oracle_min=options.cli_app_docker_oracle_pass_min,
+        timeout_sec=options.cli_app_docker_timeout_sec,
+    )
+    if not gauntlet_g34.get("skipped"):
+        if not gauntlet_g34["g3_pass"]:
+            raise _TaskRejected(
+                f"gauntlet_g3_non_discriminative_{gauntlet_g34['g3_empty_pass_rate']:.2f}"
+            )
+        if not gauntlet_g34["g4_pass"]:
+            raise _TaskRejected(
+                f"gauntlet_g4_oracle_failing_{gauntlet_g34['g4_oracle_pass_rate']:.2f}"
+            )
+    return gauntlet_g34
+
+
+def _build_cliapp_repo2env(
+    *,
+    pipeline: CodeInstructPipeline,
+    options: CodeInstructOptions,
+    spec: CliSpec,
+    cmd_slug: str,
+    cmd_names: list[str],
+    is_subset: bool,
+    intents: list[TestIntent],
+    translated: list[str],
+    test_files: dict[str, str],
+    content_hash: str,
+    reference_grounding: dict | None,
+    gauntlet_g34: dict | None,
+    llm_cost_before: float,
+) -> dict:
+    """Assemble the repo2env metadata block for one cli_app task."""
+    repo2env: dict[str, Any] = {
+        "pipeline": "code_instruct",
+        "pipeline_version": "0.6.0-cliapp-v1",
+        "repo": spec.repo,
+        "ref": spec.git_sha,
+        "reference": f"https://github.com/{spec.repo}/tree/{spec.git_sha}/{spec.tests_dir}",
+        "source_access": pipeline.input.repo.access,
+        "built_at": datetime.now(UTC).isoformat(),
+        "synthesis_llm": pipeline._llm.qualified_name,
+        "reward_kinds": ["test_execution"],
+        "content_hash": content_hash,
+        "code_instruct": {
+            "mode": "cli_app",
+            "command_prefix": spec.command_prefix,
+            "command": cmd_slug,
+            "cli_spec_sha256": spec.spec_sha256,
+            "prompt_template_version": PROMPT_TEMPLATE_VERSION,
+            "translation_model": _translation_model_id(pipeline, options),
+            "oracle_model": pipeline._llm.qualified_name,
+            "intents_extracted": len(intents),
+            "tests_translated": len(translated),
+            "tests_in_task": len(test_files),
+            "simulation_backend": "moto",
+            "python_version": "3.11",
+            "entry_point": "submission/main.py",
+            "pinned_deps": list(PINNED_DEPS),
+            "runtime_cpus": 1.0,
+            "runtime_memory_mb": 1024,
+            "runtime_network": "none",
+            "runtime_timeout_sec": 300,
+            "llm_cost_usd": round(pipeline._llm_cost_usd - llm_cost_before, 6),
+            "run_llm_cost_usd": round(pipeline._llm_cost_usd, 6),
+            "llm_cost_method": "litellm_native",
+            "behaviour_tags": sorted({i.behaviour_tag for i in intents}),
+            "behaviour_tag_counts": _count_behaviour_tags(intents),
+        },
+    }
+    if is_subset:
+        repo2env["code_instruct"]["commands"] = sorted(cmd_names)
+        repo2env["code_instruct"]["subset"] = True
+        # count workflow tests that actually shipped (post static gauntlet)
+        repo2env["code_instruct"]["workflow_tests"] = sum(
+            1 for f in test_files if "_workflow_" in f
+        )
+    if reference_grounding is not None and not reference_grounding.get("skipped"):
+        repo2env["code_instruct"]["reference_grounding"] = {
+            "reference": "aws-cli",
+            "awscli_version": PINNED_AWSCLI,
+            "n_reference_pass": reference_grounding["n_reference"],
+            "n_oracle_pass": reference_grounding["n_oracle"],
+            "n_empty_stub_pass": reference_grounding["n_empty"],
+            "tests_shipped": len(test_files),
+            "discriminative": True,
+            "oracle_solves_all_shipped": True,
+        }
+    if gauntlet_g34 is not None and not gauntlet_g34.get("skipped"):
+        repo2env["code_instruct"]["docker_gauntlet"] = {
+            "g3_empty_pass_rate": round(gauntlet_g34["g3_empty_pass_rate"], 4),
+            "g3_empty_passed": gauntlet_g34["g3_empty_passed"],
+            "g3_empty_total": gauntlet_g34["g3_empty_total"],
+            "g4_oracle_pass_rate": round(gauntlet_g34["g4_oracle_pass_rate"], 4),
+            "g4_oracle_passed": gauntlet_g34["g4_oracle_passed"],
+            "g4_oracle_total": gauntlet_g34["g4_oracle_total"],
+            "discriminative": True,
+            "image_tag": gauntlet_g34.get("image_tag", ""),
+        }
+    return repo2env
 
 
 def _build_one_task(
@@ -618,16 +875,7 @@ def _build_one_task(
 
     # ----- Gauntlet G1-G2 (cheap, no Docker) -----
     if not options.cli_app_skip_gauntlet:
-        survivors: dict[str, str] = {}
-        for fname, code in test_files.items():
-            ok, reason = _gauntlet_static(code)
-            if ok:
-                survivors[fname] = code
-            else:
-                logger.info("gauntlet reject %s: %s", fname, reason)
-        if not survivors:
-            raise _TaskRejected("all_tests_failed_static_gauntlet")
-        test_files = survivors
+        test_files = _apply_static_gauntlet(test_files)
 
     # ----- Reference grounding (opt-in): keep ONLY tests that BOTH the real
     # aws CLI AND the synthesised oracle pass, and that the empty stub fails.
@@ -636,30 +884,14 @@ def _build_one_task(
     # never in the shipped task image (anti-cheat).
     reference_grounding = None
     if options.cli_app_reference_grounding:
-        tests_aux = {"tests/conftest.py": conftest, "tests/__init__.py": ""}
-        for fname, code in test_files.items():
-            tests_aux[f"tests/{fname}"] = code
-        reference_grounding = _run_reference_grounding(
-            dockerfile_content=dockerfile,
-            tests_aux=tests_aux,
+        reference_grounding, test_files = _apply_reference_grounding(
+            options=options,
+            dockerfile=dockerfile,
+            conftest=conftest,
+            test_files=test_files,
             test_script=test_script,
             oracle_code=oracle_code,
-            timeout_sec=options.cli_app_docker_timeout_sec,
         )
-        if reference_grounding.get("skipped"):
-            raise _TaskRejected("reference_grounding_unavailable")
-        grounded = reference_grounding["grounded_files"]
-        logger.info(
-            "reference grounding: %d ref-pass & %d oracle-pass -> %d grounded "
-            "(empty-stub passed %d of all)",
-            reference_grounding["n_reference"],
-            reference_grounding["n_oracle"],
-            len(grounded),
-            reference_grounding["n_empty"],
-        )
-        if len(grounded) < options.cli_app_min_grounded_tests:
-            raise _TaskRejected(f"reference_grounding_insufficient_tests_{len(grounded)}")
-        test_files = {f: c for f, c in test_files.items() if f in grounded}
 
     # ----- Assemble aux_files for Harbor (tests/ subdir) -----
     aux_files: dict[str, str] = {
@@ -680,22 +912,13 @@ def _build_one_task(
     _assert_no_test_leakage(instruction_md, test_files)
 
     # ----- task_id derived from spec sha + command + prompt version (+ intent_idx) -----
-    h = hashlib.sha256()
-    h.update(spec.spec_sha256.encode())
-    h.update(b"\0")
-    h.update(cmd_slug.encode())
-    h.update(b"\0")
-    h.update(PROMPT_TEMPLATE_VERSION.encode())
-    if intent_idx is not None:
-        h.update(b"\0")
-        h.update(f"i{intent_idx:02d}".encode())
-        if intents:
-            h.update(b"\0")
-            h.update(intents[0].test_name.encode())
-        idx_suffix = f"-i{intent_idx:02d}"
-    else:
-        idx_suffix = ""
-    task_id = f"{spec.name}-cliapp-{id_slug}{idx_suffix}-{h.hexdigest()[:10]}"
+    task_id = _compute_cliapp_task_id(
+        spec=spec,
+        cmd_slug=cmd_slug,
+        id_slug=id_slug,
+        intent_idx=intent_idx,
+        intents=intents,
+    )
 
     # ----- Pre-compute content_hash covering spec + tests + oracle + instr -----
     # Overrides harbor.py's default which only covers instruction + diff.
@@ -706,7 +929,7 @@ def _build_one_task(
         aux_files=aux_files,
         prompt_version=PROMPT_TEMPLATE_VERSION,
         translation_model=_translation_model_id(pipeline, options),
-        oracle_model=pipeline.input.llm.qualified_name,
+        oracle_model=pipeline._llm.qualified_name,
     )
 
     # ----- Gauntlet G3 (empty-stub-fails) + G4 (oracle-passes) — opt-in -----
@@ -714,92 +937,30 @@ def _build_one_task(
     # Builds image once per Dockerfile (cached), runs pytest twice per task.
     gauntlet_g34 = None
     if not options.cli_app_skip_gauntlet and getattr(options, "cli_app_docker_gauntlet", False):
-        gauntlet_g34 = _run_docker_gauntlet_g3g4(
-            dockerfile_content=dockerfile,
+        gauntlet_g34 = _run_g3g4_gauntlet_gate(
+            options=options,
+            dockerfile=dockerfile,
             aux_files=aux_files,
             test_script=test_script,
             oracle_code=oracle_code,
-            empty_max=options.cli_app_docker_empty_pass_max,
-            oracle_min=options.cli_app_docker_oracle_pass_min,
-            timeout_sec=options.cli_app_docker_timeout_sec,
         )
-        if not gauntlet_g34.get("skipped"):
-            if not gauntlet_g34["g3_pass"]:
-                raise _TaskRejected(
-                    f"gauntlet_g3_non_discriminative_{gauntlet_g34['g3_empty_pass_rate']:.2f}"
-                )
-            if not gauntlet_g34["g4_pass"]:
-                raise _TaskRejected(
-                    f"gauntlet_g4_oracle_failing_{gauntlet_g34['g4_oracle_pass_rate']:.2f}"
-                )
 
     # ----- repo2env metadata -----
-    repo2env = {
-        "pipeline": "code_instruct",
-        "pipeline_version": "0.6.0-cliapp-v1",
-        "repo": spec.repo,
-        "ref": spec.git_sha,
-        "reference": f"https://github.com/{spec.repo}/tree/{spec.git_sha}/{spec.tests_dir}",
-        "source_access": pipeline.input.repo.access,
-        "built_at": datetime.now(UTC).isoformat(),
-        "synthesis_llm": pipeline.input.llm.qualified_name,
-        "reward_kinds": ["test_execution"],
-        "content_hash": content_hash,
-        "code_instruct": {
-            "mode": "cli_app",
-            "command_prefix": spec.command_prefix,
-            "command": cmd_slug,
-            "cli_spec_sha256": spec.spec_sha256,
-            "prompt_template_version": PROMPT_TEMPLATE_VERSION,
-            "translation_model": _translation_model_id(pipeline, options),
-            "oracle_model": pipeline.input.llm.qualified_name,
-            "intents_extracted": len(intents),
-            "tests_translated": len(translated),
-            "tests_in_task": len(test_files),
-            "simulation_backend": "moto",
-            "python_version": "3.11",
-            "entry_point": "submission/main.py",
-            "pinned_deps": list(PINNED_DEPS),
-            "runtime_cpus": 1.0,
-            "runtime_memory_mb": 1024,
-            "runtime_network": "none",
-            "runtime_timeout_sec": 300,
-            "llm_cost_usd": round(pipeline._llm_cost_usd - _llm_cost_before, 6),
-            "run_llm_cost_usd": round(pipeline._llm_cost_usd, 6),
-            "llm_cost_method": "litellm_native",
-            "behaviour_tags": sorted({i.behaviour_tag for i in intents}),
-            "behaviour_tag_counts": _count_behaviour_tags(intents),
-        },
-    }
-    if is_subset:
-        repo2env["code_instruct"]["commands"] = sorted(cmd_names)
-        repo2env["code_instruct"]["subset"] = True
-        # count workflow tests that actually shipped (post static gauntlet)
-        repo2env["code_instruct"]["workflow_tests"] = sum(
-            1 for f in test_files if "_workflow_" in f
-        )
-    if reference_grounding is not None and not reference_grounding.get("skipped"):
-        repo2env["code_instruct"]["reference_grounding"] = {
-            "reference": "aws-cli",
-            "awscli_version": PINNED_AWSCLI,
-            "n_reference_pass": reference_grounding["n_reference"],
-            "n_oracle_pass": reference_grounding["n_oracle"],
-            "n_empty_stub_pass": reference_grounding["n_empty"],
-            "tests_shipped": len(test_files),
-            "discriminative": True,
-            "oracle_solves_all_shipped": True,
-        }
-    if gauntlet_g34 is not None and not gauntlet_g34.get("skipped"):
-        repo2env["code_instruct"]["docker_gauntlet"] = {
-            "g3_empty_pass_rate": round(gauntlet_g34["g3_empty_pass_rate"], 4),
-            "g3_empty_passed": gauntlet_g34["g3_empty_passed"],
-            "g3_empty_total": gauntlet_g34["g3_empty_total"],
-            "g4_oracle_pass_rate": round(gauntlet_g34["g4_oracle_pass_rate"], 4),
-            "g4_oracle_passed": gauntlet_g34["g4_oracle_passed"],
-            "g4_oracle_total": gauntlet_g34["g4_oracle_total"],
-            "discriminative": True,
-            "image_tag": gauntlet_g34.get("image_tag", ""),
-        }
+    repo2env = _build_cliapp_repo2env(
+        pipeline=pipeline,
+        options=options,
+        spec=spec,
+        cmd_slug=cmd_slug,
+        cmd_names=cmd_names,
+        is_subset=is_subset,
+        intents=intents,
+        translated=translated,
+        test_files=test_files,
+        content_hash=content_hash,
+        reference_grounding=reference_grounding,
+        gauntlet_g34=gauntlet_g34,
+        llm_cost_before=_llm_cost_before,
+    )
 
     _task_ecr_ref: str | None = None
     if options.cli_app_ecr_push and _ecr_registry is not None:
@@ -872,7 +1033,7 @@ def _translate_intent(
     )
     try:
         resp = complete(
-            pipeline.input.llm,
+            pipeline._llm,
             system=TRANSLATION_SYSTEM,
             user=user,
             max_tokens=options.max_llm_tokens,
@@ -918,7 +1079,7 @@ def _synthesise_oracle(
     cmd_label = "+".join(c.name for c in cmd_specs)
     try:
         resp = complete(
-            pipeline.input.llm,
+            pipeline._llm,
             system=system,
             user=user,
             max_tokens=options.max_llm_tokens,
@@ -984,7 +1145,7 @@ def _synthesise_workflow_tests(
     )
     try:
         resp = complete(
-            pipeline.input.llm,
+            pipeline._llm,
             system=WORKFLOW_SYSTEM,
             user=user,
             max_tokens=options.max_llm_tokens,
@@ -1867,7 +2028,7 @@ def _strip_code_fence(text: str) -> str:
 def _translation_model_id(pipeline: CodeInstructPipeline, options: CodeInstructOptions) -> str:
     if options.cli_app_translation_model:
         return options.cli_app_translation_model
-    return pipeline.input.llm.qualified_name
+    return pipeline._llm.qualified_name
 
 
 def _resolve_git_sha(clone_dir: Path) -> str:

@@ -149,6 +149,93 @@ def has_benchmark_overlap(text: str, phrases: tuple[str, ...] = DEFAULT_BENCHMAR
     return any(p.lower() in lower for p in phrases)
 
 
+def _normalize_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip()
+
+
+_TRIVIAL_SOLUTION_LINES = frozenset(
+    {"pass", "return", "...", "else:", "try:", "finally:", "break", "continue", "raise"}
+)
+_MIN_LEAK_LINE_LEN = 8
+
+
+def substantive_solution_lines(solution_code: str) -> list[str]:
+    """Whitespace-normalized implementation-body lines from the oracle solution.
+
+    Excludes signatures, imports, comments, docstrings, blanks, and trivial
+    one-keyword lines. What remains is the implementation body — the part that,
+    if reproduced in the problem statement, hands the agent the answer. AST is
+    used only to locate docstring line ranges. Returns [] on syntax errors.
+    """
+    import ast
+
+    try:
+        tree = ast.parse(solution_code)
+    except SyntaxError:
+        return []
+
+    docstring_lines: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(
+            node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ) and ast.get_docstring(node, clean=False):
+            first = node.body[0]
+            start = getattr(first, "lineno", None)
+            end = getattr(first, "end_lineno", start)
+            if start is not None:
+                docstring_lines.update(range(start, (end or start) + 1))
+
+    out: list[str] = []
+    for lineno, raw in enumerate(solution_code.splitlines(), start=1):
+        if lineno in docstring_lines:
+            continue
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if _COMMENT_OR_IMPORT_RE.match(stripped):
+            continue
+        if stripped.startswith(("def ", "class ", "async def ")):
+            continue
+        if stripped in _TRIVIAL_SOLUTION_LINES:
+            continue
+        norm = _normalize_ws(stripped)
+        if len(norm) < _MIN_LEAK_LINE_LEN:
+            continue
+        out.append(norm)
+    return out
+
+
+def solution_leaks_into_problem(
+    problem: str, solution_code: str, *, min_leaked_lines: int = 3
+) -> bool:
+    """True if the oracle implementation bleeds into the agent-visible problem.
+
+    The problem statement is the ONLY artifact the solving agent sees at solve
+    time (Harbor withholds the test and oracle until the post-agent verifier),
+    so solution->problem is the one real contamination vector here. Counts the
+    distinct substantive solution lines that appear verbatim in the problem;
+    `>= min_leaked_lines` flags a leak. Returns False on solution syntax errors.
+    """
+    lines = substantive_solution_lines(solution_code)
+    if not lines:
+        return False
+
+    problem_norm = _normalize_ws(problem).lower()
+    seen: set[str] = set()
+    for line in lines:
+        key = line.lower()
+        if key in seen:
+            continue
+        if key in problem_norm:
+            seen.add(key)
+            if len(seen) >= min_leaked_lines:
+                return True
+
+    # A 1-2 line solution fully reproduced in the problem is a total leak even
+    # though it cannot reach min_leaked_lines distinct matches.
+    return len(lines) <= 2 and len(seen) == len(lines)
+
+
 # ---------------------------------------------------------------------------
 # Prompting + parsing
 # ---------------------------------------------------------------------------
@@ -159,7 +246,7 @@ PROMPT_SYSTEM = """You are a senior Python engineer. You will be given a code sn
 Produce three sections — exactly in this order, exactly with these section headers:
 
 [Problem Description]
-A clear, self-contained problem statement. Describe the function to implement and its expected behavior. Include 1-2 examples. Avoid any specific library or framework references. Treat the reader as someone who has not seen the snippet. Keep it under 200 words.
+A clear, self-contained problem statement. Describe the function to implement and its expected behavior. Include 1-2 input/output examples. Avoid any specific library or framework references. Treat the reader as someone who has not seen the snippet. Keep it under 200 words. Do NOT include the implementation, the solution source, or copies of any line from the [Solution] section — the reader must write the code themselves.
 
 [Test]
 A pytest test file. It MUST import from the module `task_module` (literal name, do not change it). Write 2-4 assertions covering normal cases AND edge cases. Use plain `def test_...(): assert ...` — no fixtures.
@@ -184,7 +271,7 @@ Runtime guarantees provided by the sandbox (do NOT restate them in your output):
 Produce three sections — exactly in this order, exactly with these section headers:
 
 [Problem Description]
-A clear, self-contained problem statement. Describe a function or CLI workflow that operates on AWS resources (S3 buckets/objects, DynamoDB tables, etc.). Include 1-2 worked examples. Keep it under 200 words.
+A clear, self-contained problem statement. Describe a function or CLI workflow that operates on AWS resources (S3 buckets/objects, DynamoDB tables, etc.). Include 1-2 worked examples. Keep it under 200 words. Do NOT include the implementation, the solution source, or copies of any line from the [Solution] section — the reader must write the code themselves.
 
 [Test]
 A pytest test file. It MUST import from the module `task_module` (literal name). Write 2-4 assertions covering normal cases AND edge cases. Use plain `def test_...(): assert ...` — no fixtures. The test SHOULD set up any required AWS state (e.g., `boto3.client('s3').create_bucket(Bucket=...)`) before invoking the function under test. Use only the env-provided endpoint routing — do NOT pass `endpoint_url=` explicitly. For S3 buckets in us-east-1, do NOT pass `CreateBucketConfiguration` (real S3 rejects LocationConstraint for us-east-1; moto matches that behavior).

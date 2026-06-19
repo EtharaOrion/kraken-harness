@@ -33,6 +33,18 @@ _INDEX_LINE_RE = re.compile(r"^index ")
 _DIFF_GIT_RE = re.compile(r"^diff --git ")
 
 
+def _clamp_unit(value: float) -> float:
+    """Clamp a reward/rate into [0.0, 1.0]; non-finite collapses to 0.0.
+
+    Out-of-range or non-finite rewards silently poison RL training, so every
+    reward path clamps defensively even though the arithmetic is bounded by
+    construction. Keeps the [0, 1] contract local and refactor-proof.
+    """
+    if value != value:  # NaN: the only value unequal to itself
+        return 0.0
+    return max(0.0, min(1.0, value))
+
+
 @dataclass(slots=True)
 class DiffRewardMetadata:
     similarity: float
@@ -83,7 +95,7 @@ def calculate_diff_similarity_reward(
         )
 
     matcher = difflib.SequenceMatcher(a=oracle_lines, b=pred_lines, autojunk=False)
-    ratio = matcher.ratio()
+    ratio = _clamp_unit(matcher.ratio())
     matched = sum(triple.size for triple in matcher.get_matching_blocks())
 
     return ratio, DiffRewardMetadata(
@@ -114,12 +126,12 @@ class ExecutionReport:
     @property
     def f2p_rate(self) -> float:
         total = len(self.fail_to_pass_success) + len(self.fail_to_pass_failure)
-        return 1.0 if total == 0 else len(self.fail_to_pass_success) / total
+        return 1.0 if total == 0 else _clamp_unit(len(self.fail_to_pass_success) / total)
 
     @property
     def p2p_rate(self) -> float:
         total = len(self.pass_to_pass_success) + len(self.pass_to_pass_failure)
-        return 1.0 if total == 0 else len(self.pass_to_pass_success) / total
+        return 1.0 if total == 0 else _clamp_unit(len(self.pass_to_pass_success) / total)
 
     @property
     def resolution_status(self) -> str:
@@ -146,10 +158,12 @@ def grade_test_execution(
 
     Tests not present in `test_status` count as failures (silent skip).
     """
-    f2p_success, f2p_failure = [], []
+    f2p_success: list[str] = []
+    f2p_failure: list[str] = []
     for t in fail_to_pass:
         (f2p_success if test_status.get(t) == "PASSED" else f2p_failure).append(t)
-    p2p_success, p2p_failure = [], []
+    p2p_success: list[str] = []
+    p2p_failure: list[str] = []
     for t in pass_to_pass:
         (p2p_success if test_status.get(t) == "PASSED" else p2p_failure).append(t)
     return ExecutionReport(

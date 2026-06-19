@@ -66,6 +66,18 @@ FAILED = "FAILED"
 SKIPPED = "SKIPPED"
 ERROR = "ERROR"
 
+
+def _clamp_unit(value: float) -> float:
+    """Clamp a reward/rate into [0.0, 1.0]; non-finite collapses to 0.0.
+
+    An out-of-range reward written to reward.txt silently poisons training,
+    so we clamp every rate at source even though the arithmetic is bounded.
+    """
+    if value != value:  # NaN: the only value unequal to itself
+        return 0.0
+    return max(0.0, min(1.0, value))
+
+
 # ---------------------------------------------------------------------------
 # Per-runner log parsers (condensed ports of repo2rlenv.log_parsers.*)
 # ---------------------------------------------------------------------------
@@ -271,8 +283,8 @@ def grade(
         t for t, s in status_map.items() if s == FAILED and t not in f2p_set and t not in p2p_set
     )
 
-    f2p_rate = (f2p_passed / f2p_total) if f2p_total else 0.0
-    p2p_rate = (p2p_passed / p2p_total) if p2p_total else 1.0
+    f2p_rate = _clamp_unit(f2p_passed / f2p_total) if f2p_total else 0.0
+    p2p_rate = _clamp_unit(p2p_passed / p2p_total) if p2p_total else 1.0
     reward = f2p_rate * p2p_rate
     resolved = f2p_total > 0 and f2p_passed == f2p_total and p2p_passed == p2p_total
 

@@ -44,7 +44,7 @@ from uuid import uuid4
 
 from repo2rlenv.auth import resolve_github_token
 from repo2rlenv.bootstrap.runner import _shallow_clone_at_ref
-from repo2rlenv.bootstrap.spec import BootstrapResult
+from repo2rlenv.bootstrap.spec import BootstrapResult, LanguageHint
 from repo2rlenv.emitter.harbor import HarborTask, write_harbor_task
 from repo2rlenv.git_local import CommitInfo, GitError, list_commits, show_diff
 from repo2rlenv.github import fetch_issue
@@ -159,6 +159,7 @@ class CommitRuntimePipeline:
 
     name: ClassVar[PipelineName] = PipelineName.COMMIT_RUNTIME
     requires_bootstrap: ClassVar[bool] = True
+    supported_languages: ClassVar[frozenset[LanguageHint] | None] = None
     experimental: ClassVar[bool] = True
 
     def __init__(

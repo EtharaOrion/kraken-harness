@@ -43,10 +43,11 @@ import logging
 import re
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 from uuid import uuid4
 
 from repo2rlenv.auth import resolve_github_token
+from repo2rlenv.bootstrap.spec import LanguageHint
 from repo2rlenv.emitter.harbor import HarborTask, write_harbor_task
 from repo2rlenv.github import (
     GitHubError,
@@ -425,6 +426,7 @@ class PRDiffPipeline:
 
     name: ClassVar[PipelineName] = PipelineName.PR_DIFF
     requires_bootstrap: ClassVar[bool] = False
+    supported_languages: ClassVar[frozenset[LanguageHint] | None] = None
     experimental: ClassVar[bool] = False  # stable
 
     def __init__(self, input: GenerationInput, options: PRDiffOptions, bootstrap=None):
@@ -534,7 +536,7 @@ class PRDiffPipeline:
         owner, name = self.input.repo.owner_name
         task_id = f"{owner}__{name}-{pr.number}"
 
-        repo2env = {
+        repo2env: dict[str, Any] = {
             "pipeline": "pr_diff",
             "pipeline_version": "0.3.0",
             "repo": f"{owner}/{name}",

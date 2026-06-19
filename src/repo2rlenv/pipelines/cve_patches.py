@@ -46,7 +46,7 @@ from typing import ClassVar
 from uuid import uuid4
 
 from repo2rlenv.auth import resolve_github_token
-from repo2rlenv.bootstrap.spec import BootstrapResult
+from repo2rlenv.bootstrap.spec import BootstrapResult, LanguageHint
 from repo2rlenv.emitter.harbor import HarborTask, write_harbor_task
 from repo2rlenv.github import (
     GitHubError,
@@ -93,6 +93,7 @@ class CVEPatchesPipeline:
 
     name: ClassVar[PipelineName] = PipelineName.CVE_PATCHES
     requires_bootstrap: ClassVar[bool] = True
+    supported_languages: ClassVar[frozenset[LanguageHint] | None] = None
     experimental: ClassVar[bool] = True
 
     def __init__(

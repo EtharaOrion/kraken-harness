@@ -260,6 +260,7 @@ class MutationBugsPipeline:
             )
         if input.llm is None:
             raise ValueError("mutation_bugs requires --llm (provider/model)")
+        self._llm = input.llm
         self.input = input
         self.options = options
         self.bootstrap = bootstrap
@@ -607,7 +608,7 @@ class MutationBugsPipeline:
         )
         try:
             resp = complete(
-                self.input.llm,
+                self._llm,
                 system=_ISSUE_SYSTEM_PROMPT,
                 user=user_prompt,
                 max_tokens=self.options.max_llm_tokens,
@@ -670,7 +671,7 @@ class MutationBugsPipeline:
             "reference": f"https://github.com/{owner}/{name}/blob/{self.input.repo.ref}/{file_path}",
             "source_access": self.input.repo.access,
             "built_at": datetime.now(UTC).isoformat(),
-            "synthesis_llm": self.input.llm.qualified_name,
+            "synthesis_llm": self._llm.qualified_name,
             "reward_kinds": ["test_execution", "diff_similarity"],
             "mutation_bugs": {
                 "file_path": file_path,

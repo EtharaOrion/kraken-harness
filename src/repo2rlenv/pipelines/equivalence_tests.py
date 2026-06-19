@@ -240,6 +240,7 @@ class EquivalenceTestsPipeline:
             )
         if input.llm is None:
             raise ValueError("equivalence_tests requires --llm (provider/model)")
+        self._llm = input.llm
         self.input = input
         self.options = options
         self.bootstrap = bootstrap
@@ -372,7 +373,7 @@ class EquivalenceTestsPipeline:
         )
         try:
             resp = complete(
-                self.input.llm,
+                self._llm,
                 system=PROMPT_SYSTEM.format(name=cand.name),
                 user=user,
                 max_tokens=self.options.max_llm_tokens,
@@ -518,7 +519,7 @@ class EquivalenceTestsPipeline:
             ),
             "source_access": self.input.repo.access,
             "built_at": datetime.now(UTC).isoformat(),
-            "synthesis_llm": self.input.llm.qualified_name,
+            "synthesis_llm": self._llm.qualified_name,
             "reward_kinds": ["test_execution"],
             "equivalence_tests": {
                 "function_name": cand.name,

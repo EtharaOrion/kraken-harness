@@ -1,0 +1,384 @@
+# findings.yaml — CRUCIBLE Phase 2 audit findings
+# Generated against evidence.yaml from audit run at 2026-06-19T01:15:38Z
+# Git SHA: 621f611fa105bd470b3e5ab5b16f8734443657d5 (dirty tree)
+# Overall disposition: BLOCK (CRITICAL secret exposure in git history)
+
+- id: SEC-001
+  title: "GitHub Personal Access Token exposed in git history"
+  severity: CRITICAL
+  category: security
+  tool: gitleaks
+  rule_id: github-pat
+  description: >-
+    A GitHub Personal Access Token was detected in .env.bak, committed to git
+    history. gitleaks --log-opts=--all found this in the full history scan.
+    Secret exposure is a CRITICAL-floor item and cannot be waived to SHIP.
+    The token may grant unauthorized repository access and must be rotated
+    immediately. The .env.bak file must be purged from history via
+    git-filter-repo or BFG.
+  evidence: "gitleaks/github-pat at .env.bak (cluster_fingerprint: 178bef5355db8b41)"
+  recommendation: >-
+    1. Rotate the GitHub PAT immediately.
+    2. Remove .env.bak from git history using git-filter-repo.
+    3. Force-push the cleaned history.
+    4. Audit all actions taken with the token.
+  disposition: BLOCK
+  affected_files:
+    - ".env.bak"
+  issue_count: 1
+  source_tools:
+    - gitleaks
+
+- id: SEC-002
+  title: "Generic API key exposed in git history"
+  severity: CRITICAL
+  category: security
+  tool: gitleaks
+  rule_id: generic-api-key
+  description: >-
+    A generic API key was detected in .env.bak, committed to git history.
+    This could expose access to various services. Secret exposure is a
+    CRITICAL-floor item and cannot be waived to SHIP. The key must be
+    rotated and the file purged from history.
+  evidence: "gitleaks/generic-api-key at .env.bak (cluster_fingerprint: d4d20b0f37cfb58e)"
+  recommendation: >-
+    1. Identify which service the API key belongs to and rotate it.
+    2. Remove .env.bak from git history using git-filter-repo.
+    3. Ensure .env.bak is in .gitignore.
+  disposition: BLOCK
+  affected_files:
+    - ".env.bak"
+  issue_count: 1
+  source_tools:
+    - gitleaks
+
+- id: DEP-001
+  title: "torch 2.6.0 vulnerable to CVE-2025-3000"
+  severity: HIGH
+  category: dependency
+  tool: pip_audit
+  rule_id: vulnerable-dependency
+  description: >-
+    pip-audit reports torch 2.6.0 is affected by CVE-2025-3000, a critical
+    vulnerability in torch.jit.script. While torch is not a direct dependency
+    of repo2rlenv (it is a transitive dep via other packages), the
+    vulnerability affects the function torch.jit.script which could be
+    invoked indirectly.
+  evidence: "pip_audit/vulnerable-dependency for package torch (cluster_fingerprint: 43fd3b952b430936, vuln_id: CVE-2025-3000)"
+  recommendation: >-
+    Pin torch >= patched version in dependency constraints or add to
+    constraint-deps in pyproject.toml. If torch is not needed, exclude it.
+  disposition: HOLD
+  affected_files: []
+  issue_count: 1
+  source_tools:
+    - pip_audit
+
+- id: QUA-001
+  title: "mypy union-attr: attribute access on optional types"
+  severity: MEDIUM
+  category: quality
+  tool: mypy
+  rule_id: union-attr
+  description: >-
+    12 instances of accessing attributes on types that include None without
+    proper narrowing. Primarily in pipeline code accessing BootstrapResult
+    and LLMSpec optional fields. Runtime NoneType AttributeError risk.
+  evidence: "mypy/union-attr across 4 pipeline files"
+  recommendation: >-
+    Add explicit None checks or assert statements before accessing optional
+    attributes. Consider using early-return guard patterns.
+  disposition: HOLD
+  affected_files:
+    - src/repo2rlenv/pipelines/_cli_app_synthesis.py
+    - src/repo2rlenv/pipelines/code_instruct.py
+    - src/repo2rlenv/pipelines/equivalence_tests.py
+    - src/repo2rlenv/pipelines/mutation_bugs.py
+  issue_count: 12
+  source_tools:
+    - mypy
+
+- id: QUA-002
+  title: "mypy assignment: incompatible types in assignment"
+  severity: MEDIUM
+  category: quality
+  tool: mypy
+  rule_id: assignment
+  description: >-
+    7 instances of assigning values with incompatible types, e.g. str | None
+    to str variables. Spread across pipeline, UI, and registry code.
+  evidence: "mypy/assignment across 5 source files"
+  recommendation: >-
+    Narrow types before assignment or widen variable type annotations.
+  disposition: HOLD
+  affected_files:
+    - src/repo2rlenv/pipelines/_cli_app_synthesis.py
+    - src/repo2rlenv/pipelines/_mutation_operators.py
+    - src/repo2rlenv/registry/push.py
+    - src/repo2rlenv/ui/views/bootstrap.py
+    - src/repo2rlenv/ui/views/generation.py
+  issue_count: 7
+  source_tools:
+    - mypy
+
+- id: QUA-003
+  title: "mypy dict-item: incompatible dict entry types"
+  severity: MEDIUM
+  category: quality
+  tool: mypy
+  rule_id: dict-item
+  description: >-
+    6 instances of dict entries with incompatible types, primarily in
+    pipeline registry and PR diff pipeline configuration.
+  evidence: "mypy/dict-item in pipelines/__init__.py and pipelines/pr_diff.py"
+  recommendation: >-
+    Use TypedDict or explicit type annotations for dict construction.
+  disposition: HOLD
+  affected_files:
+    - src/repo2rlenv/pipelines/__init__.py
+    - src/repo2rlenv/pipelines/pr_diff.py
+  issue_count: 6
+  source_tools:
+    - mypy
+
+- id: QUA-004
+  title: "mypy arg-type: incompatible argument types"
+  severity: MEDIUM
+  category: quality
+  tool: mypy
+  rule_id: arg-type
+  description: >-
+    6 instances of passing arguments with incompatible types to functions,
+    primarily LLMSpec | None passed where LLMSpec is expected.
+  evidence: "mypy/arg-type across 4 pipeline files"
+  recommendation: >-
+    Add None guards before function calls or make parameters accept Optional.
+  disposition: HOLD
+  affected_files:
+    - src/repo2rlenv/pipelines/_cli_app_synthesis.py
+    - src/repo2rlenv/pipelines/code_instruct.py
+    - src/repo2rlenv/pipelines/equivalence_tests.py
+    - src/repo2rlenv/pipelines/mutation_bugs.py
+  issue_count: 6
+  source_tools:
+    - mypy
+
+- id: QUA-005
+  title: "mypy index: unsupported indexed assignment targets"
+  severity: MEDIUM
+  category: quality
+  tool: mypy
+  rule_id: index
+  description: >-
+    5 instances of indexed assignment on dicts with incompatible key/value
+    types in _cli_app_synthesis.py.
+  evidence: "mypy/index in pipelines/_cli_app_synthesis.py"
+  recommendation: >-
+    Use properly typed dicts or cast with type narrowing.
+  disposition: HOLD
+  affected_files:
+    - src/repo2rlenv/pipelines/_cli_app_synthesis.py
+  issue_count: 5
+  source_tools:
+    - mypy
+
+- id: QUA-006
+  title: "mypy call-overload: no matching overload variant"
+  severity: MEDIUM
+  category: quality
+  tool: mypy
+  rule_id: call-overload
+  description: >-
+    5 instances of list.__setitem__ called with incompatible argument types
+    in _cli_app_synthesis.py.
+  evidence: "mypy/call-overload in pipelines/_cli_app_synthesis.py"
+  recommendation: >-
+    Ensure argument types match the overloaded function signatures.
+  disposition: HOLD
+  affected_files:
+    - src/repo2rlenv/pipelines/_cli_app_synthesis.py
+  issue_count: 5
+  source_tools:
+    - mypy
+
+- id: QUA-007
+  title: "mypy var-annotated: missing type annotations"
+  severity: MEDIUM
+  category: quality
+  tool: mypy
+  rule_id: var-annotated
+  description: >-
+    4 instances in reward.py where variables need explicit type annotations.
+  evidence: "mypy/var-annotated in reward.py"
+  recommendation: >-
+    Add type annotations: e.g. f2p_success: list[str] = ...
+  disposition: HOLD
+  affected_files:
+    - src/repo2rlenv/reward.py
+  issue_count: 4
+  source_tools:
+    - mypy
+
+- id: QUA-008
+  title: "mypy operator: unsupported operand types"
+  severity: MEDIUM
+  category: quality
+  tool: mypy
+  rule_id: operator
+  description: >-
+    1 instance of float * None unsupported operand in _pr_diff_verifier.py.
+    Runtime TypeError risk when verifier weight is None.
+  evidence: "mypy/operator in pipelines/_pr_diff_verifier.py"
+  recommendation: >-
+    Add None check before arithmetic operation on optional weight.
+  disposition: HOLD
+  affected_files:
+    - src/repo2rlenv/pipelines/_pr_diff_verifier.py
+  issue_count: 1
+  source_tools:
+    - mypy
+
+- id: QUA-009
+  title: "mypy misc: generator yields incompatible type"
+  severity: MEDIUM
+  category: quality
+  tool: mypy
+  rule_id: misc
+  description: >-
+    1 instance of a generator yielding float where bool is expected
+    in _pr_diff_verifier.py.
+  evidence: "mypy/misc in pipelines/_pr_diff_verifier.py"
+  recommendation: >-
+    Fix generator return type or adjust expected type.
+  disposition: HOLD
+  affected_files:
+    - src/repo2rlenv/pipelines/_pr_diff_verifier.py
+  issue_count: 1
+  source_tools:
+    - mypy
+
+- id: QUA-010
+  title: "mypy return-value: incompatible return value type"
+  severity: MEDIUM
+  category: quality
+  tool: mypy
+  rule_id: return-value
+  description: >-
+    1 instance of returning tuple[str, str | None] where tuple[str, str]
+    is expected in registry/integration.py.
+  evidence: "mypy/return-value in registry/integration.py"
+  recommendation: >-
+    Narrow the optional value before returning or widen the return type.
+  disposition: HOLD
+  affected_files:
+    - src/repo2rlenv/registry/integration.py
+  issue_count: 1
+  source_tools:
+    - mypy
+
+- id: QUA-011
+  title: "mypy no-redef: name already defined by import"
+  severity: MEDIUM
+  category: quality
+  tool: mypy
+  rule_id: no-redef
+  description: >-
+    1 instance of tomllib name redefined in config.py (conditional import
+    for Python 3.11+ compatibility).
+  evidence: "mypy/no-redef in config.py"
+  recommendation: >-
+    Use if TYPE_CHECKING or sys.version_info guard to satisfy mypy.
+  disposition: HOLD
+  affected_files:
+    - src/repo2rlenv/config.py
+  issue_count: 1
+  source_tools:
+    - mypy
+
+- id: QUA-012
+  title: "High cyclomatic complexity (rank D) in 10 functions"
+  severity: MEDIUM
+  category: quality
+  tool: radon
+  rule_id: complexity-D
+  description: >-
+    10 functions across 7 files have cyclomatic complexity rank D (scores
+    21-30), indicating hard-to-test code paths. Key offenders include
+    hub.py, cli.py, and several pipeline run() methods.
+  evidence: "radon/complexity-D across 7 source files"
+  recommendation: >-
+    Extract helper functions, reduce conditional nesting, and simplify
+    complex orchestration flows. Target complexity rank C or better.
+  disposition: HOLD
+  affected_files:
+    - src/repo2rlenv/cli.py
+    - src/repo2rlenv/hub.py
+    - src/repo2rlenv/pipelines/_cli_app_synthesis.py
+    - src/repo2rlenv/pipelines/code_instruct.py
+    - src/repo2rlenv/pipelines/cve_patches.py
+    - src/repo2rlenv/pipelines/pr_runtime.py
+    - src/repo2rlenv/registry/probe.py
+  issue_count: 10
+  source_tools:
+    - radon
+
+- id: QUA-013
+  title: "shellcheck SC1090: non-constant source paths"
+  severity: MEDIUM
+  category: quality
+  tool: shellcheck
+  rule_id: SC1090
+  description: >-
+    3 shell scripts source files using variable paths that shellcheck
+    cannot follow for analysis. Reduces shellcheck's static analysis
+    coverage of the sourced code.
+  evidence: "shellcheck/SC1090 in 3 shell scripts"
+  recommendation: >-
+    Add shellcheck directives (# shellcheck source=path) or use constant
+    source paths where possible.
+  disposition: HOLD
+  affected_files:
+    - raiden-runner.sh
+    - raiden-trajectory-general.sh
+    - raiden-trajectory-runner.sh
+  issue_count: 3
+  source_tools:
+    - shellcheck
+
+- id: QUA-014
+  title: "shellcheck SC2221: case pattern overrides later pattern"
+  severity: MEDIUM
+  category: quality
+  tool: shellcheck
+  rule_id: SC2221
+  description: >-
+    1 instance where a case pattern always overrides a later pattern on
+    line 232 in raiden-trajectory-general.sh. The later pattern is dead code.
+  evidence: "shellcheck/SC2221 in raiden-trajectory-general.sh"
+  recommendation: >-
+    Reorder case patterns or remove the unreachable pattern.
+  disposition: HOLD
+  affected_files:
+    - raiden-trajectory-general.sh
+  issue_count: 1
+  source_tools:
+    - shellcheck
+
+- id: QUA-015
+  title: "shellcheck SC2222: unreachable case pattern"
+  severity: MEDIUM
+  category: quality
+  tool: shellcheck
+  rule_id: SC2222
+  description: >-
+    1 instance where a case pattern is never matched due to a previous
+    pattern on line 232 in raiden-trajectory-general.sh.
+  evidence: "shellcheck/SC2222 in raiden-trajectory-general.sh"
+  recommendation: >-
+    Remove the dead case pattern or fix the ordering.
+  disposition: HOLD
+  affected_files:
+    - raiden-trajectory-general.sh
+  issue_count: 1
+  source_tools:
+    - shellcheck
