@@ -191,3 +191,152 @@ def test_two_tasks_get_distinct_uuids(tmp_path: Path):
     assert a.name != b.name
     UUID(a.name)
     UUID(b.name)
+
+
+def test_writes_disallow_compose_overlay_with_environment(tmp_path: Path):
+    """Sandbox-required tasks get the anti-reward-hacking compose overlay."""
+    task = _make_task("netpol-task")
+    task.environment_dockerfile = "FROM python:3.12-slim\nWORKDIR /workspace\n"
+    out = write_harbor_task(task, tmp_path)
+    overlay = out / "environment" / "docker-compose.yaml"
+    assert overlay.is_file()
+    text = overlay.read_text()
+    # Hosts the agent has used to mine specs must be blackholed at the DNS layer.
+    assert "pypi.org:0.0.0.0" in text
+    assert "awscli.amazonaws.com:0.0.0.0" in text
+    assert "github.com:0.0.0.0" in text
+
+
+def test_omits_disallow_compose_overlay_for_lite_tasks(tmp_path: Path):
+    """Lite (text-only) tasks have no environment/ dir — nothing to overlay."""
+    task = _make_task("lite-netpol-task")
+    out = write_harbor_task(task, tmp_path)
+    assert not (out / "environment" / "docker-compose.yaml").exists()
+
+
+def test_disallow_compose_overlay_does_not_clobber_pipeline_supplied(tmp_path: Path):
+    """If a pipeline already supplies its own environment/docker-compose.yaml
+    via aux_files, the emitter does not overwrite it."""
+    task = _make_task("custom-compose-task")
+    task.environment_dockerfile = "FROM python:3.12-slim\nWORKDIR /workspace\n"
+    custom_yaml = 'services:\n  main:\n    extra_hosts:\n      - "example.com:0.0.0.0"\n'
+    task.aux_files = {"environment/docker-compose.yaml": custom_yaml}
+    out = write_harbor_task(task, tmp_path)
+    overlay = (out / "environment" / "docker-compose.yaml").read_text()
+    assert overlay == custom_yaml
+
+
+def test_blocked_hosts_fully_covered_by_blocked_suffixes():
+    """Canonical BLOCKED_HOSTS must be a subset of BLOCKED_SUFFIXES by suffix."""
+    from repo2rlenv.emitter.harbor import BLOCKED_HOSTS, BLOCKED_SUFFIXES
+
+    for host in BLOCKED_HOSTS:
+        lowered = host.lower()
+        assert any(lowered == s or lowered.endswith("." + s) for s in BLOCKED_SUFFIXES), (
+            f"{host!r} not covered by any BLOCKED_SUFFIXES entry"
+        )
+
+
+def test_disallow_compose_yaml_contains_every_blocked_host():
+    """Every BLOCKED_HOSTS entry must appear in the rendered Docker overlay."""
+    from repo2rlenv.emitter.harbor import (
+        BLOCKED_HOSTS,
+        NETWORK_DISALLOW_COMPOSE,
+    )
+
+    for host in BLOCKED_HOSTS:
+        assert f"{host}:0.0.0.0" in NETWORK_DISALLOW_COMPOSE
+
+
+def test_cli_app_conftest_blocks_public_ips_and_imports_canonical_suffixes():
+    """Conftest socket guard must reject public IPs and reuse BLOCKED_SUFFIXES."""
+    from repo2rlenv.emitter.harbor import BLOCKED_SUFFIXES
+    from repo2rlenv.pipelines._cli_app_synthesis import _build_conftest
+
+    conftest = _build_conftest()
+    assert "ip.is_loopback or ip.is_private or ip.is_link_local" in conftest
+    assert "public IP" in conftest
+    for suffix in BLOCKED_SUFFIXES:
+        assert repr(suffix) in conftest
+    assert "_socket.socket.connect_ex" in conftest
+    compile(conftest, "<generated conftest>", "exec")
+
+
+def test_aux_file_path_cannot_escape_via_adjacent_sibling(tmp_path: Path):
+    """Sibling dir whose name is a prefix of the task UUID evades startswith but not relative_to."""
+    import pytest
+
+    task = _make_task("escape-sibling-task")
+    task.environment_dockerfile = "FROM ubuntu\n"
+    task.task_uuid = "aaaaaaaa-0000-0000-0000-000000000000"
+    task.aux_files = {"../aaaaaaaa-0000-0000-0000-000000000000-evil/evil.py": "x"}
+    with pytest.raises(ValueError, match="escapes task dir"):
+        write_harbor_task(task, tmp_path)
+
+
+def test_patch_network_writes_overlay_when_missing(tmp_path: Path):
+    """cmd_patch_network writes the disallow overlay next to environment/Dockerfile when absent."""
+    import argparse
+
+    from repo2rlenv.cli import cmd_patch_network
+    from repo2rlenv.emitter.harbor import NETWORK_DISALLOW_COMPOSE
+
+    env_dir = tmp_path / "task-a" / "environment"
+    env_dir.mkdir(parents=True)
+    (env_dir / "Dockerfile").write_text("FROM ubuntu\n")
+
+    args = argparse.Namespace(path=str(tmp_path), dry_run=False)
+    rc = cmd_patch_network(args)
+
+    assert rc == 0
+    compose = env_dir / "docker-compose.yaml"
+    assert compose.is_file()
+    assert compose.read_text() == NETWORK_DISALLOW_COMPOSE
+
+
+def test_patch_network_skips_when_compose_exists(tmp_path: Path):
+    """cmd_patch_network does not overwrite an existing docker-compose.yaml."""
+    import argparse
+
+    from repo2rlenv.cli import cmd_patch_network
+
+    env_dir = tmp_path / "task-b" / "environment"
+    env_dir.mkdir(parents=True)
+    (env_dir / "Dockerfile").write_text("FROM ubuntu\n")
+    custom = "# custom\nservices:\n  main:\n    image: ubuntu\n"
+    (env_dir / "docker-compose.yaml").write_text(custom)
+
+    args = argparse.Namespace(path=str(tmp_path), dry_run=False)
+    rc = cmd_patch_network(args)
+
+    assert rc == 0
+    assert (env_dir / "docker-compose.yaml").read_text() == custom
+
+
+def test_patch_network_dry_run_writes_nothing(tmp_path: Path):
+    """cmd_patch_network --dry-run reports intent but writes nothing."""
+    import argparse
+
+    from repo2rlenv.cli import cmd_patch_network
+
+    env_dir = tmp_path / "task-c" / "environment"
+    env_dir.mkdir(parents=True)
+    (env_dir / "Dockerfile").write_text("FROM ubuntu\n")
+
+    args = argparse.Namespace(path=str(tmp_path), dry_run=True)
+    rc = cmd_patch_network(args)
+
+    assert rc == 0
+    assert not (env_dir / "docker-compose.yaml").exists()
+
+
+def test_patch_network_returns_error_for_missing_path(tmp_path: Path):
+    """cmd_patch_network returns 1 when the given path does not exist."""
+    import argparse
+
+    from repo2rlenv.cli import cmd_patch_network
+
+    args = argparse.Namespace(path=str(tmp_path / "nonexistent"), dry_run=False)
+    rc = cmd_patch_network(args)
+
+    assert rc == 1

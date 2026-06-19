@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from repo2rlenv import __version__
+from repo2rlenv.emitter.harbor import NETWORK_DISALLOW_COMPOSE
 from repo2rlenv.ui import console, install_logging
 
 logger = logging.getLogger("repo2rlenv")
@@ -816,6 +817,72 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_patch_network(args: argparse.Namespace) -> int:
+    """Retroactively add the disallow-list compose overlay to existing task dirs.
+
+    Walks *path* for `environment/Dockerfile` markers and writes a sibling
+    `docker-compose.yaml` (the same overlay write_harbor_task emits for new
+    tasks) when missing. Skips dirs that already have one. Use after running
+    `repo2rlenv generate` on tasks emitted before the disallow-list landed.
+
+    NOTE: This patches LOCAL task directories only. To propagate the fix to a
+    published dataset (e.g. on the HF Hub), follow up with `repo2rlenv push
+    <path> <repo-id>` so consumers receive the patched docker-compose.yaml.
+    """
+
+    root = Path(args.path).expanduser().resolve()
+    if not root.exists():
+        console.error(f"path does not exist: {root}")
+        return 1
+
+    dockerfiles = sorted(root.rglob("environment/Dockerfile"))
+    if not dockerfiles:
+        console.warn(f"no environment/Dockerfile found under {root}")
+        return 0
+
+    patched = 0
+    would_patch = 0
+    skipped = 0
+    with console.section(f"Patching network policy under {root}"):
+        for df in dockerfiles:
+            compose_path = df.parent / "docker-compose.yaml"
+            rel = compose_path.relative_to(root)
+            if compose_path.exists():
+                console.dim(f"  skip {rel} (already present)")
+                skipped += 1
+                continue
+            if args.dry_run:
+                console.info(f"  would write {rel}")
+                would_patch += 1
+            else:
+                compose_path.write_text(NETWORK_DISALLOW_COMPOSE, encoding="utf-8")
+                console.success(f"  patched {rel}")
+                patched += 1
+
+    if skipped > 0:
+        console.warn(
+            f"{skipped} task(s) already have docker-compose.yaml and were skipped. "
+            "Verify those files include the disallow-list overlay if they were created "
+            "before the anti-reward-hacking patch (see raiden/REWARD_HACKING.md §9)."
+        )
+    console.kv(
+        {
+            "patched": patched,
+            "would_patch": would_patch,
+            "skipped": skipped,
+            "total": len(dockerfiles),
+            "mode": "dry-run" if args.dry_run else "applied",
+        },
+        title="patch-network result",
+    )
+    if not args.dry_run and patched > 0:
+        console.info(
+            "reminder: run `repo2rlenv push <path> <repo-id>` to publish the "
+            "patched overlay to the Hub (local-only patch otherwise)."
+        )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     _load_dotenv_if_present()
 
@@ -1035,6 +1102,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     bs.add_argument("--force", action="store_true", help="ignore cache, rebuild from scratch")
     bs.set_defaults(func=cmd_bootstrap)
+
+    # patch-network
+    pn = sub.add_parser(
+        "patch-network",
+        help="Retroactively add the disallow-list compose overlay to existing tasks",
+    )
+    pn.add_argument("path", help="dataset root or task directory")
+    pn.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report which tasks would be patched without writing",
+    )
+    pn.set_defaults(func=cmd_patch_network)
 
     args = parser.parse_args(argv)
     install_logging(level=logging.DEBUG if args.verbose else logging.INFO)

@@ -42,6 +42,64 @@ from uuid import uuid4
 
 import tomli_w
 
+# Anti-reward-hacking disallow-list. BLOCKED_HOSTS is the canonical set of
+# hosts we blackhole at the DNS layer via Docker `extra_hosts -> 0.0.0.0`.
+# BLOCKED_SUFFIXES is the suffix-form that the generated conftest socket
+# guard imports verbatim, so the agent-phase (Docker) and verifier-phase
+# (Python) layers enforce exactly the same policy. Adding a host here
+# flows to both layers automatically. See raiden/REWARD_HACKING.md.
+BLOCKED_HOSTS: tuple[str, ...] = (
+    "pypi.org",
+    "pythonhosted.org",
+    "files.pythonhosted.org",
+    "github.com",
+    "githubusercontent.com",
+    "raw.githubusercontent.com",
+    "codeload.github.com",
+    "objects.githubusercontent.com",
+    "awscli.amazonaws.com",
+    "s3.amazonaws.com",
+)
+# Registrable-domain suffix-form used by the Python socket guard:
+# `host == suffix or host.endswith("." + suffix)` covers apex + arbitrary
+# subdomains, so `files.pythonhosted.org` is matched by the
+# `pythonhosted.org` entry.
+BLOCKED_SUFFIXES: tuple[str, ...] = (
+    "pypi.org",
+    "pythonhosted.org",
+    "github.com",
+    "githubusercontent.com",
+    "awscli.amazonaws.com",
+    "s3.amazonaws.com",
+)
+
+
+def _build_disallow_compose(hosts: tuple[str, ...]) -> str:
+    # Service name 'main' is Harbor's standard task-runner service,
+    # confirmed via harbor/src/harbor/environments/docker/docker-compose-no-network.yaml.
+    extra_hosts = "\n".join(f'      - "{h}:0.0.0.0"' for h in hosts)
+    return f"services:\n  main:\n    extra_hosts:\n{extra_hosts}\n"
+
+
+def _verify_blocklist_alignment(hosts: tuple[str, ...], suffixes: tuple[str, ...]) -> None:
+    """Every BLOCKED_HOSTS entry must be matched by some BLOCKED_SUFFIXES entry."""
+    for host in hosts:
+        lowered = host.lower()
+        if not any(lowered == s or lowered.endswith("." + s) for s in suffixes):
+            raise RuntimeError(
+                f"network blocklist invariant broken: host {host!r} is not "
+                "covered by any BLOCKED_SUFFIXES entry \u2014 keep BLOCKED_HOSTS "
+                "and BLOCKED_SUFFIXES in sync (see emitter/harbor.py)."
+            )
+
+
+_verify_blocklist_alignment(BLOCKED_HOSTS, BLOCKED_SUFFIXES)
+
+# Compose overlay emitted next to every sandbox task's Dockerfile. Harbor's
+# docker.py picks it up via `_environment_docker_compose_path` and appends
+# it to the compose stack, so extra_hosts merge with the base stack.
+NETWORK_DISALLOW_COMPOSE = _build_disallow_compose(BLOCKED_HOSTS)
+
 
 @dataclass(slots=True)
 class HarborTask:
@@ -176,6 +234,13 @@ def write_harbor_task(task: HarborTask, dest_dir: Path) -> Path:
         env_dir = task_path / "environment"
         env_dir.mkdir(exist_ok=True)
         (env_dir / "Dockerfile").write_text(task.environment_dockerfile, encoding="utf-8")
+        # Disallow-list compose overlay sits next to the Dockerfile. Always
+        # written here; the aux_files loop below runs last, so a pipeline
+        # that ships its own `environment/docker-compose.yaml` via aux_files
+        # overrides this default. Harbor's docker.py picks the file up via
+        # _environment_docker_compose_path and appends it to the compose
+        # stack, so extra_hosts merge with the base stack.
+        (env_dir / "docker-compose.yaml").write_text(NETWORK_DISALLOW_COMPOSE, encoding="utf-8")
     if task.test_script is not None:
         tests_dir = task_path / "tests"
         tests_dir.mkdir(exist_ok=True)
@@ -191,8 +256,10 @@ def write_harbor_task(task: HarborTask, dest_dir: Path) -> Path:
     for rel_path, content in (task.aux_files or {}).items():
         # Defensive: keep aux files inside the task dir.
         target = (task_path / rel_path).resolve()
-        if not str(target).startswith(str(task_path.resolve())):
-            raise ValueError(f"aux_file path escapes task dir: {rel_path!r}")
+        try:
+            target.relative_to(task_path.resolve())
+        except ValueError:
+            raise ValueError(f"aux_file path escapes task dir: {rel_path!r}") from None
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
 
