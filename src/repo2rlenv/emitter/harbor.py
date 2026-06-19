@@ -49,16 +49,38 @@ import tomli_w
 # (Python) layers enforce exactly the same policy. Adding a host here
 # flows to both layers automatically. See raiden/REWARD_HACKING.md.
 BLOCKED_HOSTS: tuple[str, ...] = (
+    # PyPI (official)
     "pypi.org",
     "pythonhosted.org",
     "files.pythonhosted.org",
+    # GitHub
     "github.com",
     "githubusercontent.com",
     "raw.githubusercontent.com",
     "codeload.github.com",
     "objects.githubusercontent.com",
+    # AWS (defense in depth on top of moto)
     "awscli.amazonaws.com",
     "s3.amazonaws.com",
+    # Debian apt repos (closes `apt-get install awscli` on debian-based images)
+    "deb.debian.org",
+    "security.debian.org",
+    "archive.debian.org",
+    "ftp.debian.org",
+    # Ubuntu apt repos (future-proof if base image moves to ubuntu)
+    "archive.ubuntu.com",
+    "security.ubuntu.com",
+    "ports.ubuntu.com",
+    # Alternate PyPI mirrors (APAC + global, blocks `pip install -i <mirror> awscli`)
+    "pypi.tuna.tsinghua.edu.cn",
+    "pypi.mirrors.ustc.edu.cn",
+    "mirrors.aliyun.com",
+    "mirrors.cloud.tencent.com",
+    "pypi.douban.com",
+    "mirrors.huaweicloud.com",
+    # Conda channels (defense in depth; no conda in default base, but future-proof)
+    "repo.anaconda.com",
+    "conda.anaconda.org",
 )
 # Registrable-domain suffix-form used by the Python socket guard:
 # `host == suffix or host.endswith("." + suffix)` covers apex + arbitrary
@@ -71,6 +93,16 @@ BLOCKED_SUFFIXES: tuple[str, ...] = (
     "githubusercontent.com",
     "awscli.amazonaws.com",
     "s3.amazonaws.com",
+    "debian.org",
+    "ubuntu.com",
+    "pypi.tuna.tsinghua.edu.cn",
+    "pypi.mirrors.ustc.edu.cn",
+    "mirrors.aliyun.com",
+    "mirrors.cloud.tencent.com",
+    "pypi.douban.com",
+    "mirrors.huaweicloud.com",
+    "anaconda.com",
+    "anaconda.org",
 )
 
 
