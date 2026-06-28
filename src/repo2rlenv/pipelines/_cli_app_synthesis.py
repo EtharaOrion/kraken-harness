@@ -102,7 +102,10 @@ asserts on boto3 operations. Treat it as a STYLE and INTENT reference only — \
 write a clean black-box pytest function from scratch that produces the same \
 observable behaviour. Your output must:
 
-1. Use @mock_aws decorator (function scope, from `moto`)
+1. Do NOT use the @mock_aws decorator or any moto import. A real moto S3 \
+server is already running and is wired into the `cli` and `s3_client` fixtures \
+via conftest.py. In-process @mock_aws patching does NOT reach the subprocess \
+the `cli` fixture spawns, so @mock_aws is both unnecessary and wrong here.
 2. Invoke the candidate CLI as a subprocess via the `cli` fixture (defined \
 in conftest.py) which returns a `subprocess.CompletedProcess` (stdout/stderr/returncode)
 3. Assert on returncode AND on observable side effects (S3 state via the \
@@ -1043,7 +1046,23 @@ def _translate_intent(
         logger.warning("translation failed for %s: %s", intent.test_name, exc)
         return None
     pipeline._llm_cost_usd += resp.cost_usd
-    return _strip_code_fence(resp.content)
+    return _sanitise_mock_aws(_strip_code_fence(resp.content))
+
+
+def _sanitise_mock_aws(code: str) -> str:
+    out_lines: list[str] = []
+    for line in code.splitlines():
+        stripped = line.strip()
+        if stripped == "@mock_aws" or stripped.startswith("@mock_aws("):
+            continue
+        if stripped in {
+            "from moto import mock_aws",
+            "from moto import mock_aws  # noqa",
+            "import moto",
+        }:
+            continue
+        out_lines.append(line)
+    return "\n".join(out_lines)
 
 
 def _synthesise_oracle(
