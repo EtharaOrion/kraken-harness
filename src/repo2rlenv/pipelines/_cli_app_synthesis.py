@@ -480,6 +480,13 @@ def run_cli_app_pipeline(
     owner_name = f"{owner}/{name}"
     skip_reasons: dict[str, int] = {}
 
+    if owner_name.lower() == "aws/aws-cli" and pipeline.input.repo.ref != "v2":
+        raise ValueError(
+            f"cli_app mode for aws/aws-cli requires --ref v2 (got {pipeline.input.repo.ref!r}); "
+            f"the gauntlet's reference oracle is aws-cli v{PINNED_AWSCLI_VERSION}, so the "
+            "source tests must come from the v2 branch."
+        )
+
     with tempfile.TemporaryDirectory(prefix="r2e-cli-app-") as tmp:
         clone_dir = Path(tmp) / "repo"
         logger.info("cli_app: cloning %s at %s", owner_name, pipeline.input.repo.ref)
@@ -781,7 +788,7 @@ def _build_cliapp_repo2env(
     if reference_grounding is not None and not reference_grounding.get("skipped"):
         repo2env["code_instruct"]["reference_grounding"] = {
             "reference": "aws-cli",
-            "awscli_version": PINNED_AWSCLI,
+            "awscli_version": PINNED_AWSCLI_VERSION,
             "n_reference_pass": reference_grounding["n_reference"],
             "n_oracle_pass": reference_grounding["n_oracle"],
             "n_empty_stub_pass": reference_grounding["n_empty"],
@@ -2272,8 +2279,9 @@ def _run_docker_gauntlet_g3g4(
 # the CLI from scratch.
 # ---------------------------------------------------------------------------
 
-# aws-cli v1 (pip-installable, botocore-based, honours AWS_ENDPOINT_URL → moto).
-PINNED_AWSCLI = "awscli==1.45.24"
+# v2 has no PyPI package; this is the binary version pulled from awscli.amazonaws.com.
+# Source repo must be cloned at `--ref v2` for the test corpus to match.
+PINNED_AWSCLI_VERSION = "2.28.23"
 
 # Mounted as /workspace/submission/main.py during the reference run: forwards
 # argv to the real `aws` binary, so `cli("s3","mb",...)` runs `aws s3 mb ...`
@@ -2333,7 +2341,23 @@ def _run_reference_grounding(
     ref_dockerfile = (
         dockerfile_content
         + "\n# Reference oracle for gauntlet grounding ONLY (not the shipped image)\n"
-        + f"RUN pip install --no-cache-dir {PINNED_AWSCLI}\n"
+        + "# aws-cli v2 has no PyPI package; install from the official binary zip.\n"
+        + "RUN (apt-get update && apt-get install -y --no-install-recommends curl unzip ca-certificates \\\n"
+        + "     && rm -rf /var/lib/apt/lists/*) || \\\n"
+        + "    apk add --no-cache curl unzip ca-certificates || true\n"
+        + "RUN set -e; \\\n"
+        + '    arch="$(uname -m)"; \\\n'
+        + '    case "$arch" in \\\n'
+        + "      x86_64|amd64) cli_arch=x86_64 ;; \\\n"
+        + "      aarch64|arm64) cli_arch=aarch64 ;; \\\n"
+        + '      *) echo "cli_app gauntlet: unsupported arch $arch" >&2; exit 1 ;; \\\n'
+        + "    esac; \\\n"
+        + f'    url="https://awscli.amazonaws.com/awscli-exe-linux-${{cli_arch}}-{PINNED_AWSCLI_VERSION}.zip"; \\\n'
+        + '    curl -sSL "$url" -o /tmp/awscli.zip; \\\n'
+        + "    unzip -q /tmp/awscli.zip -d /tmp; \\\n"
+        + "    /tmp/aws/install; \\\n"
+        + "    rm -rf /tmp/awscli.zip /tmp/aws\n"
+        + "RUN aws --version\n"
     )
     with tempfile.TemporaryDirectory(prefix="r2e-refground-ctx-") as ctx_str:
         ctx = Path(ctx_str)
