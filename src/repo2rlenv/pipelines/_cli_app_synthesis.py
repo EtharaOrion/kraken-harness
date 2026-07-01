@@ -171,6 +171,31 @@ pass against an empty stub that just exits 0 (non-discriminative).
 7. For happy_path tests: set up the prereq state explicitly inside the test \
 (e.g. `s3_client.make_bucket('x')` before testing `rb`). The test must be \
 runnable in isolation — do NOT assume other tests ran.
+8. Upstream aws-cli alignment (these tests must ALSO pass against real \
+aws-cli v2.28+, not just the oracle):
+   - Exit codes: NEVER assert `result.returncode == 255` or `== 2` or `== 252`. \
+Real aws-cli returns `252` for argparse-style usage errors, `255` for \
+internal/network errors, `1` for application errors. For error cases use \
+`assert result.returncode != 0` only. The `Expected exit code` field in the \
+translation prompt is a CATEGORY hint (0 = success, non-zero = error), not a \
+value to assert on when non-zero.
+   - Stdout: assert with substring-anywhere semantics (`pattern in result.stdout` \
+or `re.search(pattern, result.stdout)`). NEVER `result.stdout.splitlines()[0] == \
+pattern` — real aws-cli prints progress lines (`Completed N Bytes(s)...`) BEFORE \
+the success line for `cp`/`mv`/`sync`. If you need progress-free output, pass \
+`--no-progress`.
+   - Error messages: assert on error CATEGORY, not verbatim phrasing. Match a \
+stable keyword like `NoSuchBucket`, `NoSuchKey`, `does not exist`, \
+`InvalidBucketName`, `AccessDenied`, `usage:` — NOT a full sentence copied \
+from the reference test. Two correct implementations may word the same error \
+differently.
+   - Bucket-name validation: do NOT assert client-side rejection for malformed \
+bucket names (e.g. uppercase, `_`, too-short). Real aws-cli defers name \
+validation to the server; MinIO does the same. Any bucket-name test must \
+exercise the server round-trip and assert on the server response.
+   - Fabricated flags: never assert a flag that isn't in the reference test's \
+observed argv. In particular, `aws s3 mb` has NO `--tags` flag — do NOT write \
+a test that passes `--tags` to `mb`.
 
 If you find yourself wanting to import `boto3` or write `s3_client.X(Bucket=...)`, \
 STOP — translate to the Minio SDK equivalent from the mapping above. Boto3 \
@@ -238,11 +263,22 @@ Constraints:
 - Use the `minio` Python SDK
 - Do NOT import boto3, botocore, or moto in any form (including `@mock_aws`)
 - Do NOT import `awscli` or shell out to the `aws` binary
-- Exit 0 on success, non-zero on failure
+- Exit codes: `0` on success, `1` on application error, `252` for argparse-style \
+usage errors (invalid flag, missing required arg), `255` for internal errors. \
+Prefer argparse's default `SystemExit(2)` or an explicit `sys.exit(252)` for \
+usage errors — either `252` or `255` is acceptable to the tests.
 - Catch `minio.error.S3Error`; the error has `.code` (e.g. 'NoSuchBucket', 'NoSuchKey') and `.message`
-- Match real aws-cli stdout EXACTLY (e.g. `make_bucket: <name>` for mb, `delete: s3://<bucket>/<key>` for rm)
+- Match real aws-cli stdout for the success line (e.g. `make_bucket: <name>` for mb, \
+`delete: s3://<bucket>/<key>` for rm). You MAY additionally emit progress lines \
+before the success line (e.g. `Completed 1024 Bytes(s) with 1 file(s) remaining`), \
+or accept a `--no-progress` flag to suppress them — matching real aws-cli's \
+optional progress output.
 - For `s3 ls` output use `f"{last_modified}  {size:>10}  {key}"` per line
 - The MinIO SDK returns typed objects (Bucket/Object with `.name`, `.object_name`, `.size`, `.last_modified`), not dicts
+- Do NOT validate bucket names client-side; let the server return `InvalidBucketName`. \
+Real aws-cli defers name-format validation to the S3 service.
+- Do NOT fabricate flags that don't exist upstream. In particular, `aws s3 mb` \
+has NO `--tags` flag — do NOT implement one.
 
 The CLI is invoked as: `python submission/main.py <prefix> <command> [args...]`
 
@@ -279,14 +315,22 @@ every requested subcommand
 - Use the `minio` Python SDK
 - Do NOT import boto3, botocore, or moto in any form (including `@mock_aws`)
 - Do NOT import `awscli` or shell out to the `aws` binary
-- Exit 0 on success, non-zero on failure
+- Exit codes: `0` on success, `1` on application error, `252` for argparse-style \
+usage errors (invalid flag, missing required arg), `255` for internal errors. \
+Either `252` or `255` is acceptable to the tests for usage errors.
 - Catch `minio.error.S3Error`; the error has `.code` (e.g. 'NoSuchBucket', 'NoSuchKey') and `.message`
-- Match real aws-cli stdout EXACTLY (e.g. `make_bucket: <name>` for mb, \
-`delete: s3://<bucket>/<key>` for rm, `upload: <src> to <dst>` for cp)
+- Match real aws-cli stdout for the success line (e.g. `make_bucket: <name>` for \
+mb, `delete: s3://<bucket>/<key>` for rm, `upload: <src> to <dst>` for cp). You \
+MAY additionally emit progress lines before the success line, or accept \
+`--no-progress` to suppress them — matching real aws-cli.
 - For `s3 ls` output use `f"{last_modified}  {size:>10}  {key}"` per line
 - The MinIO SDK returns typed objects (Bucket/Object with `.name`, `.object_name`, `.size`, `.last_modified`), not dicts
 - Keep S3 state consistent across subcommands so a sequence like upload -> list -> \
 download -> remove behaves correctly end-to-end
+- Do NOT validate bucket names client-side; let the server return `InvalidBucketName`. \
+Real aws-cli defers name-format validation to the S3 service.
+- Do NOT fabricate flags that don't exist upstream. In particular, `aws s3 mb` \
+has NO `--tags` flag — do NOT implement one for any subcommand.
 
 The CLI is invoked as: `python submission/main.py <prefix> <command> [args...]`
 
@@ -327,7 +371,11 @@ dict-idiom on `s3_client` (no `Bucket=`, `Key=`, `Body=`, `["Buckets"]`, `["Body
 `s3_client.put_object("bucket", "key", BytesIO(b"data"), length=len(b"data"))`, \
 local files via `tmp_path`). Tests must run in isolation and in any order.
 4. After EVERY `cli(...)` step meant to succeed, assert `result.returncode == 0`. For \
-steps meant to fail, assert `result.returncode != 0` AND a stderr substring.
+steps meant to fail, assert `result.returncode != 0` AND a stderr CATEGORY \
+keyword (e.g. `NoSuchBucket`, `NoSuchKey`, `does not exist`, `InvalidBucketName`, \
+`AccessDenied`, `usage:`). NEVER assert `returncode == 255` or `== 2` or `== 252` \
+— real aws-cli returns `252` for usage errors and `255` for internal errors, \
+and either may occur.
 5. Assert cross-command invariants on `s3_client` STATE, not on stdout wording:
    - Object presence: iterate `s3_client.list_objects(bucket, recursive=True)` and check \
 `obj.object_name`; OR call `s3_client.stat_object(bucket, key)` (raises `S3Error` with \
@@ -336,11 +384,18 @@ steps meant to fail, assert `result.returncode != 0` AND a stderr substring.
    - Deletion: assert `S3Error` with `.code == 'NoSuchKey'` from `stat_object`.
    - Bucket presence/absence: iterate `s3_client.list_buckets()` and check `bucket.name` \
 or `s3_client.bucket_exists("name")`.
+   - When you DO assert on stdout, use substring-anywhere semantics \
+(`pattern in result.stdout`) — NEVER `result.stdout.splitlines()[0]`. Real \
+aws-cli emits progress lines BEFORE the success line for `cp`/`mv`/`sync`.
 6. Each test MUST chain at least TWO different subcommands and include at least one \
 assertion that depends on a PRIOR command's effect.
 7. Assert only on order-insensitive state (sets of keys, object bytes, bucket existence, \
 exit codes) — never on listing order, ETags, or timestamps.
-8. Name each function `test_workflow_<chain>`. Return ONLY the test function source(s) \
+8. Do NOT fabricate flags that don't exist upstream. In particular, `aws s3 mb` \
+has NO `--tags` flag — never generate a workflow step that passes `--tags` to \
+`mb`. Do NOT assert client-side rejection for malformed bucket names — real \
+aws-cli defers name validation to the server.
+9. Name each function `test_workflow_<chain>`. Return ONLY the test function source(s) \
 (one or more `def test_...`), no preamble, no surrounding markdown fences."""
 
 
@@ -1721,7 +1776,8 @@ _COMMAND_STATE_MODEL: dict[tuple[str, str], str] = {
         "- `rm s3://b/k` removes a single object via `DeleteObject`.\n"
         "- `rm s3://b/prefix --recursive` removes all matching objects via `DeleteObjects`.\n"
         "- Removing a non-existent object: SUCCEEDS silently (idempotent, like real aws-cli).\n"
-        "- `--request-payer requester` MUST be passed through to the boto3 call."
+        "- `--request-payer requester` MUST be reflected as an `x-amz-request-payer` "
+        "header on the underlying S3 request."
     ),
     ("s3", "sync"): (
         "- Syncs source → destination, transferring only files that are newer or absent.\n"
@@ -1730,7 +1786,8 @@ _COMMAND_STATE_MODEL: dict[tuple[str, str], str] = {
         "- After sync, the destination's file/object set MUST be a superset of the source's.\n"
         "- Sync does NOT delete by default; `--delete` (if supported) removes destination items\n"
         "  not present at source.\n"
-        "- Non-existent source directory (local): FAILS (exit 255, stderr `does not exist`)."
+        "- Non-existent source directory (local): FAILS (non-zero exit, typically 252 "
+        "or 255; stderr contains `does not exist`)."
     ),
     ("s3", "presign"): (
         "- Outputs a time-limited presigned URL on stdout for `GET <s3://bucket/key>`.\n"
@@ -1748,7 +1805,7 @@ _COMMAND_STATE_MODEL: dict[tuple[str, str], str] = {
     ),
 }
 
-# Friendly English for boto3 operation names — used to render "Expected
+# Friendly English for S3 API operation names — used to render "Expected
 # observable side effects" without leaking test internals.
 _OP_TO_ENGLISH: dict[str, str] = {
     "PutObject": "upload an object to S3",
@@ -1799,11 +1856,10 @@ def _build_instruction_md(spec: CliSpec, cmd_spec: CommandSpec, intents: list[Te
         "```bash\n"
         f"python /workspace/submission/main.py {cmd_label} [args...]\n"
         "```\n\n"
-        "The harness configures the runtime environment so that\n"
-        "`boto3.client('s3')` connects to a sandboxed, isolated S3 endpoint.\n"
-        "Use boto3's defaults — do not override the endpoint, region, or\n"
-        "credentials in your code. They will be set by the environment.\n"
-        "Treat the S3 backend as real AWS S3: your implementation should be\n"
+        "The harness configures the runtime environment so that the S3 client\n"
+        "reaches a sandboxed, isolated S3-compatible endpoint. Read credentials\n"
+        "and endpoint from the environment; do not hard-code them in your code.\n"
+        "Treat the backend as real AWS S3: your implementation should be\n"
         "correct against the actual S3 API contract.\n"
     )
 
@@ -1836,6 +1892,11 @@ def _build_instruction_md(spec: CliSpec, cmd_spec: CommandSpec, intents: list[Te
     parts.append(
         "- stdout: aws-cli-style success line — `make_bucket: <name>` for `mb`,"
         " `delete: s3://<b>/<k>` for `rm`, `upload: <src> to <dst>` for `cp` upload, etc.\n"
+        "  Real aws-cli may print progress lines (`Completed N Bytes(s)...`) BEFORE\n"
+        "  the success line for `cp`/`mv`/`sync`. Tests should match the success line\n"
+        "  as a substring ANYWHERE in stdout (`pattern in result.stdout`), NEVER via\n"
+        "  `result.stdout.splitlines()[0]`. Your implementation may either emit the\n"
+        "  progress lines or accept `--no-progress` to suppress them.\n"
         "- stderr: empty\n"
         "- exit: 0"
     )
@@ -1843,7 +1904,7 @@ def _build_instruction_md(spec: CliSpec, cmd_spec: CommandSpec, intents: list[Te
         bullets = ", ".join(f"`{op}`" for op in success_ops)
         ens = "; ".join(f"{op} = {_OP_TO_ENGLISH.get(op, op)}" for op in success_ops)
         parts.append(
-            "- **Observable side effects** — the underlying boto3 calls invoked must\n"
+            "- **Observable side effects** — the underlying S3 operations invoked must\n"
             f"  include at least: {bullets}.\n"
             f"  (Plain English: {ens}.)"
         )
@@ -1851,8 +1912,18 @@ def _build_instruction_md(spec: CliSpec, cmd_spec: CommandSpec, intents: list[Te
     parts.append("**On error (exit ≠ 0):**")
     if by_tag.get("error"):
         parts.append("- stdout: empty")
-        parts.append("- stderr: human-readable error message that identifies the cause")
-        parts.append("- exit: 1 (application error) or 2 / 255 (argument error)")
+        parts.append(
+            "- stderr: human-readable error identifying the CATEGORY (e.g."
+            " `NoSuchBucket`, `NoSuchKey`, `does not exist`, `InvalidBucketName`,"
+            " `AccessDenied`, `usage:`). Tests assert on the category keyword,"
+            " NOT on any specific reference-impl wording."
+        )
+        parts.append(
+            "- exit: `1` (application error) or `252` / `255` (argument/usage error)."
+            " Real aws-cli returns `252` for argparse-style usage errors and `255`"
+            " for internal errors. Tests should assert `returncode != 0` rather than"
+            " equality with any specific non-zero code."
+        )
         parts.append("- Specific error cases:")
         for intent in by_tag["error"]:
             shape = _argv_shape(intent.cmdline_template) or "<argv>"
@@ -1883,15 +1954,21 @@ def _build_instruction_md(spec: CliSpec, cmd_spec: CommandSpec, intents: list[Te
     # 5. Implementation constraints
     parts.append(
         "## Implementation constraints\n\n"
-        "- **Python 3.11** standard library + `boto3` only.\n"
-        "- **Do NOT** import `awscli` or shell out to the real `aws` binary.\n"
-        "- Use `boto3.client('s3')` with its defaults. Do not set endpoint, region,\n"
-        "  or credentials in code; the runtime environment configures them for you.\n"
+        "- Use the S3 client library that is pre-installed in the environment;\n"
+        "  do not add new package dependencies. Do NOT import `awscli` or shell\n"
+        "  out to the real `aws` binary.\n"
+        "- Read endpoint and credentials from environment variables provided\n"
+        "  by the runtime; do not hard-code them.\n"
         "- Success messages go to **stdout**; errors go to **stderr**. Do not mix them.\n"
-        "- Exit code: `0` on success, `1` on application error, `2`/`255` on argument errors\n"
-        "  (matching aws-cli's conventions).\n"
-        "- Suppress raw `botocore.exceptions.ClientError` tracebacks — print only the\n"
-        "  user-facing error string.\n"
+        "- Exit code: `0` on success, `1` on application error, `252` or `255` on\n"
+        "  argument/usage errors. Real aws-cli returns `252` for argparse-style\n"
+        "  usage errors and `255` for internal errors — either is acceptable.\n"
+        "- Catch S3 errors and print a concise, user-facing error string\n"
+        "  (do NOT print raw Python tracebacks).\n"
+        "- Do NOT fabricate flags that don't exist upstream. For example,\n"
+        "  `aws s3 mb` has NO `--tags` flag — do NOT implement one.\n"
+        "- Do NOT validate bucket names client-side; the server rejects malformed\n"
+        "  names with `InvalidBucketName`.\n"
         "- Implementation lives at `/workspace/submission/main.py` — a single file.\n"
     )
 
@@ -2020,12 +2097,12 @@ def _build_subset_instruction_md(
         f"python /workspace/submission/main.py {prefix} <command> [args...]\n"
         "```\n\n"
         "Dispatch on the `<command>` token so one program handles every subcommand\n"
-        "above. The harness configures the runtime so that `boto3.client('s3')`\n"
-        "connects to a sandboxed, isolated S3 service. Use boto3's defaults — do not\n"
-        "override the service address, region, or credentials in your code; they are\n"
-        "set by the environment. Treat the S3 backend as real AWS S3, and keep state\n"
-        "consistent across commands so a sequence like upload, list, download, remove\n"
-        "behaves correctly end-to-end.\n"
+        "above. The harness configures the runtime so that the S3 client reaches\n"
+        "a sandboxed, isolated S3-compatible service. Read endpoint and\n"
+        "credentials from the environment; do not hard-code them. Treat the\n"
+        "backend as real AWS S3, and keep state consistent across commands so\n"
+        "a sequence like upload, list, download, remove behaves correctly\n"
+        "end-to-end.\n"
     )
 
     parts.append("## Commands\n")
@@ -2040,15 +2117,21 @@ def _build_subset_instruction_md(
 
     parts.append(
         "## Implementation constraints\n\n"
-        "- **Python 3.11** standard library + `boto3` only.\n"
-        "- **Do NOT** import `awscli` or shell out to the real `aws` binary.\n"
-        "- Use `boto3.client('s3')` with its defaults. Do not set the service address,\n"
-        "  region, or credentials in code; the runtime environment configures them.\n"
+        "- Use the S3 client library that is pre-installed in the environment;\n"
+        "  do not add new package dependencies. Do NOT import `awscli` or shell\n"
+        "  out to the real `aws` binary.\n"
+        "- Read endpoint and credentials from environment variables provided\n"
+        "  by the runtime; do not hard-code them.\n"
         "- Success messages go to **stdout**; errors go to **stderr**. Do not mix them.\n"
-        "- Exit code: `0` on success, `1` on application error, `2`/`255` on argument errors\n"
-        "  (matching aws-cli's conventions).\n"
-        "- Suppress raw `botocore.exceptions.ClientError` tracebacks — print only the\n"
-        "  user-facing error string.\n"
+        "- Exit code: `0` on success, `1` on application error, `252` or `255` on\n"
+        "  argument/usage errors. Real aws-cli returns `252` for argparse-style\n"
+        "  usage errors and `255` for internal errors — either is acceptable.\n"
+        "- Catch S3 errors and print a concise, user-facing error string\n"
+        "  (do NOT print raw Python tracebacks).\n"
+        "- Do NOT fabricate flags that don't exist upstream. For example,\n"
+        "  `aws s3 mb` has NO `--tags` flag — do NOT implement one for any subcommand.\n"
+        "- Do NOT validate bucket names client-side; the server rejects malformed\n"
+        "  names with `InvalidBucketName`.\n"
         "- Everything lives in `/workspace/submission/main.py` — a single file that\n"
         "  dispatches on the subcommand.\n"
     )
@@ -2152,26 +2235,26 @@ def _assert_no_test_leakage(instruction_md: str, test_files: dict[str, str]) -> 
     for s in code_suspects:
         if s in instruction_md:
             raise RuntimeError(f"test-code leakage into instruction.md: {s!r}")
-    # Test-infrastructure leakage — case-insensitive token check.
-    infra_suspects = (
-        "moto",
-        "mock_aws",
-        "minio",
-        "pytest",
-        "conftest",
-        "ThreadedMotoServer",
-        "AWS_ENDPOINT_URL",
-        "AWS_ENDPOINT",
-        "endpoint_url",
-        # Reward-hacking surface — must NEVER point agent at source tests:
-        "github.com",
-        "tests/functional",
-        "_command.py",
-        "git ref",
-        "git_sha",
-        "reference url",
-        "behaviour drawn from",
-    )
+        # Test-infrastructure leakage — case-insensitive token check.
+        infra_suspects = (
+            "moto",
+            "mock_aws",
+            "minio",
+            "pytest",
+            "conftest",
+            "ThreadedMotoServer",
+            "AWS_ENDPOINT_URL",
+            "AWS_ENDPOINT",
+            "endpoint_url",
+            # Reward-hacking surface — must NEVER point agent at source tests:
+            "github.com",
+            "tests/functional",
+            "_command.py",
+            "git ref",
+            "git_sha",
+            "reference url",
+            "behaviour drawn from",
+        )
     lower = instruction_md.lower()
     for s in infra_suspects:
         if s.lower() in lower:
