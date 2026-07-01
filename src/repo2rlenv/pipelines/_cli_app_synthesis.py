@@ -79,16 +79,45 @@ PROMPT_TEMPLATE_VERSION = "v2.0.0-minio"
 # Pinned versions for the verification + runtime container. Used both at
 # gauntlet time and in the emitted Harbor task's Dockerfile.
 PINNED_DEPS = (
-    "minio==7.2.9",
     "pytest==8.3.3",
-    "freezegun==1.5.1",
+    "minio==7.2.20",
 )
-PINNED_PYTHON = "3.12-slim"
 
-PINNED_MINIO_VERSION = "RELEASE.2024-08-17T01-24-54Z"
-PINNED_MC_VERSION = "RELEASE.2024-08-13T05-33-17Z"
-PINNED_MINIO_SHA256 = "b446b656a611361b5a2487d726f6117a4abdc3a540d85c3ba72d3305448ffff5"
-PINNED_MC_SHA256 = "279825b9b3761e6f39f931bb4984d3bbf664af5510cdbe3dea2a3c9e4b518e19"
+# Two-stage image: the app layer builds ON TOP of the baked polyglot base
+# (raiden-base — C/C++/Go/Rust/Node/Ruby/Java/Python toolchains + curl + the
+# aws-cli v2 binary). Override per-build via the Dockerfile's BASE_IMAGE ARG or
+# CodeInstructOptions.cli_app_base_image. Pinned by digest for reproducibility.
+PINNED_BASE_IMAGE = (
+    "426628337772.dkr.ecr.ap-south-1.amazonaws.com/aws_cli_s3@sha256:"
+    "6fbab75a878b49c1be2f7ee3f754f563b977adcbd7b6bf2eb7462d424efbef29"
+)
+
+# MinIO server binary baked into the app layer (arch-aware download; no SHA pin
+# because the digest differs per arch and the app supports amd64 + arm64).
+PINNED_MINIO_VERSION = "RELEASE.2025-09-07T16-13-09Z"
+
+# OpenHands agent-runtime SDK baked into an isolated venv (harness parity).
+PINNED_OPENHANDS_VERSION = "v1.12.0"
+PINNED_FASTAPI_VERSION = "0.138.2"
+PINNED_GCP_AIPLATFORM_VERSION = "1.158.0"
+
+# aws-cli v2 S3-command dependency closure, pinned to aws-cli/pyproject.toml.
+# Installed in the MAIN env so the base image's aws-cli is runnable. There is no
+# real conflict with the MinIO SDK (minio declares urllib3 unbounded and runs on
+# 1.26.x). urllib3 is pinned down FIRST (clean RECORD-based downgrade of the
+# minio-pulled 2.x), then the rest with --ignore-installed so debian-shipped,
+# RECORD-less packages are shadowed rather than failing to uninstall.
+AWSCLI_DEP_CLOSURE = (
+    "colorama>=0.2.5,<0.4.7",
+    "docutils>=0.10,<0.20",
+    "ruamel.yaml>=0.15.0,<=0.17.21",
+    "ruamel.yaml.clib>=0.2.0,<=0.2.12",
+    "prompt-toolkit>=3.0.24,<3.0.52",
+    "distro>=1.5.0,<1.9.0",
+    "awscrt==0.27.6",
+    "python-dateutil>=2.1,<=2.9.0",
+    "jmespath>=0.7.1,<1.1.0",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -655,6 +684,7 @@ def _build_and_push_task_image(
     uid: str,
     aux_files: dict[str, str],
     test_script: str,
+    base_image: str = PINNED_BASE_IMAGE,
 ) -> str:
     repo_segment = f"{_safe_repo_segment(owner_name)}__{_safe_repo_segment(task_slug)}"
     image_ref = f"{registry}/{repo_segment}:{uid}"
@@ -668,7 +698,9 @@ def _build_and_push_task_image(
     ensure_docker_login_ecr(registry, region, profile=profile)
     with tempfile.TemporaryDirectory() as ctx:
         ctx_path = Path(ctx)
-        (ctx_path / "Dockerfile").write_text(_build_dockerfile(bake_tests=True))
+        (ctx_path / "Dockerfile").write_text(
+            _build_dockerfile(base_image=base_image, bake_tests=True)
+        )
         for rel, content in aux_files.items():
             target = ctx_path / rel
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -945,7 +977,8 @@ def _build_one_task(
         _ecr_registry = options.cli_app_ecr_registry
         _ecr_profile = _resolve_ecr_profile(options)
         _ecr_platforms = _resolve_platforms(options)
-    dockerfile = _build_dockerfile(bake_tests=options.cli_app_ecr_push)
+    base_image = options.cli_app_base_image or PINNED_BASE_IMAGE
+    dockerfile = _build_dockerfile(base_image=base_image, bake_tests=options.cli_app_ecr_push)
     test_script = _build_test_script()
 
     # ----- Gauntlet G1-G2 (cheap, no Docker) -----
@@ -1049,6 +1082,7 @@ def _build_one_task(
             uid=_uid,
             aux_files=aux_files,
             test_script=test_script,
+            base_image=base_image,
         )
         repo2env["reproducibility"] = {
             "mode": "registry",
@@ -1365,67 +1399,58 @@ def _gauntlet_static(test_code: str) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 
-def _build_dockerfile(*, bake_tests: bool = False) -> str:
-    """Pinned python-slim + pinned deps + determinism env + git init; bake_tests COPYs tests/ for ECR per-task variance. MinIO + mc binaries add ~120 MB."""
+def _build_dockerfile(*, base_image: str = PINNED_BASE_IMAGE, bake_tests: bool = False) -> str:
+    """App layer on the baked polyglot base: MinIO server binary, test deps, the
+    OpenHands SDK venv, aws-cli dep closure, submission scaffold + git baseline.
+    bake_tests COPYs tests/ into the image for per-task ECR variance."""
     deps_line = " ".join(f'"{d}"' for d in PINNED_DEPS)
-    apt_packages = "git ca-certificates curl"
-    backend_env_lines = [
-        "    MINIO_ROOT_USER=testing \\",
-        "    MINIO_ROOT_PASSWORD=testingtesting \\",
-        "    MINIO_ENDPOINT=127.0.0.1:9000",
-    ]
-    binary_install = (
-        "RUN curl -fsSL "
-        f'"https://dl.min.io/server/minio/release/linux-amd64/archive/minio.{PINNED_MINIO_VERSION}" '
-        "-o /usr/local/bin/minio \\\n"
-        f'    && echo "{PINNED_MINIO_SHA256}  /usr/local/bin/minio" | sha256sum -c - \\\n'
-        "    && chmod +x /usr/local/bin/minio\n"
-        "RUN curl -fsSL "
-        f'"https://dl.min.io/client/mc/release/linux-amd64/archive/mc.{PINNED_MC_VERSION}" '
-        "-o /usr/local/bin/mc \\\n"
-        f'    && echo "{PINNED_MC_SHA256}  /usr/local/bin/mc" | sha256sum -c - \\\n'
-        "    && chmod +x /usr/local/bin/mc\n"
-    )
-    common_env_lines = [
-        "ENV HTTP_PROXY=${HTTP_PROXY} \\",
-        "    HTTPS_PROXY=${HTTPS_PROXY} \\",
-        "    NO_PROXY=${NO_PROXY} \\",
-        "    http_proxy=${HTTP_PROXY} \\",
-        "    https_proxy=${HTTPS_PROXY} \\",
-        "    no_proxy=${NO_PROXY} \\",
-        "    SSL_CERT_FILE=${CA_CERT_PATH} \\",
-        "    REQUESTS_CA_BUNDLE=${CA_CERT_PATH} \\",
-        "    CURL_CA_BUNDLE=${CA_CERT_PATH} \\",
-        "    PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \\",
-        "    PYTHONHASHSEED=0 TZ=UTC LC_ALL=C.UTF-8 \\",
-    ]
-    env_block = "\n".join(common_env_lines + backend_env_lines) + "\n"
+    closure_line = " \\\n        ".join(f'"{d}"' for d in AWSCLI_DEP_CLOSURE)
     copy_tests = "COPY tests/ /workspace/tests/\n" if bake_tests else ""
     return (
+        "# syntax=docker/dockerfile:1\n"
         "# Auto-generated by Repo2RLEnv code_instruct cli_app mode\n"
-        f"FROM python:{PINNED_PYTHON}\n"
-        'ARG HTTP_PROXY=""\n'
-        'ARG HTTPS_PROXY=""\n'
-        'ARG NO_PROXY="localhost,127.0.0.1,::1"\n'
-        'ARG CA_CERT_PATH="/etc/ssl/certs/ca-certificates.crt"\n'
-        f"{env_block}"
+        f"ARG BASE_IMAGE={base_image}\n"
+        "FROM ${BASE_IMAGE}\n"
+        "ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \\\n"
+        "    PYTHONHASHSEED=0 TZ=UTC LC_ALL=C.UTF-8 \\\n"
+        "    AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \\\n"
+        "    AWS_DEFAULT_REGION=us-east-1 \\\n"
+        "    MINIO_UPDATE=off\n"
         "WORKDIR /workspace\n"
         "RUN apt-get update && apt-get install -y --no-install-recommends \\\n"
-        f"      {apt_packages} && rm -rf /var/lib/apt/lists/*\n"
+        "      git ca-certificates && rm -rf /var/lib/apt/lists/*\n"
+        f"ARG MINIO_VERSION={PINNED_MINIO_VERSION}\n"
+        'RUN m="$(dpkg --print-architecture)"; \\\n'
+        '    case "$m" in arm64) a=arm64;; amd64) a=amd64;; *) a="$m";; esac; \\\n'
+        '    curl -fsSL "https://dl.min.io/server/minio/release/linux-${a}/archive/minio.${MINIO_VERSION}" '
+        "-o /usr/local/bin/minio && \\\n"
+        "    chmod +x /usr/local/bin/minio && minio --version\n"
         "RUN pip install --no-cache-dir --upgrade pip\n"
         f"RUN pip install --no-cache-dir {deps_line}\n"
-        f"{binary_install}"
+        "RUN python3 -m venv /opt/openhands-sdk-venv && \\\n"
+        "    /opt/openhands-sdk-venv/bin/pip install --no-cache-dir --upgrade pip && \\\n"
+        "    /opt/openhands-sdk-venv/bin/pip install --no-cache-dir \\\n"
+        '        "openhands-sdk @ https://github.com/Ethara-Ai/software-agent-sdk/archive/refs/tags/'
+        f'{PINNED_OPENHANDS_VERSION}.tar.gz#subdirectory=openhands-sdk" \\\n'
+        '        "openhands-tools @ https://github.com/Ethara-Ai/software-agent-sdk/archive/refs/tags/'
+        f'{PINNED_OPENHANDS_VERSION}.tar.gz#subdirectory=openhands-tools" \\\n'
+        f'        "fastapi=={PINNED_FASTAPI_VERSION}" "google-cloud-aiplatform=={PINNED_GCP_AIPLATFORM_VERSION}"\n'
+        'RUN pip install --no-cache-dir "urllib3>=1.25.4,<1.27" && \\\n'
+        "    pip install --no-cache-dir --ignore-installed \\\n"
+        f"        {closure_line}\n"
         f"{copy_tests}"
-        # NOTE: don't pre-create submission/main.py — the gold patch is a
-        # `new file` diff which `git apply` rejects with "already exists" if
-        # the file is present. Just make the dir + an empty .gitkeep so git
-        # has something to commit as a baseline.
+        # Don't pre-create submission/main.py — the gold patch is a `new file`
+        # diff that `git apply` rejects as "already exists" if the file is present.
         "RUN mkdir -p /workspace/submission && touch /workspace/submission/.gitkeep\n"
-        "RUN git init -q /workspace && \\\n"
-        "    git -C /workspace config user.email r2e@local && \\\n"
-        "    git -C /workspace config user.name r2e && \\\n"
+        # The submission's `aws` executable lives here and shadows any base-image
+        # aws-cli so tests exercise the submission, not the real binary.
+        "ENV PATH=/workspace/submission:$PATH\n"
+        "RUN git config --global --add safe.directory /workspace && \\\n"
+        "    git init -q /workspace && \\\n"
+        "    git -C /workspace config user.email raiden@local && \\\n"
+        "    git -C /workspace config user.name raiden && \\\n"
         "    git -C /workspace add -A && \\\n"
-        "    git -C /workspace commit -q --allow-empty -m 'r2e: baseline'\n"
+        "    git -C /workspace commit -q --allow-empty -m 'raiden: baseline'\n"
     )
 
 
@@ -1522,8 +1547,8 @@ def minio_server(tmp_path_factory):
          "--console-address", ":0"],
         env={
             **os.environ,
-            "MINIO_ROOT_USER": "testing",
-            "MINIO_ROOT_PASSWORD": "testingtesting",
+            "MINIO_ROOT_USER": "minioadmin",
+            "MINIO_ROOT_PASSWORD": "minioadmin",
             "MINIO_UPDATE": "off",
             "MINIO_BROWSER": "off",
         },
@@ -1558,8 +1583,8 @@ def minio_server(tmp_path_factory):
 def s3_client(minio_server):
     return Minio(
         minio_server,
-        access_key="testing",
-        secret_key="testingtesting",
+        access_key="minioadmin",
+        secret_key="minioadmin",
         secure=False,
     )
 
@@ -1582,13 +1607,13 @@ def cli(minio_server):
     def _run(*args, env_overrides=None, timeout=60):
         env = os.environ.copy()
         env["MINIO_ENDPOINT"] = minio_server
-        env["MINIO_ACCESS_KEY"] = "testing"
-        env["MINIO_SECRET_KEY"] = "testingtesting"
+        env["MINIO_ACCESS_KEY"] = "minioadmin"
+        env["MINIO_SECRET_KEY"] = "minioadmin"
         env["MINIO_SECURE"] = "false"
         env["AWS_ENDPOINT_URL_S3"] = f"http://{minio_server}"
         env["AWS_ENDPOINT_URL"] = f"http://{minio_server}"
-        env["AWS_ACCESS_KEY_ID"] = "testing"
-        env["AWS_SECRET_ACCESS_KEY"] = "testingtesting"
+        env["AWS_ACCESS_KEY_ID"] = "minioadmin"
+        env["AWS_SECRET_ACCESS_KEY"] = "minioadmin"
         env["AWS_DEFAULT_REGION"] = "us-east-1"
         if env_overrides:
             env.update(env_overrides)

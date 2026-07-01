@@ -256,6 +256,9 @@ class CodeInstructOptions(_BaseOptions):
     cli_app_ecr_registry: str | None = None
     cli_app_ecr_profile: str | None = None
     cli_app_platforms: list[str] | None = None
+    # Override the app Dockerfile's BASE_IMAGE (the baked polyglot base). None =
+    # the pipeline default (repo2rlenv.pipelines._cli_app_synthesis.PINNED_BASE_IMAGE).
+    cli_app_base_image: str | None = None
 
 
 class RefactorSynthesisOptions(_BaseOptions):
