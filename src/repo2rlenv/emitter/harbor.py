@@ -59,9 +59,15 @@ BLOCKED_HOSTS: tuple[str, ...] = (
     "raw.githubusercontent.com",
     "codeload.github.com",
     "objects.githubusercontent.com",
-    # AWS (defense in depth on top of moto)
+    # AWS (defense in depth on top of moto/MinIO sandbox)
     "awscli.amazonaws.com",
     "s3.amazonaws.com",
+    # MinIO release infra (forecloses agent swapping the pinned binary or
+    # phoning home for telemetry/updates even if MINIO_UPDATE env is bypassed)
+    "dl.min.io",
+    "update.min.io",
+    "subnet.min.io",
+    "min.io",
     # Debian apt repos (closes `apt-get install awscli` on debian-based images)
     "deb.debian.org",
     "security.debian.org",
@@ -93,6 +99,7 @@ BLOCKED_SUFFIXES: tuple[str, ...] = (
     "githubusercontent.com",
     "awscli.amazonaws.com",
     "s3.amazonaws.com",
+    "min.io",
     "debian.org",
     "ubuntu.com",
     "pypi.tuna.tsinghua.edu.cn",

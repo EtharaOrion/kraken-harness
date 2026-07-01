@@ -73,21 +73,22 @@ logger = logging.getLogger(__name__)
 
 # Bump on prompt changes; baked into content_hash so consumers can detect
 # "tasks before/after this version are not directly comparable".
-PROMPT_TEMPLATE_VERSION = "v1.1.0-primed"
+PROMPT_TEMPLATE_VERSION = "v2.0.0-minio"
 
 
 # Pinned versions for the verification + runtime container. Used both at
 # gauntlet time and in the emitted Harbor task's Dockerfile.
 PINNED_DEPS = (
-    "boto3==1.34.150",
-    "botocore==1.34.150",
-    "moto[s3,server]==5.0.16",
+    "minio==7.2.9",
     "pytest==8.3.3",
     "freezegun==1.5.1",
-    "werkzeug==3.0.4",
-    "flask==3.0.3",
 )
 PINNED_PYTHON = "3.12-slim"
+
+PINNED_MINIO_VERSION = "RELEASE.2024-08-17T01-24-54Z"
+PINNED_MC_VERSION = "RELEASE.2024-08-13T05-33-17Z"
+PINNED_MINIO_SHA256 = "b446b656a611361b5a2487d726f6117a4abdc3a540d85c3ba72d3305448ffff5"
+PINNED_MC_SHA256 = "279825b9b3761e6f39f931bb4984d3bbf664af5510cdbe3dea2a3c9e4b518e19"
 
 
 # ---------------------------------------------------------------------------
@@ -100,24 +101,51 @@ TRANSLATION_SYSTEM = """You translate aws-cli white-box tests into black-box pyt
 The reference test exercises an aws-cli command via the in-process driver and \
 asserts on boto3 operations. Treat it as a STYLE and INTENT reference only — \
 write a clean black-box pytest function from scratch that produces the same \
-observable behaviour. Your output must:
+observable behaviour. The S3 backend in this environment is a local MinIO \
+server (already running, wired into the `cli` and `s3_client` fixtures via \
+conftest.py). Your output must:
 
-1. Do NOT use the @mock_aws decorator or any moto import. A real moto S3 \
-server is already running and is wired into the `cli` and `s3_client` fixtures \
-via conftest.py. In-process @mock_aws patching does NOT reach the subprocess \
-the `cli` fixture spawns, so @mock_aws is both unnecessary and wrong here.
-2. Invoke the candidate CLI as a subprocess via the `cli` fixture (defined \
-in conftest.py) which returns a `subprocess.CompletedProcess` (stdout/stderr/returncode)
-3. Assert on returncode AND on observable side effects (S3 state via the \
-`s3_client` fixture, or stdout content)
-4. Have AT LEAST one non-trivial STATE assertion: either query s3_client for
-   bucket/object existence/contents, OR assert on a specific stderr/stdout
-   substring tied to the command's documented output format. A bare
-   `assert result.returncode == 0` with no state check is REJECTED — such
-   tests pass against an empty stub that just exits 0 (non-discriminative).
-5. For happy_path tests: set up the prereq state explicitly inside the test
-   (e.g. `s3_client.create_bucket(Bucket='x')` before testing `rb`).
-   The test must be runnable in isolation — do NOT assume other tests ran.
+1. Do NOT import or reference ANY of the following — these are fatal errors:
+   - `boto3` (any form: `import boto3`, `from boto3`, `boto3.client(...)`, \
+`boto3.resource(...)`)
+   - `botocore` (any form: `import botocore`, `botocore.session`, \
+`botocore.exceptions`, `from botocore...`)
+   - `moto` (any form, including `@mock_aws`, `from moto`, `ThreadedMotoServer`)
+2. Do NOT use boto3 dict-idiom on `s3_client`. The `s3_client` fixture is a \
+`minio.Minio` instance, NOT a boto3 client. The following are FORBIDDEN \
+because they will raise `TypeError`:
+   - `s3_client.create_bucket(Bucket="foo")`           — use `s3_client.make_bucket("foo")`
+   - `s3_client.put_object(Bucket="b", Key="k", Body=b"v")` — use \
+`s3_client.put_object("b", "k", BytesIO(b"v"), length=1)`
+   - `s3_client.list_buckets()["Buckets"]`             — use `list(s3_client.list_buckets())` \
+(returns `Bucket` objects with `.name` and `.creation_date`)
+   - `s3_client.get_object(Bucket="b", Key="k")["Body"].read()` — use \
+`s3_client.get_object("b", "k").read()`
+   - `s3_client.head_object(Bucket="b", Key="k")`      — use `s3_client.stat_object("b", "k")` \
+(returns `Object` with `.size`, `.etag`, `.last_modified`)
+   - `s3_client.delete_object(Bucket="b", Key="k")`    — use `s3_client.remove_object("b", "k")`
+   - `s3_client.list_objects_v2(Bucket="b")["Contents"]` — use \
+`list(s3_client.list_objects("b", recursive=True))` (returns `Object` items \
+with `.object_name`, `.size`)
+3. Catch `minio.error.S3Error` for S3 errors (NOT `botocore.exceptions.ClientError`). \
+The error has `.code` (e.g. `'NoSuchBucket'`, `'NoSuchKey'`) and `.message`.
+4. Invoke the candidate CLI as a subprocess via the `cli` fixture (returns \
+`subprocess.CompletedProcess`).
+5. Assert on returncode AND on observable side effects (S3 state via the \
+`s3_client` Minio instance, or stdout content).
+6. Have AT LEAST one non-trivial STATE assertion: query `s3_client` for \
+bucket/object existence/contents via SDK methods (`bucket_exists`, \
+`stat_object`, `get_object`), OR assert on a specific stderr/stdout substring \
+tied to the command's documented output format. A bare \
+`assert result.returncode == 0` with no state check is REJECTED — such tests \
+pass against an empty stub that just exits 0 (non-discriminative).
+7. For happy_path tests: set up the prereq state explicitly inside the test \
+(e.g. `s3_client.make_bucket('x')` before testing `rb`). The test must be \
+runnable in isolation — do NOT assume other tests ran.
+
+If you find yourself wanting to import `boto3` or write `s3_client.X(Bucket=...)`, \
+STOP — translate to the Minio SDK equivalent from the mapping above. Boto3 \
+imports or dict-idiom in this file is a fatal error.
 
 DO NOT COPY any of the following from the reference test — these are \
 white-box harness leakage and will break the black-box contract:
@@ -134,6 +162,9 @@ Output constraints:
 - Function name: `test_<command>_<descriptive>` matching the intent
 - No fixtures other than `cli`, `s3_client`, `tmp_path` (all provided by conftest)
 - Plain `def test_...(...)` with positional fixture args
+- If you need to construct request bodies, import `BytesIO` from `io`. The \
+`BytesIO` is already imported at module level by the conftest preamble — \
+you can import it again in the test for clarity.
 - For error-tag intents: assert `result.returncode != 0` AND on a stderr
   substring identifying the error category
 - Return ONLY the test function source (no preamble, no surrounding markdown fences)"""
@@ -148,26 +179,41 @@ Extracted intent:
 - Command: aws {command_prefix} {command}
 - argv after program name: {cmdline_template}
 - Expected exit code: {expected_exit}
-- Expected boto3 operations: {expected_state_calls}
+- Expected aws-cli observable operations: {expected_state_calls}
 - Behaviour tag: {behaviour_tag}
 
 Translate this into a black-box pytest test. The agent's CLI is at \
 /workspace/submission/main.py. Use `cli(*argv)` to invoke it (returns \
-CompletedProcess). Use `s3_client` (a boto3 S3 client pointing at moto) to \
-verify state."""
+CompletedProcess). Use `s3_client` (a `minio.Minio` SDK client wired to the \
+local MinIO server) to verify state — call methods like `make_bucket`, \
+`put_object`, `stat_object`, `list_objects` per the mapping in the system \
+prompt. The `expected_state_calls` field above describes the OBSERVABLE \
+side-effects in aws-cli terms; translate them into the equivalent Minio SDK \
+queries when asserting state."""
 
 
 ORACLE_SYSTEM = """You write a reference Python implementation of a single aws-cli S3 command.
 
+The S3 backend is a local MinIO server, already running and reachable. Configure your client from env:
+
+  client = Minio(
+      os.environ["MINIO_ENDPOINT"],
+      access_key=os.environ["MINIO_ACCESS_KEY"],
+      secret_key=os.environ["MINIO_SECRET_KEY"],
+      secure=os.environ.get("MINIO_SECURE", "false").lower() == "true",
+  )
+
 Constraints:
 - Single file: `submission/main.py`
 - Use argparse for argument parsing
-- Use boto3 with the default endpoint (moto intercepts via AWS_ENDPOINT_URL_S3 env var)
+- Use the `minio` Python SDK
+- Do NOT import boto3, botocore, or moto in any form (including `@mock_aws`)
 - Do NOT import `awscli` or shell out to the `aws` binary
 - Exit 0 on success, non-zero on failure
-- Match real aws-cli output format on stdout (e.g. `make_bucket: <name>` for mb, \
-`delete: s3://<bucket>/<key>` for rm, etc.)
-- Print errors to stderr, suppress noisy boto3 tracebacks (use `botocore.exceptions.ClientError`)
+- Catch `minio.error.S3Error`; the error has `.code` (e.g. 'NoSuchBucket', 'NoSuchKey') and `.message`
+- Match real aws-cli stdout EXACTLY (e.g. `make_bucket: <name>` for mb, `delete: s3://<bucket>/<key>` for rm)
+- For `s3 ls` output use `f"{last_modified}  {size:>10}  {key}"` per line
+- The MinIO SDK returns typed objects (Bucket/Object with `.name`, `.object_name`, `.size`, `.last_modified`), not dicts
 
 The CLI is invoked as: `python submission/main.py <prefix> <command> [args...]`
 
@@ -188,16 +234,28 @@ focus on the `{command}` subcommand."""
 ORACLE_SUBSET_SYSTEM = """You write a reference Python implementation of a SUBSET of \
 aws-cli S3 commands as ONE file.
 
+The S3 backend is a local MinIO server, already running and reachable. Configure your client from env:
+
+  client = Minio(
+      os.environ["MINIO_ENDPOINT"],
+      access_key=os.environ["MINIO_ACCESS_KEY"],
+      secret_key=os.environ["MINIO_SECRET_KEY"],
+      secure=os.environ.get("MINIO_SECURE", "false").lower() == "true",
+  )
+
 Constraints:
 - Single file: `submission/main.py`
 - Parse argv and dispatch on the subcommand (argv[2]) so one program handles \
 every requested subcommand
-- Use boto3 with the default endpoint (moto intercepts via AWS_ENDPOINT_URL_S3 env var)
+- Use the `minio` Python SDK
+- Do NOT import boto3, botocore, or moto in any form (including `@mock_aws`)
 - Do NOT import `awscli` or shell out to the `aws` binary
 - Exit 0 on success, non-zero on failure
-- Match real aws-cli output format on stdout (e.g. `make_bucket: <name>` for mb, \
-`delete: s3://<bucket>/<key>` for rm, `upload: <src> to <dst>` for cp, etc.)
-- Print errors to stderr, suppress noisy boto3 tracebacks (use `botocore.exceptions.ClientError`)
+- Catch `minio.error.S3Error`; the error has `.code` (e.g. 'NoSuchBucket', 'NoSuchKey') and `.message`
+- Match real aws-cli stdout EXACTLY (e.g. `make_bucket: <name>` for mb, \
+`delete: s3://<bucket>/<key>` for rm, `upload: <src> to <dst>` for cp)
+- For `s3 ls` output use `f"{last_modified}  {size:>10}  {key}"` per line
+- The MinIO SDK returns typed objects (Bucket/Object with `.name`, `.object_name`, `.size`, `.last_modified`), not dicts
 - Keep S3 state consistent across subcommands so a sequence like upload -> list -> \
 download -> remove behaves correctly end-to-end
 
@@ -225,28 +283,35 @@ behaviour of a from-scratch `aws s3`-style CLI.
 
 The CLI is a single file at /workspace/submission/main.py, invoked as a subprocess via \
 the `cli` fixture: `cli(*argv) -> subprocess.CompletedProcess` (with .returncode, \
-.stdout, .stderr). A boto3 client `s3_client` (pointing at the SAME sandboxed S3) and \
-pytest's `tmp_path` are also available as fixtures.
+.stdout, .stderr). A `minio.Minio` client `s3_client` (pointing at the SAME sandboxed \
+MinIO server) and pytest's `tmp_path` are also available as fixtures.
 
 Rules:
 1. Use ONLY the fixtures `cli`, `s3_client`, `tmp_path` as test-function arguments. Do \
-NOT use any decorator. You may use the standard library plus `boto3`/`botocore` \
-(assume both are importable).
-2. Create ALL prerequisite state inside the test (buckets via the CLI or \
-`s3_client.create_bucket`, local files via `tmp_path`). Tests must run in isolation and \
-in any order.
-3. After EVERY `cli(...)` step meant to succeed, assert `result.returncode == 0`. For \
+NOT use any decorator. You may use the standard library plus the `minio` SDK \
+(`from minio import Minio`, `from minio.error import S3Error`, `from io import BytesIO`).
+2. Do NOT import or reference boto3, botocore, or moto in any form. Do NOT use boto3 \
+dict-idiom on `s3_client` (no `Bucket=`, `Key=`, `Body=`, `["Buckets"]`, `["Body"]`, \
+`["Contents"]`, etc.). Use Minio SDK call signatures only.
+3. Create ALL prerequisite state inside the test (buckets via the CLI or \
+`s3_client.make_bucket("name")`, objects via \
+`s3_client.put_object("bucket", "key", BytesIO(b"data"), length=len(b"data"))`, \
+local files via `tmp_path`). Tests must run in isolation and in any order.
+4. After EVERY `cli(...)` step meant to succeed, assert `result.returncode == 0`. For \
 steps meant to fail, assert `result.returncode != 0` AND a stderr substring.
-4. Assert cross-command invariants on `s3_client` STATE, not on stdout wording: object \
-presence via `list_objects_v2`/`head_object`; byte-identical content via \
-`get_object()['Body'].read()`; deletion by expecting a `botocore.exceptions.ClientError` \
-(error code '404' or 'NoSuchKey') from `head_object`; bucket presence/absence via \
-`list_buckets`.
-5. Each test MUST chain at least TWO different subcommands and include at least one \
+5. Assert cross-command invariants on `s3_client` STATE, not on stdout wording:
+   - Object presence: iterate `s3_client.list_objects(bucket, recursive=True)` and check \
+`obj.object_name`; OR call `s3_client.stat_object(bucket, key)` (raises `S3Error` with \
+`.code == 'NoSuchKey'` when absent).
+   - Byte-identical content: `s3_client.get_object(bucket, key).read()`.
+   - Deletion: assert `S3Error` with `.code == 'NoSuchKey'` from `stat_object`.
+   - Bucket presence/absence: iterate `s3_client.list_buckets()` and check `bucket.name` \
+or `s3_client.bucket_exists("name")`.
+6. Each test MUST chain at least TWO different subcommands and include at least one \
 assertion that depends on a PRIOR command's effect.
-6. Assert only on order-insensitive state (sets of keys, object bytes, bucket existence, \
+7. Assert only on order-insensitive state (sets of keys, object bytes, bucket existence, \
 exit codes) — never on listing order, ETags, or timestamps.
-7. Name each function `test_workflow_<chain>`. Return ONLY the test function source(s) \
+8. Name each function `test_workflow_<chain>`. Return ONLY the test function source(s) \
 (one or more `def test_...`), no preamble, no surrounding markdown fences."""
 
 
@@ -763,7 +828,7 @@ def _build_cliapp_repo2env(
             "intents_extracted": len(intents),
             "tests_translated": len(translated),
             "tests_in_task": len(test_files),
-            "simulation_backend": "moto",
+            "simulation_backend": "minio",
             "python_version": "3.11",
             "entry_point": "submission/main.py",
             "pinned_deps": list(PINNED_DEPS),
@@ -1032,7 +1097,8 @@ def _translate_intent(
     intent: TestIntent,
 ) -> str | None:
     """One LLM call per intent. Returns translated test code or None on failure."""
-    user = TRANSLATION_USER_TEMPLATE.format(
+    template = TRANSLATION_USER_TEMPLATE
+    user = template.format(
         raw_source=intent.raw_source[:4000],
         command_prefix=spec.command_prefix,
         command=intent.command,
@@ -1126,7 +1192,9 @@ def _synthesise_oracle(
 
 # Prepended to every workflow-test module so each is self-contained after the
 # multi-function LLM response is split into one file per test function.
-_WF_IMPORT_PREAMBLE = "import boto3\nimport botocore\nimport botocore.exceptions\n\n\n"
+_WF_IMPORT_PREAMBLE = (
+    "from minio import Minio\nfrom minio.error import S3Error\nfrom io import BytesIO\n\n\n"
+)
 
 
 def _synthesise_workflow_tests(
@@ -1183,11 +1251,18 @@ def _synthesise_workflow_tests(
     pipeline._llm_cost_usd += resp.cost_usd
     code = _strip_code_fence(resp.content)
     return _split_workflow_functions(
-        code, allowed_commands=set(subset_names), prefix=spec.command_prefix
+        code,
+        allowed_commands=set(subset_names),
+        prefix=spec.command_prefix,
     )
 
 
-def _split_workflow_functions(code: str, *, allowed_commands: set[str], prefix: str) -> list[str]:
+def _split_workflow_functions(
+    code: str,
+    *,
+    allowed_commands: set[str],
+    prefix: str,
+) -> list[str]:
     """Split a multi-function workflow blob into one self-contained module per
     `test_*` function. Functions whose `cli(...)` calls reference a subcommand
     outside the subset are dropped (the combined oracle won't implement it).
@@ -1291,8 +1366,40 @@ def _gauntlet_static(test_code: str) -> tuple[bool, str]:
 
 
 def _build_dockerfile(*, bake_tests: bool = False) -> str:
-    """Pinned python-slim + pinned deps + determinism env + git init; bake_tests COPYs tests/ for ECR per-task variance."""
+    """Pinned python-slim + pinned deps + determinism env + git init; bake_tests COPYs tests/ for ECR per-task variance. MinIO + mc binaries add ~120 MB."""
     deps_line = " ".join(f'"{d}"' for d in PINNED_DEPS)
+    apt_packages = "git ca-certificates curl"
+    backend_env_lines = [
+        "    MINIO_ROOT_USER=testing \\",
+        "    MINIO_ROOT_PASSWORD=testingtesting \\",
+        "    MINIO_ENDPOINT=127.0.0.1:9000",
+    ]
+    binary_install = (
+        "RUN curl -fsSL "
+        f'"https://dl.min.io/server/minio/release/linux-amd64/archive/minio.{PINNED_MINIO_VERSION}" '
+        "-o /usr/local/bin/minio \\\n"
+        f'    && echo "{PINNED_MINIO_SHA256}  /usr/local/bin/minio" | sha256sum -c - \\\n'
+        "    && chmod +x /usr/local/bin/minio\n"
+        "RUN curl -fsSL "
+        f'"https://dl.min.io/client/mc/release/linux-amd64/archive/mc.{PINNED_MC_VERSION}" '
+        "-o /usr/local/bin/mc \\\n"
+        f'    && echo "{PINNED_MC_SHA256}  /usr/local/bin/mc" | sha256sum -c - \\\n'
+        "    && chmod +x /usr/local/bin/mc\n"
+    )
+    common_env_lines = [
+        "ENV HTTP_PROXY=${HTTP_PROXY} \\",
+        "    HTTPS_PROXY=${HTTPS_PROXY} \\",
+        "    NO_PROXY=${NO_PROXY} \\",
+        "    http_proxy=${HTTP_PROXY} \\",
+        "    https_proxy=${HTTPS_PROXY} \\",
+        "    no_proxy=${NO_PROXY} \\",
+        "    SSL_CERT_FILE=${CA_CERT_PATH} \\",
+        "    REQUESTS_CA_BUNDLE=${CA_CERT_PATH} \\",
+        "    CURL_CA_BUNDLE=${CA_CERT_PATH} \\",
+        "    PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \\",
+        "    PYTHONHASHSEED=0 TZ=UTC LC_ALL=C.UTF-8 \\",
+    ]
+    env_block = "\n".join(common_env_lines + backend_env_lines) + "\n"
     copy_tests = "COPY tests/ /workspace/tests/\n" if bake_tests else ""
     return (
         "# Auto-generated by Repo2RLEnv code_instruct cli_app mode\n"
@@ -1301,24 +1408,13 @@ def _build_dockerfile(*, bake_tests: bool = False) -> str:
         'ARG HTTPS_PROXY=""\n'
         'ARG NO_PROXY="localhost,127.0.0.1,::1"\n'
         'ARG CA_CERT_PATH="/etc/ssl/certs/ca-certificates.crt"\n'
-        "ENV HTTP_PROXY=${HTTP_PROXY} \\\n"
-        "    HTTPS_PROXY=${HTTPS_PROXY} \\\n"
-        "    NO_PROXY=${NO_PROXY} \\\n"
-        "    http_proxy=${HTTP_PROXY} \\\n"
-        "    https_proxy=${HTTPS_PROXY} \\\n"
-        "    no_proxy=${NO_PROXY} \\\n"
-        "    SSL_CERT_FILE=${CA_CERT_PATH} \\\n"
-        "    REQUESTS_CA_BUNDLE=${CA_CERT_PATH} \\\n"
-        "    CURL_CA_BUNDLE=${CA_CERT_PATH} \\\n"
-        "    PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \\\n"
-        "    PYTHONHASHSEED=0 TZ=UTC LC_ALL=C.UTF-8 \\\n"
-        "    AWS_ACCESS_KEY_ID=testing AWS_SECRET_ACCESS_KEY=testing \\\n"
-        "    AWS_DEFAULT_REGION=us-east-1\n"
+        f"{env_block}"
         "WORKDIR /workspace\n"
         "RUN apt-get update && apt-get install -y --no-install-recommends \\\n"
-        "      git ca-certificates && rm -rf /var/lib/apt/lists/*\n"
+        f"      {apt_packages} && rm -rf /var/lib/apt/lists/*\n"
         "RUN pip install --no-cache-dir --upgrade pip\n"
         f"RUN pip install --no-cache-dir {deps_line}\n"
+        f"{binary_install}"
         f"{copy_tests}"
         # NOTE: don't pre-create submission/main.py — the gold patch is a
         # `new file` diff which `git apply` rejects with "already exists" if
@@ -1334,7 +1430,7 @@ def _build_dockerfile(*, bake_tests: bool = False) -> str:
 
 
 def _build_conftest() -> str:
-    """ThreadedMotoServer per-test fixture + cli subprocess wrapper + s3_client.
+    """Network-isolated conftest with S3 server + cli subprocess wrapper.
 
     The verifier-phase socket guard reuses ``BLOCKED_SUFFIXES`` from
     ``emitter/harbor`` as its single source of truth so the Docker-layer
@@ -1343,12 +1439,12 @@ def _build_conftest() -> str:
     suffix blocklist leaves open).
     """
     suffixes_literal = ", ".join(repr(s) for s in BLOCKED_SUFFIXES)
-    template = '''"""Auto-generated by Repo2RLEnv code_instruct cli_app mode.
+    template = '''"""Auto-generated by Repo2RLEnv code_instruct cli_app mode (MinIO backend).
 
-Per-test moto S3 server + subprocess fixtures. The agent's submission
-runs as a subprocess; @mock_aws's in-process patching doesn't reach
-subprocesses, so we boot a real ThreadedMotoServer on a random port and
-point boto3 (in both the test and the subprocess) at it via AWS_ENDPOINT_URL_S3.
+Module-scoped MinIO subprocess + iterate-and-delete reset between tests.
+The agent's submission runs as a subprocess; we boot MinIO on a random
+loopback port and pass MINIO_* env vars (plus defensive AWS_* env) so
+both the test and the subprocess reach the same server.
 """
 
 import ipaddress
@@ -1356,6 +1452,8 @@ import os
 import socket as _socket
 import subprocess
 import sys
+import time as _time
+import http.client as _http
 
 _R2E_ORIG_CONNECT = _socket.socket.connect
 _R2E_BLOCKED_SUFFIXES = (__BLOCKED_SUFFIXES__,)
@@ -1390,45 +1488,107 @@ def _r2e_guarded_connect_ex(self, addr):
         return exc.errno
 _socket.socket.connect_ex = _r2e_guarded_connect_ex
 
-import boto3
 import pytest
-from moto.server import ThreadedMotoServer
+from io import BytesIO
+from minio import Minio
+from minio.error import S3Error
+
+
+def _grab_free_port(retries=3):
+    """Retry on bind-time races; rare but observed on busy CI."""
+    last_err = None
+    for _ in range(retries):
+        try:
+            sock = _socket.socket()
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+            sock.close()
+            return port
+        except OSError as e:
+            last_err = e
+            _time.sleep(0.05)
+    raise RuntimeError(f"could not bind ephemeral port: {last_err}")
+
+
+@pytest.fixture(scope="module")
+def minio_server(tmp_path_factory):
+    data_dir = tmp_path_factory.mktemp("minio-data")
+    port = _grab_free_port()
+    endpoint = f"127.0.0.1:{port}"
+
+    proc = subprocess.Popen(
+        ["minio", "server", str(data_dir),
+         "--address", f":{port}",
+         "--console-address", ":0"],
+        env={
+            **os.environ,
+            "MINIO_ROOT_USER": "testing",
+            "MINIO_ROOT_PASSWORD": "testingtesting",
+            "MINIO_UPDATE": "off",
+            "MINIO_BROWSER": "off",
+        },
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    for _ in range(50):
+        try:
+            conn = _http.HTTPConnection(endpoint, timeout=0.2)
+            conn.request("GET", "/minio/health/live")
+            if conn.getresponse().status == 200:
+                break
+        except OSError:
+            pass
+        _time.sleep(0.1)
+    else:
+        proc.terminate()
+        raise RuntimeError("minio failed to start within 5s")
+
+    try:
+        yield endpoint
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
 
 
 @pytest.fixture
-def moto_server():
-    server = ThreadedMotoServer(port=0)
-    server.start()
-    port = server._server.socket.getsockname()[1]
-    endpoint = f"http://127.0.0.1:{port}"
-    yield endpoint
-    server.stop()
-
-
-@pytest.fixture
-def s3_client(moto_server):
-    return boto3.client(
-        "s3",
-        endpoint_url=moto_server,
-        region_name="us-east-1",
-        aws_access_key_id="testing",
-        aws_secret_access_key="testing",
+def s3_client(minio_server):
+    return Minio(
+        minio_server,
+        access_key="testing",
+        secret_key="testingtesting",
+        secure=False,
     )
 
 
+@pytest.fixture(autouse=True)
+def _reset_minio(s3_client):
+    try:
+        buckets = list(s3_client.list_buckets())
+        for bucket in buckets:
+            for obj in s3_client.list_objects(bucket.name, recursive=True):
+                s3_client.remove_object(bucket.name, obj.object_name)
+            s3_client.remove_bucket(bucket.name)
+    except S3Error:
+        pass
+    yield
+
+
 @pytest.fixture
-def cli(moto_server):
-    """Invoke /workspace/submission/main.py as a subprocess.
-
-    Returns a callable: cli(*argv) -> subprocess.CompletedProcess
-    """
-
+def cli(minio_server):
     def _run(*args, env_overrides=None, timeout=60):
         env = os.environ.copy()
-        env["AWS_ENDPOINT_URL_S3"] = moto_server
-        env["AWS_ENDPOINT_URL"] = moto_server
+        env["MINIO_ENDPOINT"] = minio_server
+        env["MINIO_ACCESS_KEY"] = "testing"
+        env["MINIO_SECRET_KEY"] = "testingtesting"
+        env["MINIO_SECURE"] = "false"
+        env["AWS_ENDPOINT_URL_S3"] = f"http://{minio_server}"
+        env["AWS_ENDPOINT_URL"] = f"http://{minio_server}"
         env["AWS_ACCESS_KEY_ID"] = "testing"
-        env["AWS_SECRET_ACCESS_KEY"] = "testing"
+        env["AWS_SECRET_ACCESS_KEY"] = "testingtesting"
         env["AWS_DEFAULT_REGION"] = "us-east-1"
         if env_overrides:
             env.update(env_overrides)
@@ -1971,6 +2131,7 @@ def _assert_no_test_leakage(instruction_md: str, test_files: dict[str, str]) -> 
     infra_suspects = (
         "moto",
         "mock_aws",
+        "minio",
         "pytest",
         "conftest",
         "ThreadedMotoServer",
@@ -2285,7 +2446,9 @@ PINNED_AWSCLI_VERSION = "2.28.23"
 
 # Mounted as /workspace/submission/main.py during the reference run: forwards
 # argv to the real `aws` binary, so `cli("s3","mb",...)` runs `aws s3 mb ...`
-# against the same moto server the test fixtures point at.
+# against the same S3 server the test fixtures point at (via
+# AWS_ENDPOINT_URL_S3 set in the cli fixture — works for moto and MinIO alike,
+# since aws-cli v2.13+ honours AWS_ENDPOINT_URL_S3).
 _REFERENCE_SHIM = (
     "import subprocess\n"
     "import sys\n"
