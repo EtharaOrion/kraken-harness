@@ -1,0 +1,6 @@
+llm:
+  provider: anthropic
+  model: claude-opus-4-8
+  endpoint: http://localhost:8765
+  api_key_env: CLAUDE_PROXY_TOKEN
+  timeout_sec: 300

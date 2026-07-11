@@ -113,11 +113,41 @@ BLOCKED_SUFFIXES: tuple[str, ...] = (
 )
 
 
-def _build_disallow_compose(hosts: tuple[str, ...]) -> str:
+def _build_disallow_compose(hosts: tuple[str, ...], *, ddb_sidecar: bool = False) -> str:
     # Service name 'main' is Harbor's standard task-runner service,
     # confirmed via harbor/src/harbor/environments/docker/docker-compose-no-network.yaml.
     extra_hosts = "\n".join(f'      - "{h}:0.0.0.0"' for h in hosts)
-    return f"services:\n  main:\n    extra_hosts:\n{extra_hosts}\n"
+    if not ddb_sidecar:
+        return f"services:\n  main:\n    extra_hosts:\n{extra_hosts}\n"
+    # DynamoDB backend variant: adds a `ddb` sidecar (DynamoDB Local) that the
+    # `main` container talks to via AWS_ENDPOINT_URL over compose-internal DNS.
+    # Digest is parallel-pinned with pipelines/_cli_app_synthesis.py:
+    # PINNED_DDB_LOCAL_DIGEST — keep both in sync.
+    return (
+        "services:\n"
+        "  ddb:\n"
+        "    image: amazon/dynamodb-local:2.5.4"
+        "@sha256:cf8cebd061f988628c02daff10fdb950a54478feff9c52f6ddf84710fe3c3906\n"
+        '    command: ["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb", "-port", "8000"]\n'
+        "    working_dir: /home/dynamodblocal\n"
+        "    healthcheck:\n"
+        '      test: ["CMD-SHELL", "curl -s -o /dev/null http://localhost:8000 || exit 1"]\n'
+        "      interval: 2s\n"
+        "      timeout: 2s\n"
+        "      retries: 20\n"
+        "      start_period: 3s\n"
+        "  main:\n"
+        "    depends_on:\n"
+        "      ddb:\n"
+        "        condition: service_healthy\n"
+        "    environment:\n"
+        "      - AWS_ENDPOINT_URL=http://ddb:8000\n"
+        "      - AWS_ENDPOINT_URL_DYNAMODB=http://ddb:8000\n"
+        "      - AWS_PAGER=\n"
+        "      - AWS_EC2_METADATA_DISABLED=true\n"
+        "    extra_hosts:\n"
+        f"{extra_hosts}\n"
+    )
 
 
 def _verify_blocklist_alignment(hosts: tuple[str, ...], suffixes: tuple[str, ...]) -> None:
@@ -133,6 +163,22 @@ def _verify_blocklist_alignment(hosts: tuple[str, ...], suffixes: tuple[str, ...
 
 
 _verify_blocklist_alignment(BLOCKED_HOSTS, BLOCKED_SUFFIXES)
+
+# DynamoDB-backend variant of the disallow-list. The DynamoDB Local task
+# backend runs on loopback, so the only additional egress worth blackholing is
+# the real DynamoDB service endpoint (defense in depth, mirroring the S3
+# entries). Regional endpoints (`dynamodb.<region>.amazonaws.com`) resolve to
+# public IPs and are already rejected by the conftest socket guard's public-IP
+# check, so only the apex suffix is listed here.
+#
+# Kept as PARALLEL tuples rather than mutating BLOCKED_HOSTS/BLOCKED_SUFFIXES:
+# the generated S3 conftest bakes BLOCKED_SUFFIXES into its bytes, so growing
+# the base set would change every shipped S3 task's content_hash. The DynamoDB
+# pipeline branch imports these _DDB tuples and bakes them into the DynamoDB
+# conftest + compose overlay instead.
+BLOCKED_HOSTS_DDB: tuple[str, ...] = (*BLOCKED_HOSTS, "dynamodb.amazonaws.com")
+BLOCKED_SUFFIXES_DDB: tuple[str, ...] = (*BLOCKED_SUFFIXES, "dynamodb.amazonaws.com")
+_verify_blocklist_alignment(BLOCKED_HOSTS_DDB, BLOCKED_SUFFIXES_DDB)
 
 # Compose overlay emitted next to every sandbox task's Dockerfile. Harbor's
 # docker.py picks it up via `_environment_docker_compose_path` and appends
@@ -165,6 +211,11 @@ class HarborTask:
     # When None, ``write_harbor_task`` auto-generates a UUID.  The slug is
     # always preserved in task.toml as ``task.name = "<org>/<slug>"``.
     task_uuid: str | None = None
+    # Optional LLM-synthesised reference oracle, shipped alongside the golden
+    # slice as `solution/reference.diff`. When set, the emitter writes
+    # `solution/golden.diff` + `solution/reference.diff` instead of a single
+    # `solution/patch.diff`. Solve.sh always applies the golden.
+    reference_diff: str | None = None
 
 
 def _content_hash(task: HarborTask) -> str:
@@ -172,15 +223,115 @@ def _content_hash(task: HarborTask) -> str:
     h.update(task.instruction.encode("utf-8"))
     h.update(b"\0")
     h.update(task.oracle_diff.encode("utf-8"))
+    if task.reference_diff is not None:
+        h.update(b"\0")
+        h.update(task.reference_diff.encode("utf-8"))
     return f"sha256:{h.hexdigest()}"
 
 
-def write_harbor_task(task: HarborTask, dest_dir: Path) -> Path:
+def _samples_image_uri(bootstrap_image: str) -> str:
+    """Derive the samples-style ``<host>/<repo>:task_env_rl`` tag.
+
+    Samples task.toml uses the short alias tag ``:task_env_rl`` for
+    ``[metadata.image].uri`` regardless of the actual pushed tag
+    (e.g. ``task_env_rl_minio_2025_04``). We strip the digest suffix
+    from the Dockerfile FROM line and append the samples alias.
+    Digest form is preserved separately in ``[environment].docker_image``.
+    """
+    if not bootstrap_image or bootstrap_image.startswith("local/"):
+        return bootstrap_image or "local/r2e-bootstrap:unknown"
+    repo_only = bootstrap_image.split("@", 1)[0]
+    if ":" in repo_only.rsplit("/", 1)[-1]:
+        repo_only = repo_only.rsplit(":", 1)[0]
+    return f"{repo_only}:task_env_rl"
+
+
+def _build_samples_payload(
+    *,
+    task: HarborTask,
+    qualified_name: str,
+    repo2env: dict[str, Any],
+    bootstrap_image: str,
+) -> dict[str, Any]:
+    """Assemble the flat Ethara-Ai/raiden-samples task.toml payload.
+
+    Reads scalars from ``repo2env['code_instruct']`` (the cli_app pipeline's
+    per-task provenance sub-dict) and promotes them to top-level ``[metadata]``
+    fields + ``[metadata.runtime]`` + ``[metadata.image]`` + top-level
+    ``[environment]``. Drops ``difficulty``, ``[metadata.repo2env]``, ``[agent]``,
+    ``[verifier]``. Dict insertion order chosen so tomli_w emits scalars before
+    sub-tables under ``[metadata]`` (TOML requires this: sub-tables shadow
+    trailing scalars in the parent table).
+    """
+    ci = repo2env.get("code_instruct", {})
+    metadata: dict[str, Any] = {
+        "category": task.category,
+        "keywords": list(task.keywords),
+    }
+    if "commands" in ci:
+        metadata["commands"] = ci["commands"]
+    if "behaviour_tags" in ci:
+        metadata["behaviour_tags"] = ci["behaviour_tags"]
+    if ci.get("subset"):
+        metadata["subset"] = ci["subset"]
+    if "workflow_tests" in ci:
+        metadata["workflow_tests"] = ci["workflow_tests"]
+    if "tests_shipped" in ci:
+        metadata["tests_shipped"] = ci["tests_shipped"]
+    elif "tests_in_task" in ci:
+        metadata["tests_shipped"] = ci["tests_in_task"]
+    if "discriminative" in ci:
+        metadata["discriminative"] = ci["discriminative"]
+    else:
+        rg = ci.get("reference_grounding") or {}
+        if "discriminative" in rg:
+            metadata["discriminative"] = rg["discriminative"]
+
+    if "behaviour_tag_counts" in ci:
+        metadata["behaviour_tag_counts"] = ci["behaviour_tag_counts"]
+
+    # Samples convention: entry_point is always the ``submission/aws`` shim
+    # (created by solve.sh even in LLM-oracle mode, so it's the true runtime
+    # entrypoint regardless of whether the oracle is ``main.py`` or a slice).
+    metadata["runtime"] = {
+        "python_version": ci.get("python_version", "3.12"),
+        "simulation_backend": ci.get("simulation_backend", "minio"),
+        "entry_point": "submission/aws",
+        "cpus": ci.get("runtime_cpus", 1.0),
+        "memory_mb": ci.get("runtime_memory_mb", 1024),
+        "timeout_sec": ci.get("runtime_timeout_sec", 300),
+        "pinned_deps": list(ci.get("pinned_deps", [])),
+    }
+    metadata["image"] = {"uri": _samples_image_uri(bootstrap_image)}
+
+    payload: dict[str, Any] = {
+        "version": "1.0",
+        "task": {"name": qualified_name, "description": task.description},
+        "metadata": metadata,
+    }
+    if bootstrap_image:
+        payload["environment"] = {"docker_image": bootstrap_image}
+    return payload
+
+
+def write_harbor_task(
+    task: HarborTask,
+    dest_dir: Path,
+    *,
+    emit_samples_format: bool = False,
+) -> Path:
     """Materialize the task directory under *dest_dir* and return the path.
 
     The directory is named after ``task.task_uuid`` (or an auto-generated UUID
     when the field is *None*).  ``task.toml`` inside it still carries the
     human-readable slug via ``task.name``.
+
+    ``emit_samples_format=True`` emits the flat Ethara-Ai/raiden-samples task.toml
+    schema instead of the nested ``[metadata.repo2env]`` extension: promotes
+    ``code_instruct`` scalars to ``[metadata]``, adds ``[metadata.image]`` +
+    ``[metadata.runtime]`` + top-level ``[environment]``, and drops
+    ``difficulty`` / ``[agent]`` / ``[verifier]`` blocks. Used by the cli_app
+    pipeline for samples-compatible batches.
     """
     dir_name = task.task_uuid if task.task_uuid else str(uuid4())
     task_path = dest_dir / dir_name
@@ -199,20 +350,37 @@ def write_harbor_task(task: HarborTask, dest_dir: Path) -> Path:
     else:
         repo2env.setdefault("reward_kinds", ["diff_similarity"])
 
+    # Bootstrap image extracted from the Dockerfile's first FROM. Anchored on
+    # the same regex used by `registry.integration._FROM_LINE_RE`. Both output
+    # paths (default nested + samples-format flat) need this, and the samples
+    # format also derives an [metadata.image].uri tag from it.
+    bootstrap_image = ""
+    if task.environment_dockerfile is not None:
+        df = task.environment_dockerfile
+        # Dockerfile ARG defaults referenced by ${NAME} / $NAME in FROM must be
+        # resolved here so [environment].docker_image and [metadata.image].uri
+        # carry the actual pinned digest, not the literal placeholder.
+        arg_defaults: dict[str, str] = {}
+        for arg_m in re.finditer(
+            r"^\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(\S+)",
+            df,
+            re.IGNORECASE | re.MULTILINE,
+        ):
+            arg_defaults[arg_m.group(1)] = arg_m.group(2).strip()
+        m = re.search(r"^(\s*FROM\s+)(\S+)", df, re.IGNORECASE | re.MULTILINE)
+        if m:
+            raw = m.group(2).strip()
+            var_m = re.fullmatch(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", raw)
+            if var_m and var_m.group(1) in arg_defaults:
+                bootstrap_image = arg_defaults[var_m.group(1)]
+            else:
+                bootstrap_image = raw
+
     # For sandbox-required tasks (those that emit environment/Dockerfile),
     # seed [metadata.repo2env.reproducibility] with mode=local_only and the
     # un-pullable local image ref. `repo2rlenv push` rewrites this in-place
     # to mode=registry / inline_dockerfile after the push step.
     if task.environment_dockerfile is not None and "reproducibility" not in repo2env:
-        bootstrap_image = ""
-        # Derive from the Dockerfile's first FROM line so we don't need the
-        # caller to plumb it separately. Matches the same anchor used by
-        # `registry.integration._FROM_LINE_RE`.
-        m = re.search(
-            r"^(\s*FROM\s+)(\S+)", task.environment_dockerfile, re.IGNORECASE | re.MULTILINE
-        )
-        if m:
-            bootstrap_image = m.group(2).strip()
         repo2env["reproducibility"] = {
             "mode": "local_only",
             "image_ref": bootstrap_image or "local/r2e-bootstrap:unknown",
@@ -225,46 +393,98 @@ def write_harbor_task(task: HarborTask, dest_dir: Path) -> Path:
     # directory is a UUID; task.toml keeps the human-readable `org/slug`
     # form so harbor accepts the task.
     qualified_name = f"{task.org}/{task.name}"
-    payload: dict[str, Any] = {
-        "version": "1.0",
-        "task": {
-            "name": qualified_name,
-            "description": task.description,
-        },
-        "metadata": {
-            "difficulty": task.difficulty,
-            "category": task.category,
-            "keywords": task.keywords,
-            "repo2env": repo2env,
-        },
-        "agent": {"timeout_sec": 1800.0},
-        "verifier": {"timeout_sec": 300.0},
-    }
+    if emit_samples_format:
+        payload = _build_samples_payload(
+            task=task,
+            qualified_name=qualified_name,
+            repo2env=repo2env,
+            bootstrap_image=bootstrap_image,
+        )
+    else:
+        payload = {
+            "version": "1.0",
+            "task": {
+                "name": qualified_name,
+                "description": task.description,
+            },
+            "metadata": {
+                "difficulty": task.difficulty,
+                "category": task.category,
+                "keywords": task.keywords,
+                "repo2env": repo2env,
+            },
+            "agent": {"timeout_sec": 1800.0},
+            "verifier": {"timeout_sec": 300.0},
+        }
     (task_path / "task.toml").write_bytes(tomli_w.dumps(payload).encode("utf-8"))
 
     # instruction.md
     (task_path / "instruction.md").write_text(task.instruction, encoding="utf-8")
 
-    # solution/patch.diff — canonical SWE-bench-style oracle (what trainers consume)
     sol_dir = task_path / "solution"
     sol_dir.mkdir(exist_ok=True)
-    (sol_dir / "patch.diff").write_text(task.oracle_diff, encoding="utf-8")
-
-    # solution/solve.sh — Harbor's oracle agent runs this script inside the
-    # container; it should leave the working tree in the "fixed" state. We
-    # `git apply` the canonical patch.diff so we keep one oracle artifact
-    # (patch.diff) and just provide the execution shim Harbor needs.
-    (sol_dir / "solve.sh").write_text(
-        "#!/bin/bash\n"
-        "set -euxo pipefail\n"
-        "cd /workspace\n"
-        "git config --global --add safe.directory /workspace\n"
-        # Harbor uploads the whole solution/ dir into the container under
-        # /solution; the patch.diff sits next to this script.
-        'PATCH="$(dirname "$0")/patch.diff"\n'
-        'git apply --verbose --reject "$PATCH"\n',
-        encoding="utf-8",
-    )
+    if task.reference_diff is not None:
+        (sol_dir / "golden.diff").write_text(task.oracle_diff, encoding="utf-8")
+        (sol_dir / "reference.diff").write_text(task.reference_diff, encoding="utf-8")
+        (sol_dir / "solve.sh").write_text(
+            "#!/bin/bash\n"
+            "set -euxo pipefail\n"
+            "cd /workspace\n"
+            "git config --global --add safe.directory /workspace\n"
+            'DIR="$(dirname "$0")"\n'
+            'GOLDEN="$DIR/golden.diff"\n'
+            'REFERENCE="$DIR/reference.diff"\n'
+            'CHOICE="${SOLVE_PATCH:-auto}"\n'
+            'case "$CHOICE" in\n'
+            "  golden)\n"
+            '    PATCH="$GOLDEN"\n'
+            "    ;;\n"
+            "  reference)\n"
+            '    PATCH="$REFERENCE"\n'
+            "    ;;\n"
+            "  auto|*)\n"
+            '    if [ -s "$GOLDEN" ]; then\n'
+            '      PATCH="$GOLDEN"\n'
+            '    elif [ -s "$REFERENCE" ]; then\n'
+            '      PATCH="$REFERENCE"\n'
+            "    else\n"
+            '      echo "solve.sh: no non-empty patch found (golden.diff or reference.diff)" >&2\n'
+            "      exit 1\n"
+            "    fi\n"
+            "    ;;\n"
+            "esac\n"
+            'if [ ! -s "$PATCH" ]; then\n'
+            '  echo "solve.sh: requested patch is empty: $PATCH" >&2\n'
+            "  exit 1\n"
+            "fi\n"
+            'git apply --verbose --reject "$PATCH"\n'
+            "if [ ! -f /workspace/submission/aws ] && [ -f /workspace/submission/main.py ]; then\n"
+            "  cat > /workspace/submission/aws <<'EOF'\n"
+            "#!/bin/bash\n"
+            'exec python /workspace/submission/main.py "$@"\n'
+            "EOF\n"
+            "fi\n"
+            "chmod +x /workspace/submission/aws 2>/dev/null || true\n",
+            encoding="utf-8",
+        )
+        (sol_dir / "solve_reference.sh").write_text(
+            "#!/bin/bash\n"
+            "set -euo pipefail\n"
+            'exec env SOLVE_PATCH=reference "$(dirname "$0")/solve.sh" "$@"\n',
+            encoding="utf-8",
+        )
+        (sol_dir / "solve_reference.sh").chmod(0o755)
+    else:
+        (sol_dir / "patch.diff").write_text(task.oracle_diff, encoding="utf-8")
+        (sol_dir / "solve.sh").write_text(
+            "#!/bin/bash\n"
+            "set -euxo pipefail\n"
+            "cd /workspace\n"
+            "git config --global --add safe.directory /workspace\n"
+            'PATCH="$(dirname "$0")/patch.diff"\n'
+            'git apply --verbose --reject "$PATCH"\n',
+            encoding="utf-8",
+        )
     (sol_dir / "solve.sh").chmod(0o755)
 
     # Optional environment/Dockerfile + tests/test.sh — written only for

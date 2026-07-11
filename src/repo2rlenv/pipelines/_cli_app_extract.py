@@ -29,6 +29,7 @@ from __future__ import annotations
 import ast
 import fnmatch
 import hashlib
+import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -74,8 +75,16 @@ class TestIntent:
     expected_exit: int = 0
     expected_state_calls: list[str] = field(default_factory=list)
     expected_stdout_pattern: str | None = None
-    behaviour_tag: Literal["happy_path", "error", "edge", "workflow"] = "happy_path"
+    behaviour_tag: Literal[
+        "happy_path",
+        "error",
+        "error_nonexistent",
+        "error_invalid_args",
+        "edge",
+        "workflow",
+    ] = "happy_path"
     raw_source: str = ""  # original method source (for LLM context)
+    error_category: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -334,16 +343,21 @@ def extract_test_intents(
 
 
 def _interleave_by_behaviour(intents: list[TestIntent]) -> list[TestIntent]:
-    """Round-robin intents by behaviour_tag for diversity in small slices.
-
-    Tags drained in priority order (error first, then edge, workflow,
-    happy_path) so when max_intents is small the slice still surfaces
-    the rare-but-important cases. Within a tag, original order preserved.
-    """
+    """Round-robin intents by behaviour_tag for diversity in small slices."""
     buckets: dict[str, list[TestIntent]] = {}
     for i in intents:
         buckets.setdefault(i.behaviour_tag, []).append(i)
-    priority = ["error", "edge", "workflow", "happy_path"]
+    priority = [
+        "error_nonexistent",
+        "error_invalid_args",
+        "error",
+        "edge",
+        "workflow",
+        "happy_path",
+    ]
+    for tag in list(buckets):
+        if tag not in priority:
+            priority.append(tag)
     ordered: list[TestIntent] = []
     while any(buckets.get(t) for t in priority):
         for tag in priority:
@@ -573,3 +587,549 @@ def _infer_behaviour_tag(
     if "_then_" in name or "_and_" in name or "workflow" in name:
         return "workflow"
     return "happy_path"
+
+
+# ---------------------------------------------------------------------------
+# botocore service-model extraction (for services whose CLI verbs are
+# model-generated, e.g. `aws dynamodb`, rather than an awscli customization
+# with a `subcommands.py` + `tests/functional/<svc>/test_*_command.py` corpus).
+#
+# The reader consumes the vendored `botocore/data/<service>/*/service-2.json`
+# as STATIC JSON off disk (json.loads) — it NEVER `import botocore`, so shipped
+# tasks keep the no-boto/botocore/moto guarantee. It surfaces the target
+# operations as CommandSpecs and synthesises TestIntents from the request /
+# response / error shapes (there are no white-box test files to lift from).
+# ---------------------------------------------------------------------------
+
+
+# DynamoDB Data-Plane API version (the X-Amz-Target suffix is DynamoDB_20120810).
+_DDB_API_VERSION = "2012-08-10"
+
+# The 8 in-scope pilot verbs (DYNAMODB-02-SCOPE §1), as CamelCase operation
+# names. Used as the default target set for botocore_model extraction.
+_DDB_TARGET_OPS_DEFAULT: tuple[str, ...] = (
+    "CreateTable",
+    "DeleteTable",
+    "ListTables",
+    "PutItem",
+    "GetItem",
+    "UpdateItem",
+    "DeleteItem",
+    "Query",
+)
+
+_TAG_RE = re.compile(r"<[^>]+>")
+_WS_RE = re.compile(r"\s+")
+
+
+def _strip_doc(text: str, *, limit: int = 500) -> str:
+    """Flatten botocore's HTML documentation into a short plain-text blurb."""
+    if not text:
+        return ""
+    plain = _WS_RE.sub(" ", _TAG_RE.sub(" ", text)).strip()
+    if len(plain) > limit:
+        plain = plain[:limit].rstrip() + " ..."
+    return plain
+
+
+def _camel_to_kebab(name: str) -> str:
+    """botocore-style casing: CreateTable -> create-table, SSESpecification ->
+    sse-specification. Handles acronym runs correctly."""
+    s1 = re.sub(r"(.)([A-Z][a-z]+)", r"\1-\2", name)
+    s2 = re.sub(r"([a-z0-9])([A-Z])", r"\1-\2", s1)
+    return s2.lower()
+
+
+def _op_to_cli_name(op: str) -> str:
+    """CreateTable -> create-table (the `aws dynamodb <verb>` name)."""
+    return _camel_to_kebab(op)
+
+
+def _member_to_flag(member: str) -> str:
+    """TableName -> --table-name (the aws-cli long option for an input member)."""
+    return "--" + _camel_to_kebab(member)
+
+
+def find_service_model_json(
+    clone_dir: Path,
+    service: str,
+    *,
+    override: str | None = None,
+) -> Path:
+    """Locate `botocore/data/<service>/<api-version>/service-2.json` in the clone.
+
+    Read as a STATIC JSON data file, never via `import botocore`. When several
+    API-version directories exist, the lexically greatest (latest) is chosen.
+    `override` may point at either the service-2.json directly or a botocore
+    data dir to search under.
+    """
+    if override:
+        p = Path(override)
+        if p.is_file():
+            return p
+        if p.is_dir():
+            hits = sorted(p.rglob("service-2.json"))
+            if hits:
+                return hits[-1]
+        raise FileNotFoundError(f"cli_app_service_model_override not usable: {override}")
+
+    matches = sorted(clone_dir.rglob(f"botocore/data/{service}/*/service-2.json"))
+    if not matches:
+        raise RuntimeError(
+            f"could not locate botocore service model for service={service!r} under "
+            f"{clone_dir} (looked for botocore/data/{service}/*/service-2.json). "
+            "Pass --pipeline-opt cli_app_service_model_override=<abs-path-to-service-2.json>."
+        )
+    # Prefer the greatest API-version directory (…/dynamodb/2012-08-10/service-2.json).
+    matches.sort(key=lambda p: p.parent.name)
+    return matches[-1]
+
+
+def _shape_summary(model: dict, shape_name: str) -> str:
+    """One-line type description for a shape reference (for the spec blurb)."""
+    shape = model.get("shapes", {}).get(shape_name, {})
+    stype = shape.get("type", "")
+    if stype == "list":
+        member = shape.get("member", {}).get("shape", "item")
+        return f"list of {member}"
+    if stype == "map":
+        val = shape.get("value", {}).get("shape", "value")
+        return f"map to {val}"
+    if stype == "structure":
+        return f"structure ({shape_name})"
+    return stype or shape_name
+
+
+def extract_cli_spec_from_model(
+    clone_dir: Path,
+    command_prefix: str,
+    *,
+    repo: str,
+    git_sha: str,
+    target_operations: tuple[str, ...] = _DDB_TARGET_OPS_DEFAULT,
+    model_path_override: str | None = None,
+) -> tuple[CliSpec, dict]:
+    """Build a CliSpec from a botocore service model, filtered to target ops.
+
+    Returns (spec, model) — the parsed service-2.json is returned so intent
+    synthesis can walk the request/response/error shapes without re-reading.
+    """
+    model_path = find_service_model_json(clone_dir, command_prefix, override=model_path_override)
+    model = json.loads(model_path.read_text(encoding="utf-8", errors="replace"))
+    operations = model.get("operations", {})
+
+    commands: list[CommandSpec] = []
+    for op in target_operations:
+        op_def = operations.get(op)
+        if op_def is None:
+            logger.warning(
+                "botocore_model: operation %s not found in %s (available: %d ops)",
+                op,
+                model_path.name,
+                len(operations),
+            )
+            continue
+        input_shape = _op_input_shape(model, op_def)
+        flags = sorted(_member_to_flag(m) for m in input_shape.get("members", {}))
+        commands.append(
+            CommandSpec(
+                name=_op_to_cli_name(op),
+                synopsis=_strip_doc(op_def.get("documentation", ""), limit=200),
+                args=[],
+                flags=flags,
+            )
+        )
+    if not commands:
+        raise RuntimeError(
+            f"botocore_model: none of the target operations {list(target_operations)} "
+            f"were found in {model_path}"
+        )
+
+    spec = CliSpec(
+        name=f"aws_cli_{command_prefix}",
+        command_prefix=command_prefix,
+        repo=repo,
+        git_sha=git_sha,
+        entry_point=str(_safe_relpath(model_path, clone_dir)),
+        tests_dir="",
+        commands=commands,
+    )
+    spec.spec_sha256 = _canonical_spec_hash(spec)
+    return spec, model
+
+
+def _safe_relpath(path: Path, root: Path) -> Path:
+    try:
+        return path.relative_to(root)
+    except ValueError:
+        return Path(path.name)
+
+
+def _op_input_shape(model: dict, op_def: dict) -> dict:
+    shape_name = (op_def.get("input") or {}).get("shape")
+    if not shape_name:
+        return {}
+    return model.get("shapes", {}).get(shape_name, {})
+
+
+def synthesize_intents_from_model(
+    model: dict,
+    command: str,
+    command_prefix: str,
+    *,
+    target_operations: tuple[str, ...] = _DDB_TARGET_OPS_DEFAULT,
+    max_intents: int | None = None,
+) -> list[TestIntent]:
+    """Synthesise TestIntents for one CLI command from its model operation.
+
+    Produces a diverse set (happy-path, a missing-required-arg error, and one
+    intent per modeled service error) whose `raw_source` is a synthesised
+    behavioural spec block (op docs + input-member table + the specific error
+    under test) — this seeds the LLM translation prompt in lieu of a white-box
+    test. Returns [] if the command has no matching operation.
+    """
+    op_name = _command_to_op(command, target_operations)
+    operations = model.get("operations", {})
+    op_def = operations.get(op_name) if op_name else None
+    if op_def is None:
+        return []
+
+    input_shape = _op_input_shape(model, op_def)
+    members = input_shape.get("members", {})
+    required = list(input_shape.get("required", []))
+    op_doc = _strip_doc(op_def.get("documentation", ""))
+    member_lines = _render_member_lines(model, members, required)
+    errors = [e.get("shape", "") for e in op_def.get("errors", []) if e.get("shape")]
+
+    happy_cmd = [command_prefix, command]
+    for m in required:
+        ph = _placeholder_for_shape(model, members.get(m, {}).get("shape", ""))
+        happy_cmd.extend([_member_to_flag(m), ph])
+
+    out: list[TestIntent] = []
+
+    for variant_ix in range(_HAPPY_PATH_VARIANTS_PER_CMD):
+        variant_cmd = [command_prefix, command]
+        for m in required:
+            ph = _placeholder_for_shape(
+                model, members.get(m, {}).get("shape", ""), variant=variant_ix
+            )
+            variant_cmd.extend([_member_to_flag(m), ph])
+        out.append(
+            _make_model_intent(
+                command=command,
+                command_prefix=command_prefix,
+                op_name=op_name,
+                kind=f"happy_v{variant_ix}",
+                cmdline=variant_cmd,
+                expected_exit=0,
+                behaviour_tag="happy_path",
+                raw_source=_spec_block(
+                    op_name,
+                    command_prefix,
+                    command,
+                    op_doc,
+                    member_lines,
+                    errors,
+                    kind="happy",
+                    detail=f"variant {variant_ix}",
+                ),
+                state_calls=[op_name],
+            )
+        )
+
+    for missing in required:
+        bad_cmd = [command_prefix, command]
+        for m in required:
+            if m == missing:
+                continue
+            ph = _placeholder_for_shape(model, members.get(m, {}).get("shape", ""))
+            bad_cmd.extend([_member_to_flag(m), ph])
+        out.append(
+            _make_model_intent(
+                command=command,
+                command_prefix=command_prefix,
+                op_name=op_name,
+                kind=f"missing_{_camel_to_kebab(missing)}",
+                cmdline=bad_cmd,
+                expected_exit=252,
+                behaviour_tag="error_invalid_args",
+                raw_source=_spec_block(
+                    op_name,
+                    command_prefix,
+                    command,
+                    op_doc,
+                    member_lines,
+                    errors,
+                    kind="missing_required",
+                    detail=_member_to_flag(missing),
+                ),
+                state_calls=[],
+            )
+        )
+
+    if required:
+        for extra_kind in _INVALID_ARGS_EXTRA_KINDS:
+            corrupted_cmd = _mutate_cmdline_for_kind(
+                model,
+                members,
+                required,
+                command_prefix,
+                command,
+                kind=extra_kind,
+            )
+            if corrupted_cmd is None:
+                continue
+            out.append(
+                _make_model_intent(
+                    command=command,
+                    command_prefix=command_prefix,
+                    op_name=op_name,
+                    kind=extra_kind,
+                    cmdline=corrupted_cmd,
+                    expected_exit=252,
+                    behaviour_tag="error_invalid_args",
+                    raw_source=_spec_block(
+                        op_name,
+                        command_prefix,
+                        command,
+                        op_doc,
+                        member_lines,
+                        errors,
+                        kind="invalid_arg",
+                        detail=extra_kind,
+                    ),
+                    state_calls=[],
+                )
+            )
+
+    if required:
+        for err in errors:
+            err_tag = _classify_service_error(err)
+            out.append(
+                _make_model_intent(
+                    command=command,
+                    command_prefix=command_prefix,
+                    op_name=op_name,
+                    kind=f"err_{_camel_to_kebab(err)}",
+                    cmdline=list(happy_cmd),
+                    expected_exit=254,
+                    behaviour_tag=err_tag,
+                    raw_source=_spec_block(
+                        op_name,
+                        command_prefix,
+                        command,
+                        op_doc,
+                        member_lines,
+                        errors,
+                        kind="service_error",
+                        detail=err,
+                    ),
+                    state_calls=[op_name],
+                    error_category=err,
+                )
+            )
+
+    out = _interleave_by_behaviour(out)
+    if max_intents:
+        out = out[:max_intents]
+    return out
+
+
+def _command_to_op(command: str, target_operations: tuple[str, ...]) -> str | None:
+    """Reverse `create-table` -> `CreateTable` by matching the target op set."""
+    for op in target_operations:
+        if _op_to_cli_name(op) == command:
+            return op
+    return None
+
+
+def _render_member_lines(model: dict, members: dict, required: list[str]) -> list[str]:
+    lines: list[str] = []
+    req_set = set(required)
+    for name, ref in members.items():
+        flag = _member_to_flag(name)
+        summary = _shape_summary(model, ref.get("shape", ""))
+        doc = _strip_doc(ref.get("documentation", ""), limit=140)
+        tag = "required" if name in req_set else "optional"
+        suffix = f" — {doc}" if doc else ""
+        lines.append(f"- `{flag}` ({name}, {tag}, {summary}){suffix}")
+    return lines
+
+
+def _spec_block(
+    op_name: str,
+    command_prefix: str,
+    command: str,
+    op_doc: str,
+    member_lines: list[str],
+    errors: list[str],
+    *,
+    kind: str,
+    detail: str = "",
+) -> str:
+    """Render a behavioural spec block (NOT test code) used as translation context."""
+    parts = [f"Operation: {op_name}  (aws {command_prefix} {command})"]
+    if op_doc:
+        parts.append("")
+        parts.append(op_doc)
+    if member_lines:
+        parts.append("")
+        parts.append("Parameters:")
+        parts.extend(member_lines)
+    if errors:
+        parts.append("")
+        parts.append("Modeled service errors: " + ", ".join(errors))
+    parts.append("")
+    if kind == "happy":
+        parts.append(
+            "This intent tests the HAPPY PATH: a valid invocation must succeed "
+            "(exit 0) and its effect must be observable via an independent read."
+        )
+    elif kind == "missing_required":
+        parts.append(
+            f"This intent tests a PARAMETER ERROR: omitting the required {detail} "
+            "option must fail (non-zero exit); assert `returncode != 0`, never an "
+            "exact code."
+        )
+    elif kind == "service_error":
+        parts.append(
+            f"This intent tests the SERVICE ERROR `{detail}`: the invocation must "
+            f"fail with `{detail}` surfaced in stderr (assert the error-code "
+            "substring, never verbatim wording)."
+        )
+    return "\n".join(parts)
+
+
+def _make_model_intent(
+    *,
+    command: str,
+    command_prefix: str,
+    op_name: str,
+    kind: str,
+    cmdline: list[str],
+    expected_exit: int,
+    behaviour_tag: Literal["happy_path", "error", "edge", "workflow"],
+    raw_source: str,
+    state_calls: list[str],
+    error_category: str | None = None,
+) -> TestIntent:
+    h = hashlib.sha256()
+    h.update(command_prefix.encode())
+    h.update(b"\0")
+    h.update(op_name.encode())
+    h.update(b"\0")
+    h.update(kind.encode())
+    return TestIntent(
+        source_file=f"{command_prefix}/service-2.json",
+        test_name=f"model_{command.replace('-', '_')}_{kind}",
+        source_method_sha256=h.hexdigest(),
+        command=command,
+        cmdline_template=cmdline,
+        expected_exit=expected_exit,
+        expected_state_calls=state_calls,
+        expected_stdout_pattern=None,
+        behaviour_tag=behaviour_tag,
+        raw_source=raw_source,
+        error_category=error_category,
+    )
+
+
+_SHAPE_TYPE_TO_PLACEHOLDER: dict[str, str] = {
+    "string": "<string>",
+    "integer": "<number>",
+    "long": "<number>",
+    "double": "<number>",
+    "float": "<number>",
+    "boolean": "<boolean>",
+    "timestamp": "<timestamp>",
+    "blob": "<blob>",
+    "list": "<json>",
+    "map": "<json>",
+    "structure": "<json>",
+}
+
+
+def _placeholder_for_shape(model: dict, shape_name: str, *, variant: int = 0) -> str:
+    shape = model.get("shapes", {}).get(shape_name, {}) if shape_name else {}
+    base = _SHAPE_TYPE_TO_PLACEHOLDER.get(shape.get("type", "string"), "<string>")
+    if variant == 0:
+        return base
+    return base.replace(">", f"_v{variant}>", 1) if base.endswith(">") else f"{base}_v{variant}"
+
+
+_HAPPY_PATH_VARIANTS_PER_CMD = 8
+
+_INVALID_ARGS_EXTRA_KINDS: tuple[str, ...] = (
+    "unknown_flag",
+    "empty_value",
+    "malformed_json",
+    "duplicate_flag",
+    "too_long_value",
+)
+
+_NONEXISTENT_ERROR_MARKERS: tuple[str, ...] = (
+    "NotFound",
+    "NotExists",
+    "Missing",
+    "Unknown",
+    "DoesNotExist",
+    "NoSuch",
+)
+
+
+def _classify_service_error(err_name: str) -> str:
+    for marker in _NONEXISTENT_ERROR_MARKERS:
+        if marker.lower() in err_name.lower():
+            return "error_nonexistent"
+    return "error_invalid_args"
+
+
+def _mutate_cmdline_for_kind(
+    model: dict,
+    members: dict,
+    required: list[str],
+    command_prefix: str,
+    command: str,
+    *,
+    kind: str,
+) -> list[str] | None:
+    base = [command_prefix, command]
+    for m in required:
+        ph = _placeholder_for_shape(model, members.get(m, {}).get("shape", ""))
+        base.extend([_member_to_flag(m), ph])
+    if kind == "unknown_flag":
+        return [*base, "--not-a-real-flag", "x"]
+    if kind == "empty_value":
+        if not required:
+            return None
+        out = [command_prefix, command]
+        for m in required:
+            ph = _placeholder_for_shape(model, members.get(m, {}).get("shape", ""))
+            if m == required[0]:
+                out.extend([_member_to_flag(m), ""])
+            else:
+                out.extend([_member_to_flag(m), ph])
+        return out
+    if kind == "malformed_json":
+        return [*base, "--attribute-definitions", "{not valid json"]
+    if kind == "duplicate_flag":
+        if not required:
+            return None
+        out = list(base)
+        first = required[0]
+        ph = _placeholder_for_shape(model, members.get(first, {}).get("shape", ""))
+        out.extend([_member_to_flag(first), ph])
+        return out
+    if kind == "too_long_value":
+        if not required:
+            return None
+        out = [command_prefix, command]
+        for m in required:
+            if m == required[0]:
+                out.extend([_member_to_flag(m), "x" * 512])
+            else:
+                ph = _placeholder_for_shape(model, members.get(m, {}).get("shape", ""))
+                out.extend([_member_to_flag(m), ph])
+        return out
+    return None

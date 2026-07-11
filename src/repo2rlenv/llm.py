@@ -135,6 +135,7 @@ class LLMResponse:
     cost_usd: float = 0.0  # cost of THIS call, in USD (best-effort)
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    finish_reason: str | None = None
 
 
 def _is_failover_eligible(exc: BaseException) -> bool:
@@ -225,6 +226,7 @@ def _do_complete(
             raise
     choice = response.choices[0]
     content = choice.message.content or ""
+    finish_reason = getattr(choice, "finish_reason", None)
 
     usage_obj = getattr(response, "usage", None)
     prompt_tokens = 0
@@ -241,6 +243,7 @@ def _do_complete(
         cost_usd=cost_usd,
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
+        finish_reason=finish_reason,
     )
 
 

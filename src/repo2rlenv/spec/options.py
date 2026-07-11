@@ -233,7 +233,7 @@ class CodeInstructOptions(_BaseOptions):
         False  # G3+G4: build image + run empty/oracle to verify discriminative
     )
     cli_app_docker_empty_pass_max: float = 0.05  # G3 reject threshold: empty stub must pass <= 5%
-    cli_app_docker_oracle_pass_min: float = 0.95  # G4 reject threshold: oracle must pass >= 95%
+    cli_app_docker_oracle_pass_min: float = 1.0  # G4 reject threshold: oracle must pass 100%
     cli_app_docker_timeout_sec: int = 240  # per-run pytest timeout inside container
     # --- cli_app subset (multi-command) tasks ---
     # When set, emit ONE task per compatible subset of commands (instead of one
@@ -243,6 +243,12 @@ class CodeInstructOptions(_BaseOptions):
     # Number of cross-command workflow tests to synthesise per subset task
     # (0 disables). Ignored for single-command tasks.
     cli_app_workflow_tests: int = 3
+    # Number of parallel LLM worker threads for per-intent test translation.
+    # Each intent is a self-contained LLM call; 1 = strictly sequential (safe
+    # default for rate-limited providers). Bumping to 4-8 gives ~4-6x wall-time
+    # speedup with the same total token spend on providers that permit
+    # concurrent requests.
+    cli_app_translate_workers: int = 1
     # --- Reference grounding (real aws-cli as ground-truth oracle) ---
     # When True, the Docker gauntlet keeps ONLY tests that BOTH the real `aws`
     # CLI AND the synthesised oracle pass, and that an empty stub fails. This
@@ -252,6 +258,11 @@ class CodeInstructOptions(_BaseOptions):
     cli_app_reference_grounding: bool = False
     # Reject a task if fewer than this many tests survive reference grounding.
     cli_app_min_grounded_tests: int = 3
+    cli_app_min_tests_final: int = 0
+    cli_app_min_happy_path: int = 0
+    cli_app_min_error_nonexistent: int = 0
+    cli_app_min_error_invalid_args: int = 0
+    cli_app_min_workflow: int = 0
     cli_app_ecr_push: bool = False
     cli_app_ecr_registry: str | None = None
     cli_app_ecr_profile: str | None = None
@@ -259,6 +270,38 @@ class CodeInstructOptions(_BaseOptions):
     # Override the app Dockerfile's BASE_IMAGE (the baked polyglot base). None =
     # the pipeline default (repo2rlenv.pipelines._cli_app_synthesis.PINNED_BASE_IMAGE).
     cli_app_base_image: str | None = None
+    # --- cli_app backend + extraction mode (S3/MinIO defaults; DynamoDB opt-in) ---
+    # Which simulation backend the emitted task boots. "minio" is the shipped S3
+    # path (byte-identical output). "dynamodb_local" swaps the conftest for an
+    # in-container DynamoDB Local JVM subprocess + a stdlib raw-HTTP test client.
+    cli_app_backend: Literal["minio", "dynamodb_local"] = "minio"
+    # How the command surface is extracted. "tests" derives commands from
+    # aws-cli `test_<cmd>_command.py` filenames (the S3 path). "botocore_model"
+    # reads the vendored `botocore/data/<service>/*/service-2.json` off disk and
+    # synthesises intents from the request/response shapes (required for
+    # `aws dynamodb`, whose verbs are model-generated, not an awscli customization).
+    cli_app_extract_mode: Literal["tests", "botocore_model"] = "tests"
+    # Absolute path escape hatch to a service-2.json (or a botocore data dir) when
+    # the extractor cannot locate the model inside the clone. None = auto-detect.
+    cli_app_service_model_override: str | None = None
+    # CamelCase operation names to lift in botocore_model mode. None = the 8
+    # default DynamoDB pilot verbs (see _cli_app_extract._DDB_TARGET_OPS_DEFAULT).
+    cli_app_target_operations: list[str] | None = None
+    # Oracle strategy. "llm" (default) = synthesise submission/main.py from the
+    # test intents via LLM (existing behaviour). "golden" = deterministically
+    # slice the real aws-cli source tree (awscli + botocore + s3transfer static
+    # import closure + service data) and ship it verbatim as the gold patch.
+    # Requires source_root (the cloned aws-cli checkout) to be threaded through.
+    cli_app_oracle: Literal["llm", "golden"] = "llm"
+    # Max output tokens for the reference-oracle LLM call. Scales with the number
+    # of commands in a subset: a single-command oracle is ~130 lines (~2k tokens);
+    # an 8-command subset can approach ~1000 lines. `max_llm_tokens` (2048) is
+    # too small even for 2 commands and truncates output mid-expression.
+    cli_app_oracle_max_tokens: int = 16000
+    # Retries on transient oracle-synth failures (SyntaxError from truncation,
+    # LLM refusal, provider hiccup). 1 = no retry (original behaviour). The
+    # LLM output cache is bypassed per attempt so we get a fresh sample.
+    cli_app_oracle_max_attempts: int = 3
 
 
 class RefactorSynthesisOptions(_BaseOptions):

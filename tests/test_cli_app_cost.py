@@ -77,7 +77,7 @@ def test_per_task_cost_is_delta_not_cumulative(monkeypatch, tmp_path: Path) -> N
     # Each LLM step bumps the shared run counter by a known amount.
     def fake_translate(pipeline, options, spec, intent):
         pipeline._llm_cost_usd += 0.10
-        return "def test_x(cli):\n    assert cli('s3', 'mb').returncode == 0\n"
+        return "def test_x(cli, s3_client):\n    assert cli('s3', 'mb', 's3://buk').returncode == 0\n    assert 'buk' in {b['Name'] for b in s3_client.list_buckets()['Buckets']}\n"
 
     def fake_oracle(pipeline, options, spec, cmd_specs, intents):
         pipeline._llm_cost_usd += 0.20
@@ -85,7 +85,7 @@ def test_per_task_cost_is_delta_not_cumulative(monkeypatch, tmp_path: Path) -> N
 
     captured = []
 
-    def fake_write(task, out_dir):
+    def fake_write(task, out_dir, **_kwargs):
         captured.append(task)
         return out_dir
 
@@ -137,7 +137,7 @@ def test_rejected_task_cost_not_folded_into_next(monkeypatch, tmp_path: Path) ->
 
     def fake_translate(pipeline, options, spec, intent):
         pipeline._llm_cost_usd += 0.10
-        return "def test_x(cli):\n    assert cli('s3', 'mb').returncode == 0\n"
+        return "def test_x(cli, s3_client):\n    assert cli('s3', 'mb', 's3://buk').returncode == 0\n    assert 'buk' in {b['Name'] for b in s3_client.list_buckets()['Buckets']}\n"
 
     # First call: spend then fail (oracle returns None -> _TaskRejected).
     # Second call: succeed.
@@ -151,7 +151,9 @@ def test_rejected_task_cost_not_folded_into_next(monkeypatch, tmp_path: Path) ->
     captured = []
     monkeypatch.setattr(S, "_translate_intent", fake_translate)
     monkeypatch.setattr(S, "_synthesise_oracle", fake_oracle)
-    monkeypatch.setattr(S, "write_harbor_task", lambda task, out: captured.append(task) or out)
+    monkeypatch.setattr(
+        S, "write_harbor_task", lambda task, out, **_kw: captured.append(task) or out
+    )
 
     opts = CodeInstructOptions(mode="cli_app", cli_app_command_prefix="s3")
     spec = _spec()
