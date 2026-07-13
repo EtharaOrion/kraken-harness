@@ -263,6 +263,7 @@ class CodeInstructOptions(_BaseOptions):
     cli_app_min_error_nonexistent: int = 0
     cli_app_min_error_invalid_args: int = 0
     cli_app_min_workflow: int = 0
+    cli_app_min_edge: int = 0
     cli_app_ecr_push: bool = False
     cli_app_ecr_registry: str | None = None
     cli_app_ecr_profile: str | None = None

@@ -930,6 +930,17 @@ def synthesize_intents_from_model(
                 )
             )
 
+    out.extend(
+        _edge_intents_for_op(
+            op_name=op_name,
+            command_prefix=command_prefix,
+            command=command,
+            op_doc=op_doc,
+            member_lines=member_lines,
+            errors=errors,
+        )
+    )
+
     out = _interleave_by_behaviour(out)
     if max_intents:
         out = out[:max_intents]
@@ -998,6 +1009,13 @@ def _spec_block(
             f"fail with `{detail}` surfaced in stderr (assert the error-code "
             "substring, never verbatim wording)."
         )
+    elif kind == "edge":
+        parts.append(
+            "This intent tests a DDB-SEMANTIC EDGE CASE: "
+            + detail
+            + " Prefer asserting observable state via an independent read "
+            "over inspecting stdout wording."
+        )
     return "\n".join(parts)
 
 
@@ -1009,7 +1027,14 @@ def _make_model_intent(
     kind: str,
     cmdline: list[str],
     expected_exit: int,
-    behaviour_tag: Literal["happy_path", "error", "edge", "workflow"],
+    behaviour_tag: Literal[
+        "happy_path",
+        "error",
+        "error_nonexistent",
+        "error_invalid_args",
+        "edge",
+        "workflow",
+    ],
     raw_source: str,
     state_calls: list[str],
     error_category: str | None = None,
@@ -1083,6 +1108,327 @@ def _classify_service_error(err_name: str) -> str:
         if marker.lower() in err_name.lower():
             return "error_nonexistent"
     return "error_invalid_args"
+
+
+@dataclass(slots=True, frozen=True)
+class _EdgeSpec:
+    kind: str
+    argv_tail: tuple[str, ...]
+    expected_exit: int
+    description: str
+    state_calls: tuple[str, ...] = ()
+
+
+_TN = "<string>"
+
+_EDGE_CASES_BY_OP: dict[str, tuple[_EdgeSpec, ...]] = {
+    "CreateTable": (
+        _EdgeSpec(
+            kind="edge_composite_key",
+            argv_tail=(
+                "--table-name",
+                _TN,
+                "--attribute-definitions",
+                "AttributeName=pk,AttributeType=S AttributeName=sk,AttributeType=N",
+                "--key-schema",
+                "AttributeName=pk,KeyType=HASH AttributeName=sk,KeyType=RANGE",
+                "--billing-mode",
+                "PAY_PER_REQUEST",
+            ),
+            expected_exit=0,
+            description=(
+                "creates a table with a COMPOSITE PRIMARY KEY (HASH partition key "
+                "`pk` + RANGE sort key `sk`). The described KeySchema must contain "
+                "both entries in HASH,RANGE order."
+            ),
+            state_calls=("CreateTable", "DescribeTable"),
+        ),
+        _EdgeSpec(
+            kind="edge_provisioned_throughput",
+            argv_tail=(
+                "--table-name",
+                _TN,
+                "--attribute-definitions",
+                "AttributeName=id,AttributeType=S",
+                "--key-schema",
+                "AttributeName=id,KeyType=HASH",
+                "--billing-mode",
+                "PROVISIONED",
+                "--provisioned-throughput",
+                "ReadCapacityUnits=5,WriteCapacityUnits=5",
+            ),
+            expected_exit=0,
+            description=(
+                "creates a table with `BillingMode=PROVISIONED` and explicit "
+                "ReadCapacityUnits=5 / WriteCapacityUnits=5. DescribeTable must "
+                "surface BillingModeSummary.BillingMode == 'PROVISIONED' and the "
+                "declared throughput."
+            ),
+            state_calls=("CreateTable", "DescribeTable"),
+        ),
+    ),
+    "PutItem": (
+        _EdgeSpec(
+            kind="edge_multi_type_item",
+            argv_tail=(
+                "--table-name",
+                _TN,
+                "--item",
+                '{"id":{"S":"k1"},"count":{"N":"42"},"live":{"BOOL":true},"tags":{"L":[{"S":"a"},{"S":"b"}]}}',
+            ),
+            expected_exit=0,
+            description=(
+                "puts an item with heterogeneous attribute types (S, N, BOOL, L). "
+                "A follow-up GetItem must round-trip every attribute with its "
+                "declared type marker intact."
+            ),
+            state_calls=("PutItem", "GetItem"),
+        ),
+        _EdgeSpec(
+            kind="edge_condition_attribute_not_exists",
+            argv_tail=(
+                "--table-name",
+                _TN,
+                "--item",
+                '{"id":{"S":"k1"},"v":{"S":"first"}}',
+                "--condition-expression",
+                "attribute_not_exists(id)",
+            ),
+            expected_exit=0,
+            description=(
+                "puts an item guarded by `attribute_not_exists(id)`. On a fresh "
+                "table the write MUST succeed. A second PutItem with the same "
+                "condition MUST fail with ConditionalCheckFailedException — but "
+                "this intent only asserts the first (successful) branch."
+            ),
+            state_calls=("PutItem", "GetItem"),
+        ),
+    ),
+    "GetItem": (
+        _EdgeSpec(
+            kind="edge_missing_item_empty_response",
+            argv_tail=(
+                "--table-name",
+                _TN,
+                "--key",
+                '{"id":{"S":"does-not-exist"}}',
+            ),
+            expected_exit=0,
+            description=(
+                "GetItem for a key that was never written returns exit 0 with NO "
+                "`Item` key in the response payload (DDB semantics: absence is not "
+                "an error). Assert either the absence of `Item` in the parsed "
+                "stdout JSON, or an empty dict returned."
+            ),
+            state_calls=("GetItem",),
+        ),
+        _EdgeSpec(
+            kind="edge_consistent_read",
+            argv_tail=(
+                "--table-name",
+                _TN,
+                "--key",
+                '{"id":{"S":"k1"}}',
+                "--consistent-read",
+            ),
+            expected_exit=0,
+            description=(
+                "GetItem with strongly-consistent read (`--consistent-read` sets "
+                "ConsistentRead=true). After a preceding PutItem, the value must "
+                "be retrievable in the same call."
+            ),
+            state_calls=("PutItem", "GetItem"),
+        ),
+    ),
+    "DeleteItem": (
+        _EdgeSpec(
+            kind="edge_missing_item_idempotent",
+            argv_tail=(
+                "--table-name",
+                _TN,
+                "--key",
+                '{"id":{"S":"never-existed"}}',
+            ),
+            expected_exit=0,
+            description=(
+                "DeleteItem on a key that was never written returns exit 0 (DDB "
+                "is idempotent for delete). No `Attributes` field is expected in "
+                "the response payload."
+            ),
+            state_calls=("DeleteItem",),
+        ),
+        _EdgeSpec(
+            kind="edge_condition_attribute_exists_fails",
+            argv_tail=(
+                "--table-name",
+                _TN,
+                "--key",
+                '{"id":{"S":"never-existed"}}',
+                "--condition-expression",
+                "attribute_exists(id)",
+            ),
+            expected_exit=254,
+            description=(
+                "DeleteItem guarded by `attribute_exists(id)` against a missing "
+                "key MUST fail with ConditionalCheckFailedException (CLI exit "
+                "254). Assert the error code substring in stderr; state must be "
+                "unchanged."
+            ),
+            state_calls=("DeleteItem",),
+        ),
+    ),
+    "UpdateItem": (
+        _EdgeSpec(
+            kind="edge_set_expression",
+            argv_tail=(
+                "--table-name",
+                _TN,
+                "--key",
+                '{"id":{"S":"k1"}}',
+                "--update-expression",
+                "SET v = :v",
+                "--expression-attribute-values",
+                '{":v":{"S":"updated"}}',
+            ),
+            expected_exit=0,
+            description=(
+                "UpdateItem with `SET v = :v` on an existing item overwrites the "
+                "attribute. A follow-up GetItem must show v == {'S':'updated'}."
+            ),
+            state_calls=("PutItem", "UpdateItem", "GetItem"),
+        ),
+        _EdgeSpec(
+            kind="edge_add_increment",
+            argv_tail=(
+                "--table-name",
+                _TN,
+                "--key",
+                '{"id":{"S":"k1"}}',
+                "--update-expression",
+                "ADD c :inc",
+                "--expression-attribute-values",
+                '{":inc":{"N":"1"}}',
+            ),
+            expected_exit=0,
+            description=(
+                "UpdateItem with `ADD c :inc` on an item whose `c` starts at 0 "
+                "MUST leave `c == {'N':'1'}` (or increment an existing value by "
+                "1). GetItem verifies."
+            ),
+            state_calls=("PutItem", "UpdateItem", "GetItem"),
+        ),
+    ),
+    "Query": (
+        _EdgeSpec(
+            kind="edge_key_condition_equals",
+            argv_tail=(
+                "--table-name",
+                _TN,
+                "--key-condition-expression",
+                "id = :pk",
+                "--expression-attribute-values",
+                '{":pk":{"S":"k1"}}',
+            ),
+            expected_exit=0,
+            description=(
+                "Query with `KeyConditionExpression = id = :pk` against a table "
+                "seeded with one matching item returns Count=1 and Items[0] "
+                "matches. The `--expression-attribute-values` JSON binds :pk."
+            ),
+            state_calls=("PutItem", "Query"),
+        ),
+        _EdgeSpec(
+            kind="edge_limit_one",
+            argv_tail=(
+                "--table-name",
+                _TN,
+                "--key-condition-expression",
+                "id = :pk",
+                "--expression-attribute-values",
+                '{":pk":{"S":"k1"}}',
+                "--limit",
+                "1",
+            ),
+            expected_exit=0,
+            description=(
+                "Query with `--limit 1` against a table with multiple matching "
+                "items returns exactly one Item and `Count == 1`. Do NOT assert "
+                "LastEvaluatedKey presence (DDB Local sometimes omits it)."
+            ),
+            state_calls=("PutItem", "Query"),
+        ),
+    ),
+    "ListTables": (
+        _EdgeSpec(
+            kind="edge_limit_one",
+            argv_tail=(
+                "--limit",
+                "1",
+            ),
+            expected_exit=0,
+            description=(
+                "ListTables with `--limit 1` returns at most one entry in "
+                "TableNames. When more than one table exists the response MAY "
+                "include LastEvaluatedTableName — assert only the length bound."
+            ),
+            state_calls=("CreateTable", "ListTables"),
+        ),
+    ),
+    "DeleteTable": (
+        _EdgeSpec(
+            kind="edge_delete_then_describe",
+            argv_tail=(
+                "--table-name",
+                _TN,
+            ),
+            expected_exit=0,
+            description=(
+                "DeleteTable succeeds (exit 0). A follow-up DescribeTable on the "
+                "same name MUST surface `ResourceNotFoundException`. This intent "
+                "asserts the delete succeeded; the follow-up assertion belongs "
+                "in the test body."
+            ),
+            state_calls=("CreateTable", "DeleteTable", "DescribeTable"),
+        ),
+    ),
+}
+
+
+def _edge_intents_for_op(
+    op_name: str,
+    command_prefix: str,
+    command: str,
+    op_doc: str,
+    member_lines: list[str],
+    errors: list[str],
+) -> list[TestIntent]:
+    """Hand-authored DDB-semantic edges from _EDGE_CASES_BY_OP; unlike the rest of this module these are NOT derived from the botocore model."""
+    specs = _EDGE_CASES_BY_OP.get(op_name, ())
+    out: list[TestIntent] = []
+    for spec in specs:
+        out.append(
+            _make_model_intent(
+                command=command,
+                command_prefix=command_prefix,
+                op_name=op_name,
+                kind=spec.kind,
+                cmdline=[command_prefix, command, *spec.argv_tail],
+                expected_exit=spec.expected_exit,
+                behaviour_tag="edge",
+                raw_source=_spec_block(
+                    op_name,
+                    command_prefix,
+                    command,
+                    op_doc,
+                    member_lines,
+                    errors,
+                    kind="edge",
+                    detail=spec.description,
+                ),
+                state_calls=list(spec.state_calls),
+            )
+        )
+    return out
 
 
 def _mutate_cmdline_for_kind(

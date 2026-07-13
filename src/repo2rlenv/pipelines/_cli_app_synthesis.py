@@ -1369,6 +1369,7 @@ def _build_cliapp_repo2env(
     intents: list[TestIntent],
     translated: list[str],
     test_files: dict[str, str],
+    test_file_tags: dict[str, str],
     content_hash: str,
     reference_grounding: dict | None,
     gauntlet_g34: dict | None,
@@ -1399,7 +1400,7 @@ def _build_cliapp_repo2env(
             "tests_translated": len(translated),
             "tests_in_task": len(test_files),
             "simulation_backend": "dynamodb_local" if is_ddb else "minio",
-            "python_version": "3.11",
+            "python_version": "3.12",
             "entry_point": "submission/main.py",
             "pinned_deps": list(PINNED_DEPS_DDB if is_ddb else PINNED_DEPS),
             "runtime_cpus": 1.0,
@@ -1409,8 +1410,10 @@ def _build_cliapp_repo2env(
             "llm_cost_usd": round(pipeline._llm_cost_usd - llm_cost_before, 6),
             "run_llm_cost_usd": round(pipeline._llm_cost_usd, 6),
             "llm_cost_method": "litellm_native",
-            "behaviour_tags": sorted({i.behaviour_tag for i in intents}),
-            "behaviour_tag_counts": _count_behaviour_tags(intents),
+            "behaviour_tags": sorted(
+                {_bucket_of(f, test_file_tags.get(f)) for f in test_files}
+            ),
+            "behaviour_tag_counts": _shipped_bucket_counts(test_files, test_file_tags),
             "tests_shipped": len(test_files),
             "discriminative": True,
         },
@@ -1418,10 +1421,6 @@ def _build_cliapp_repo2env(
     if is_subset:
         repo2env["code_instruct"]["commands"] = sorted(cmd_names)
         repo2env["code_instruct"]["subset"] = True
-        # count workflow tests that actually shipped (post static gauntlet)
-        repo2env["code_instruct"]["workflow_tests"] = sum(
-            1 for f in test_files if "_workflow_" in f
-        )
     if reference_grounding is not None and not reference_grounding.get("skipped"):
         repo2env["code_instruct"]["reference_grounding"] = {
             "reference": "aws-cli",
@@ -1549,12 +1548,17 @@ def _build_one_task(
     extra_tests_aux: dict[str, str] = {}
     if options.cli_app_backend == "dynamodb_local":
         extra_tests_aux["tests/_ddb_http.py"] = _DDB_HTTP_HELPER
+    def _test_filename(intent: TestIntent, i: int) -> str:
+        cmd_slug_i = (getattr(intent, "command", None) or "unknown").replace("_", "-")
+        tag_slug = (intent.behaviour_tag or "unknown").replace("_", "-")
+        return f"test_{spec.command_prefix}_{cmd_slug_i}_{tag_slug}_{i:02d}.py"
+
     test_files = {
-        f"test_{spec.command_prefix}_{id_slug}_{i:02d}.py": code
+        _test_filename(translated_intents[i], i): code
         for i, code in enumerate(translated)
     }
     test_file_tags = {
-        f"test_{spec.command_prefix}_{id_slug}_{i:02d}.py": translated_intents[i].behaviour_tag
+        _test_filename(translated_intents[i], i): translated_intents[i].behaviour_tag
         for i in range(len(translated))
     }
     # ----- Cross-command workflow tests (subset tasks only) -----
@@ -1696,6 +1700,7 @@ def _build_one_task(
         intents=intents,
         translated=translated,
         test_files=test_files,
+        test_file_tags=test_file_tags,
         content_hash=content_hash,
         reference_grounding=reference_grounding,
         gauntlet_g34=gauntlet_g34,
@@ -1769,9 +1774,21 @@ def _bucket_of(filename: str, tag: str | None) -> str:
         return "error_nonexistent"
     if tag == "error_invalid_args":
         return "error_invalid_args"
+    if tag == "edge":
+        return "edge"
     if tag == "error":
         return "error_generic"
     return tag or "unknown"
+
+
+def _shipped_bucket_counts(
+    test_files: dict[str, str], test_file_tags: dict[str, str]
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for fname in test_files:
+        b = _bucket_of(fname, test_file_tags.get(fname))
+        counts[b] = counts.get(b, 0) + 1
+    return counts
 
 
 def _enforce_final_test_quotas(
@@ -1787,6 +1804,7 @@ def _enforce_final_test_quotas(
         "error_nonexistent": options.cli_app_min_error_nonexistent,
         "error_invalid_args": options.cli_app_min_error_invalid_args,
         "workflow": options.cli_app_min_workflow,
+        "edge": options.cli_app_min_edge,
     }
     if not any(quotas.values()):
         return
@@ -1994,6 +2012,8 @@ def _synthesise_workflow_tests(
     shapes: list[str] = []
     seen: set[str] = set()
     for intent in intents:
+        if intent.behaviour_tag != "happy_path":
+            continue
         shape = _argv_shape(intent.cmdline_template)
         if shape and shape not in seen:
             seen.add(shape)
@@ -2011,48 +2031,72 @@ def _synthesise_workflow_tests(
         argv_shapes_bulleted=argv_shapes_bulleted,
         n_workflows=n_workflows,
     )
-    # Retry with 2x max_tokens on length-truncated responses — LLMs cut off
-    # mid-token (e.g. `assert` -> `ass`) but ast.parse accepts the residue.
-    max_tokens = options.max_llm_tokens
-    resp = None
-    for attempt in range(1, 4):
-        try:
-            resp = complete(
-                pipeline._llm,
-                system=system,
-                user=user,
-                max_tokens=max_tokens,
-                temperature=options.llm_temperature,
-            )
-        except Exception as exc:
-            logger.warning("workflow-test synthesis failed for subset=%s: %s", subset_names, exc)
-            return []
-        pipeline._llm_cost_usd += resp.cost_usd
-        if resp.finish_reason != "length":
-            break
-        if attempt < 3:
+    # Outer loop retries when the split yields fewer than the bucket target;
+    # inner loop doubles max_tokens on `finish_reason=length`. Both matter:
+    # the failure modes (parse-drop vs truncation) are distinct and neither
+    # retry subsumes the other. Target aims above cli_app_min_workflow so the
+    # downstream gauntlet has headroom to drop broken tests without pushing
+    # the bucket below its floor.
+    min_workflow = options.cli_app_min_workflow
+    target = max(min_workflow + 3, int(min_workflow * 1.5)) if min_workflow else 1
+    max_parse_attempts = 3
+    best_results: list[str] = []
+    for parse_attempt in range(1, max_parse_attempts + 1):
+        max_tokens = options.max_llm_tokens
+        resp = None
+        for attempt in range(1, 4):
+            try:
+                resp = complete(
+                    pipeline._llm,
+                    system=system,
+                    user=user,
+                    max_tokens=max_tokens,
+                    temperature=options.llm_temperature,
+                )
+            except Exception as exc:
+                logger.warning("workflow-test synthesis failed for subset=%s: %s", subset_names, exc)
+                return best_results
+            pipeline._llm_cost_usd += resp.cost_usd
+            if resp.finish_reason != "length":
+                break
+            if attempt < 3:
+                logger.warning(
+                    "workflow-test synthesis truncated (finish_reason=length) for subset=%s at "
+                    "max_tokens=%d; retrying with %d",
+                    subset_names,
+                    max_tokens,
+                    max_tokens * 2,
+                )
+                max_tokens *= 2
+            else:
+                logger.warning(
+                    "workflow-test synthesis still truncated after %d attempts for subset=%s; "
+                    "safety net in _split_workflow_functions will drop broken tests",
+                    attempt,
+                    subset_names,
+                )
+        code = _strip_code_fence(resp.content)
+        results = _split_workflow_functions(
+            code,
+            allowed_commands=set(subset_names),
+            prefix=spec.command_prefix,
+            preamble=_WF_IMPORT_PREAMBLE_DDB if is_ddb else _WF_IMPORT_PREAMBLE,
+        )
+        if len(results) > len(best_results):
+            best_results = results
+        if len(results) >= target:
+            return results
+        if parse_attempt < max_parse_attempts:
             logger.warning(
-                "workflow-test synthesis truncated (finish_reason=length) for subset=%s at "
-                "max_tokens=%d; retrying with %d",
+                "workflow-test synthesis yielded %d usable tests for subset=%s "
+                "(need %d for gauntlet headroom; parse attempt %d/%d); retrying",
+                len(results),
                 subset_names,
-                max_tokens,
-                max_tokens * 2,
+                target,
+                parse_attempt,
+                max_parse_attempts,
             )
-            max_tokens *= 2
-        else:
-            logger.warning(
-                "workflow-test synthesis still truncated after %d attempts for subset=%s; "
-                "safety net in _split_workflow_functions will drop broken tests",
-                attempt,
-                subset_names,
-            )
-    code = _strip_code_fence(resp.content)
-    return _split_workflow_functions(
-        code,
-        allowed_commands=set(subset_names),
-        prefix=spec.command_prefix,
-        preamble=_WF_IMPORT_PREAMBLE_DDB if is_ddb else _WF_IMPORT_PREAMBLE,
-    )
+    return best_results
 
 
 def _split_workflow_functions(
@@ -2069,7 +2113,24 @@ def _split_workflow_functions(
     try:
         tree = ast.parse(code)
     except SyntaxError as exc:
-        logger.warning("workflow-test synthesis returned invalid Python: %s", exc)
+        try:
+            import os as _os
+            import tempfile as _tempfile
+            dump_dir = _os.environ.get("R2E_WORKFLOW_DUMP_DIR") or _tempfile.gettempdir()
+            _os.makedirs(dump_dir, exist_ok=True)
+            fd, path = _tempfile.mkstemp(prefix="workflow-fail-", suffix=".py", dir=dump_dir)
+            with _os.fdopen(fd, "w") as _f:
+                _f.write(code)
+            lines = code.splitlines()
+            lo = max(0, (exc.lineno or 1) - 4)
+            hi = min(len(lines), (exc.lineno or 1) + 3)
+            snippet = "\n".join(f"{i+1:4d}: {lines[i]}" for i in range(lo, hi))
+            logger.warning(
+                "workflow-test synthesis returned invalid Python: %s (dumped to %s)\n%s",
+                exc, path, snippet,
+            )
+        except OSError:
+            logger.warning("workflow-test synthesis returned invalid Python: %s", exc)
         return []
     # Preserve the LLM's module-level imports (e.g. `import uuid`, `import os`)
     # so each split-out function module is self-contained — otherwise a
@@ -2765,8 +2826,9 @@ class DDBClient:
         for name in self.list_tables().get("TableNames", []):
             try:
                 self.delete_table(name)
-            except DDBHTTPError:
-                pass
+            except DDBHTTPError as exc:
+                if exc.response.get("Error", {}).get("Code", "") != "ResourceNotFoundException":
+                    raise
 '''
 
 
@@ -2792,6 +2854,9 @@ def _build_conftest_ddb(*, golden: bool = False) -> str:
         '"/workspace/submission/aws"'
         if golden
         else 'sys.executable, "/workspace/submission/main.py"'
+    )
+    cli_check_path = (
+        "/workspace/submission/aws" if golden else "/workspace/submission/main.py"
     )
     template = '''"""Session-scoped DynamoDB Local (compose sidecar) client + drop-all-tables reset
 between tests. The engine is reached via AWS_ENDPOINT_URL_DYNAMODB, wired by
@@ -2846,11 +2911,10 @@ from _ddb_http import DDBClient, DDBHTTPError  # noqa: E402
 
 
 def pytest_configure(config):
-    import shutil
-    if shutil.which("aws") is None:
+    if not os.path.exists("__CLI_CHECK_PATH__"):
         pytest.exit(
-            "Anti-NOP guard FAILED: no `aws` executable on $PATH "
-            "(no submission to evaluate). Reward=0.",
+            "Anti-NOP guard FAILED: submission entrypoint __CLI_CHECK_PATH__ "
+            "not found (no submission to evaluate). Reward=0.",
             returncode=1,
         )
 
@@ -2909,8 +2973,10 @@ def cli(_ddb_server):
 
     return _run
 '''
-    return template.replace("__BLOCKED_SUFFIXES__", suffixes_literal).replace(
-        "__CLI_PREFIX__", cli_prefix
+    return (
+        template.replace("__BLOCKED_SUFFIXES__", suffixes_literal)
+        .replace("__CLI_PREFIX__", cli_prefix)
+        .replace("__CLI_CHECK_PATH__", cli_check_path)
     )
 
 
@@ -3562,8 +3628,13 @@ _INTERNAL_MUTATION_KINDS: frozenset[str] = frozenset(
 
 
 def _is_internal_mutation_intent(intent: TestIntent) -> bool:
-    kind = getattr(intent, "kind", "") or ""
-    return kind in _INTERNAL_MUTATION_KINDS or kind.startswith("missing_")
+    tn = intent.test_name or ""
+    if not tn.startswith("model_"):
+        return False
+    for k in _INTERNAL_MUTATION_KINDS:
+        if tn.endswith("_" + k):
+            return True
+    return "_missing_" in tn
 
 
 def _command_section_parts(
@@ -3588,9 +3659,20 @@ def _command_section_parts(
         parts.extend(shapes)
         parts.append("")
 
-    flags = _extract_flags_from_intents(intents)
-    if flags:
-        parts.append("Flags observed: " + ", ".join(f"`{f}`" for f in sorted(flags)) + "\n")
+    non_mutation_intents = [i for i in intents if not _is_internal_mutation_intent(i)]
+    observed_flags = set(_extract_flags_from_intents(non_mutation_intents))
+    documented_flags = set(cmd_spec.flags or [])
+    if documented_flags:
+        parts.append(
+            "Documented flags: "
+            + ", ".join(f"`{f}`" for f in sorted(documented_flags))
+            + "\n"
+        )
+    flags_union = observed_flags | documented_flags
+    if flags_union:
+        parts.append(
+            "Flags observed: " + ", ".join(f"`{f}`" for f in sorted(flags_union)) + "\n"
+        )
 
     state_model = _COMMAND_STATE_MODEL.get((prefix, cmd_spec.name))
     if state_model:
@@ -3601,11 +3683,15 @@ def _command_section_parts(
     error_intents: list[TestIntent] = []
     for tag in ("error", "error_nonexistent", "error_invalid_args"):
         error_intents.extend(by_tag.get(tag, []))
-    error_intents = [i for i in error_intents if not _is_internal_mutation_intent(i)]
     if error_intents:
         parts.append("Error cases:")
+        seen_errors: set[tuple[str, int]] = set()
         for intent in error_intents:
             shape = _argv_shape(intent.cmdline_template) or "<argv>"
+            key = (shape, intent.expected_exit)
+            if key in seen_errors:
+                continue
+            seen_errors.add(key)
             parts.append(f"- `{shape}` -> exit `{intent.expected_exit}`")
         parts.append("")
     return parts
@@ -4029,17 +4115,52 @@ def _compute_content_hash(
     return f"sha256:{h.hexdigest()}"
 
 
+_FENCE_LINE_RE = re.compile(r"^\s*```[a-zA-Z0-9_+.-]*\s*$")
+
+
+def _strip_trailing_bare_names(code: str) -> str:
+    """Drop trailing module-level bare-Name/Attribute expressions (LLM stop-sentinel leaks
+    like `endTurn`, `endTool`). ast.parse() accepts them as valid syntax so compile() will
+    not catch them, but they NameError at pytest collect time and cascade-fail the whole
+    reference_grounding batch (one poisoned file → 0 tests collected). Loops so the
+    stripper handles multiple trailing sentinels."""
+    while True:
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return code
+        if not tree.body:
+            return code
+        tail = tree.body[-1]
+        if not isinstance(tail, ast.Expr):
+            return code
+        val = tail.value
+        if not isinstance(val, ast.Name | ast.Attribute):
+            return code
+        end_lineno = getattr(tail, "end_lineno", tail.lineno) or tail.lineno
+        lines = code.splitlines()
+        del lines[tail.lineno - 1 : end_lineno]
+        code = "\n".join(lines).rstrip() + "\n"
+
+
 def _strip_code_fence(text: str) -> str:
-    """Strip surrounding markdown code fences if present."""
+    """Extract Python from an LLM response; handles raw, single-fenced, and multi-block responses."""
     s = text.strip()
-    if s.startswith("```"):
-        # remove first line (```python or ```)
-        first_newline = s.find("\n")
-        if first_newline > 0:
-            s = s[first_newline + 1 :]
-        if s.endswith("```"):
-            s = s[:-3]
-    return s.strip() + "\n"
+    lines = s.splitlines()
+    fence_indices = [i for i, ln in enumerate(lines) if _FENCE_LINE_RE.match(ln)]
+    if not fence_indices:
+        return _strip_trailing_bare_names(s + "\n")
+    extracted: list[str] = []
+    in_block = False
+    for ln in lines:
+        if _FENCE_LINE_RE.match(ln):
+            in_block = not in_block
+            continue
+        if in_block:
+            extracted.append(ln)
+    if not extracted:
+        extracted = [ln for ln in lines if not _FENCE_LINE_RE.match(ln)]
+    return _strip_trailing_bare_names("\n".join(extracted).strip() + "\n")
 
 
 def _translation_model_id(pipeline: CodeInstructPipeline, options: CodeInstructOptions) -> str:
