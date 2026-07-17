@@ -5,8 +5,13 @@ import json
 import pytest
 
 from repo2rlenv.pipelines._cli_app_slice import (
+    _GENERATED_HANDLERS_DDB,
+    _GENERATED_HANDLERS_S3,
     SliceError,
     _assert_ddb_slice_closed,
+    _service_data_dirs,
+    _service_endpoints_keep,
+    _service_handlers_src,
     _slice_dynamodb_data,
     _verb_to_operation,
 )
@@ -159,3 +164,15 @@ def test_assert_ddb_slice_closed_detects_missing_shape():
     }
     with pytest.raises(SliceError, match="closure incomplete"):
         _assert_ddb_slice_closed(operations, shapes)
+
+
+def test_service_config_curated_and_derived_generic() -> None:
+    assert _service_data_dirs("dynamodb") == ("dynamodb",)
+    assert _service_data_dirs("s3") == ("s3", "sts")
+    assert _service_endpoints_keep("dynamodb") == frozenset({"dynamodb"})
+    assert _service_handlers_src("s3") == _GENERATED_HANDLERS_S3
+
+    assert _service_data_dirs("secretsmanager") == ("secretsmanager", "sts")
+    assert _service_endpoints_keep("ssm") == frozenset({"ssm", "sts"})
+    assert _service_handlers_src("dynamodb") == _GENERATED_HANDLERS_DDB
+    assert _service_handlers_src("secretsmanager") == _GENERATED_HANDLERS_DDB

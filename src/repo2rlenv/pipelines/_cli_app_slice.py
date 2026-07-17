@@ -57,6 +57,10 @@ _TREE_TOPS = {"awscli", "botocore", "s3transfer"}
 _SERVICE_DATA_DIRS: dict[str, tuple[str, ...]] = {
     "s3": ("s3", "sts"),
     "dynamodb": ("dynamodb",),
+    "kinesis": ("kinesis", "sts"),
+    "kms": ("kms", "sts"),
+    "sqs": ("sqs", "sts"),
+    "cognito-idp": ("cognito-idp", "sts"),
 }
 
 _DATA_TOP_FILES = ("endpoints.json", "partitions.json")
@@ -64,6 +68,10 @@ _DATA_TOP_FILES = ("endpoints.json", "partitions.json")
 _SERVICE_ENDPOINTS_KEEP: dict[str, frozenset[str]] = {
     "s3": frozenset({"s3", "sts"}),
     "dynamodb": frozenset({"dynamodb"}),
+    "kinesis": frozenset({"kinesis", "sts"}),
+    "kms": frozenset({"kms", "sts"}),
+    "sqs": frozenset({"sqs", "sts"}),
+    "cognito-idp": frozenset({"cognito-idp", "sts"}),
 }
 
 
@@ -211,7 +219,32 @@ def awscli_initialize(event_handlers):
 _SERVICE_HANDLERS: dict[str, str] = {
     "s3": _GENERATED_HANDLERS_S3,
     "dynamodb": _GENERATED_HANDLERS_DDB,
+    "kinesis": _GENERATED_HANDLERS_DDB,
+    "kms": _GENERATED_HANDLERS_DDB,
+    "sqs": _GENERATED_HANDLERS_DDB,
+    "cognito-idp": _GENERATED_HANDLERS_DDB,
 }
+
+
+# Generic per-service resolution: the maps above are curated for shipped services; any
+# other model service derives its config, so adding an `aws <service>` needs no edit here.
+# Model services reuse the DynamoDB handler set (generic builtins only); only s3 differs.
+
+
+def _service_data_dirs(service: str) -> tuple[str, ...]:
+    """Botocore ``data/`` dirs to keep for ``service`` (curated, else ``(service, "sts")``)."""
+    return _SERVICE_DATA_DIRS.get(service, (service, "sts"))
+
+
+def _service_endpoints_keep(service: str) -> frozenset[str]:
+    """endpoints.json services to retain for ``service`` (curated, else ``{service, "sts"}``)."""
+    return _SERVICE_ENDPOINTS_KEEP.get(service, frozenset({service, "sts"}))
+
+
+def _service_handlers_src(service: str) -> str:
+    """Generated ``handlers.py`` body for ``service``. S3 has a bespoke set; every other
+    model service shares the DynamoDB handler set (generic builtins only)."""
+    return _SERVICE_HANDLERS.get(service, _GENERATED_HANDLERS_DDB)
 
 
 # GENERATED replacement for upstream ``awscli/handlers_registry.py``.
@@ -278,6 +311,7 @@ class _StubHelpCommand:
         )
 
 
+HelpCommand = _StubHelpCommand
 OperationHelpCommand = _StubHelpCommand
 ProviderHelpCommand = _StubHelpCommand
 ServiceHelpCommand = _StubHelpCommand
@@ -860,7 +894,7 @@ def _compute_closure(
     overrides = overrides or {}
     closure: set[Path] = set()
     worklist: list[tuple[str, list[str]]] = []
-    handlers_src = _SERVICE_HANDLERS[service]
+    handlers_src = _service_handlers_src(service)
 
     def _read(path: Path) -> str:
         ov = overrides.get(path)
@@ -915,6 +949,106 @@ def _compute_closure(
             closure.add(fpath)
             _seed(_read(fpath), _pkg_parts_for(awscli_root, fpath))
     return closure
+
+
+def _closure_dotted_modules(awscli_root: Path, closure: set[Path]) -> set[str]:
+    """Dotted module names (e.g. ``awscli.customizations.binaryformat``) for every
+    ``.py`` file in the import closure, so handler-registry entries can be filtered to
+    modules the slice actually ships."""
+    base = awscli_root.parent
+    mods: set[str] = set()
+    for p in closure:
+        if p.suffix != ".py":
+            continue
+        try:
+            parts = list(p.relative_to(base).with_suffix("").parts)
+        except ValueError:
+            continue
+        if parts and parts[-1] == "__init__":
+            parts = parts[:-1]
+        if parts:
+            mods.add(".".join(parts))
+    return mods
+
+
+def _filter_handlers_registry(
+    registry_src: str,
+    closure_modules: set[str],
+    service_command_names: set[str],
+) -> str:
+    """Filter aws-cli's 2.35+ ``handlers_registry.py`` to the builtins the slice ships.
+
+    On aws-cli >= 2.35 the builtin event handlers -- including
+    ``register_init_binary_formatter``, which wires ``cli_binary_format`` for blob
+    params like ``--ciphertext-blob`` / ``--plaintext`` -- are registered ONLY through
+    this module's ``PLUGIN_REGISTRY`` (``handlers.py`` no longer runs). Shipping an empty
+    registry drops every builtin hook and breaks blob commands (``kms encrypt`` /
+    ``decrypt`` -> ``InvalidCiphertextException``). Keep entries whose module is in the
+    import closure; drop absent-service entries (which would ``ModuleNotFoundError`` at
+    driver init). ``MAIN_COMMAND_TABLE_OPS`` is filtered the same way: an ADD survives
+    when its module is present, a RENAME only when its source command survives.
+    """
+    tree = ast.parse(registry_src)
+
+    def _module_ok(node: ast.expr) -> bool:
+        return isinstance(node, ast.Constant) and node.value in closure_modules
+
+    def _op_name(el: ast.expr) -> str | None:
+        if isinstance(el, ast.Tuple) and el.elts and isinstance(el.elts[0], ast.Attribute):
+            return el.elts[0].attr
+        return None
+
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+            tgt: ast.expr | None = stmt.targets[0]
+        elif isinstance(stmt, ast.AnnAssign):
+            tgt = stmt.target
+        else:
+            tgt = None
+        name = getattr(tgt, "id", None)
+
+        if name == "PLUGIN_REGISTRY" and isinstance(stmt.value, ast.Dict):
+            keys: list[ast.expr | None] = []
+            values: list[ast.expr] = []
+            for key, val in zip(stmt.value.keys, stmt.value.values, strict=True):
+                if not isinstance(val, ast.List):
+                    continue
+                kept = [
+                    el
+                    for el in val.elts
+                    if isinstance(el, ast.Tuple) and el.elts and _module_ok(el.elts[0])
+                ]
+                if kept:
+                    keys.append(key)
+                    values.append(ast.List(elts=kept, ctx=ast.Load()))
+            stmt.value.keys = keys
+            stmt.value.values = values
+
+        elif name == "MAIN_COMMAND_TABLE_OPS" and isinstance(stmt.value, ast.List):
+            kept_add_names: set[str] = set()
+            keep: list[ast.expr] = []
+            for el in stmt.value.elts:
+                if _op_name(el) == "ADD" and len(el.elts) >= 3 and _module_ok(el.elts[2]):
+                    keep.append(el)
+                    if isinstance(el.elts[1], ast.Constant):
+                        kept_add_names.add(el.elts[1].value)
+            for el in stmt.value.elts:
+                if (
+                    _op_name(el) == "RENAME"
+                    and len(el.elts) >= 2
+                    and isinstance(el.elts[1], ast.Constant)
+                    and (
+                        el.elts[1].value in kept_add_names
+                        or el.elts[1].value in service_command_names
+                    )
+                ):
+                    keep.append(el)
+            index = {id(e): i for i, e in enumerate(stmt.value.elts)}
+            keep.sort(key=lambda e: index[id(e)])
+            stmt.value.elts = keep
+
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree) + "\n"
 
 
 def _parse_pyproject_externals(source_root: Path) -> list[str]:
@@ -1052,14 +1186,19 @@ def build_slice_gold(
     Raises ``SliceError`` if the source is not aws-cli v2 or any file cannot be
     carried byte-identically through the patch.
     """
-    if service not in _SERVICE_HANDLERS:
-        raise SliceError(f"unsupported service: {service!r} (known: {sorted(_SERVICE_HANDLERS)})")
+    if not service:
+        raise SliceError("service is required")
     root = Path(source_root)
     awscli = root / "awscli"
     if not awscli.is_dir():
         raise SliceError(f"no awscli/ under source_root: {root}")
     if not (awscli / "clidriver.py").is_file() or not (awscli / "__init__.py").is_file():
         raise SliceError(f"{awscli} is not an aws-cli source tree (missing clidriver/__init__)")
+    if not (awscli / "botocore" / "data" / service).is_dir():
+        raise SliceError(
+            f"service {service!r} has no botocore data dir under "
+            f"{awscli / 'botocore' / 'data'}; not a sliceable aws-cli service"
+        )
 
     externals = _parse_pyproject_externals(root)
 
@@ -1070,7 +1209,7 @@ def build_slice_gold(
     elif service == "dynamodb" and commands:
         overrides = _slice_dynamodb_data(awscli, commands)
 
-    if service == "dynamodb":
+    if service != "s3":
         stubs = {
             awscli / "help.py": _STUB_AWSCLI_HELP,
             awscli / "clidocs.py": _STUB_AWSCLI_CLIDOCS,
@@ -1093,8 +1232,8 @@ def build_slice_gold(
     closure = _compute_closure(awscli, service=service, overrides=overrides)
     handlers_path = awscli / "handlers.py"
     handlers_registry_path = awscli / "handlers_registry.py"
-    handlers_src = _SERVICE_HANDLERS[service]
-    data_keep_dirs = _SERVICE_DATA_DIRS[service]
+    handlers_src = _service_handlers_src(service)
+    data_keep_dirs = _service_data_dirs(service)
 
     gold_files: dict[str, str] = {}
     provenance: dict[str, str] = {}
@@ -1121,7 +1260,11 @@ def build_slice_gold(
             gold_files["submission/awscli/handlers.py"] = handlers_src
             continue
         if src_path == handlers_registry_path:
-            gold_files["submission/awscli/handlers_registry.py"] = _GENERATED_HANDLERS_REGISTRY
+            gold_files["submission/awscli/handlers_registry.py"] = _filter_handlers_registry(
+                handlers_registry_path.read_text(encoding="utf-8"),
+                _closure_dotted_modules(awscli, closure),
+                set(data_keep_dirs),
+            )
             continue
         if src_path in ov:
             if src_path not in stub_paths:
@@ -1153,7 +1296,7 @@ def build_slice_gold(
                         gold_files[f"submission/awscli/{rel}"] = ov[p]
                     else:
                         _carry(rel, p)
-    keep_services = _SERVICE_ENDPOINTS_KEEP.get(service, frozenset())
+    keep_services = _service_endpoints_keep(service)
     for j in _DATA_TOP_FILES:
         jp = bdata / j
         if not jp.is_file():

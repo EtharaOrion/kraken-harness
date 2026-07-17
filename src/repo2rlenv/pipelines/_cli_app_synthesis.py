@@ -30,6 +30,7 @@ All can be added without touching the architecture (this module owns them).
 from __future__ import annotations
 
 import ast
+import contextlib
 import hashlib
 import logging
 import os
@@ -38,6 +39,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
@@ -55,17 +57,32 @@ from repo2rlenv.emitter.harbor import (
     write_harbor_task,
 )
 from repo2rlenv.llm import complete
+from repo2rlenv.pipelines._cli_app_antihack import scan_oracle_for_reward_hacking
 from repo2rlenv.pipelines._cli_app_extract import (
     _DDB_TARGET_OPS_DEFAULT,
     CliSpec,
     CommandSpec,
     TestIntent,
+    _canonical_spec_hash,
     extract_cli_spec,
     extract_cli_spec_from_model,
     extract_test_intents,
+    select_lifecycle_scope,
     synthesize_intents_from_model,
 )
+from repo2rlenv.pipelines._cli_app_generic import (
+    SidecarSpec,
+    make_generic_profile,
+    resolve_sidecar,
+)
+from repo2rlenv.pipelines._cli_app_profiles import (
+    ServiceProfile,
+    register_profile,
+    registered_backends,
+    resolve_profile,
+)
 from repo2rlenv.pipelines._cli_app_slice import SliceError, build_slice_gold
+from repo2rlenv.pipelines._cli_app_subsets import sample_subsets
 from repo2rlenv.pipelines._oss_instruct import make_multi_file_diff
 from repo2rlenv.pipelines.base import PipelineResult
 from repo2rlenv.registry.buildx import (
@@ -167,9 +184,12 @@ RUN printf '#!/bin/bash\\nset -e\\ncd /opt/ddb\\nnohup java -jar DynamoDBLocal.j
 """
 _DDB_GAUNTLET_WRAPPER = "/usr/local/bin/ddb-wrap"
 
-# MinIO server binary baked into the app layer (arch-aware download; no SHA pin
-# because the digest differs per arch and the app supports amd64 + arm64).
+# MinIO server binary baked into the app layer (arch-aware download, SHA256-pinned
+# per arch — the app supports amd64 + arm64). Hashes are the official
+# dl.min.io minio.<VERSION>.sha256sum values for this release.
 PINNED_MINIO_VERSION = "RELEASE.2025-09-07T16-13-09Z"
+PINNED_MINIO_SHA256_AMD64 = "7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f"
+PINNED_MINIO_SHA256_ARM64 = "5c83cd2cf151717ba0243f73e1c7802ff36e272b67144bdd7f1f7d684fd6f03d"
 
 # OpenHands agent-runtime SDK baked into an isolated venv (harness parity).
 PINNED_OPENHANDS_VERSION = "v1.12.0"
@@ -838,6 +858,7 @@ def _try_emit_task(
     label: str,
     skip_reasons: dict[str, int],
     source_root: Path | None = None,
+    model: dict | None = None,
 ) -> Path | None:
     """Attempt to build and emit one task. Returns task_path on success, None on skip."""
     try:
@@ -850,6 +871,7 @@ def _try_emit_task(
             out_dir=out_dir,
             intent_idx=intent_idx,
             source_root=source_root,
+            model=model,
         )
     except _TaskRejected as exc:
         skip_reasons[exc.reason] = skip_reasons.get(exc.reason, 0) + 1
@@ -866,6 +888,9 @@ def _resolve_target_ops(options: CodeInstructOptions) -> tuple[str, ...]:
     """CamelCase operation names to lift in botocore_model mode."""
     if options.cli_app_target_operations:
         return tuple(options.cli_app_target_operations)
+    profile = resolve_profile(options.cli_app_backend)
+    if profile is not None and profile.default_target_ops:
+        return profile.default_target_ops
     return _DDB_TARGET_OPS_DEFAULT
 
 
@@ -889,6 +914,9 @@ def _extract_intents_for(
             spec.command_prefix,
             target_operations=_resolve_target_ops(options),
             max_intents=options.cli_app_max_intents,
+            combinations=_is_generic_backend(options) and options.cli_app_combinations,
+            max_optional_combos=options.cli_app_max_optional_combos,
+            mutually_exclusive=_parse_mutually_exclusive(options),
         )
     return extract_test_intents(
         tests_dir_path,
@@ -970,6 +998,7 @@ def _run_subset_mode(
             label=label,
             skip_reasons=skip_reasons,
             source_root=source_root,
+            model=model,
         )
         if task_path is not None:
             emitted += 1
@@ -1040,6 +1069,7 @@ def _run_per_command_mode(
                 label=label,
                 skip_reasons=skip_reasons,
                 source_root=source_root,
+                model=model,
             )
             if task_path is not None:
                 emitted += 1
@@ -1054,6 +1084,70 @@ def _run_per_command_mode(
 # ---------------------------------------------------------------------------
 
 
+def _is_generic_backend(options: CodeInstructOptions) -> bool:
+    """True for a generic model-sidecar service (``build_compose_overlay`` set), False for
+    the byte-locked ``dynamodb_local`` / ``minio`` baselines. Every plug-and-play
+    auto-feature (auto-scope, auto-subsets, coverage matrix, anti-hack) gates on this so
+    the finalized DDB / S3 output stays byte-identical."""
+    profile = resolve_profile(options.cli_app_backend)
+    return profile is not None and profile.build_compose_overlay is not None
+
+
+def _parse_mutually_exclusive(options: CodeInstructOptions) -> tuple[tuple[str, ...], ...]:
+    return tuple(
+        tuple(f.strip() for f in entry.split(",") if f.strip())
+        for entry in (options.cli_app_mutually_exclusive or [])
+    )
+
+
+def _effective_antihack_mode(options: CodeInstructOptions) -> str:
+    """Resolve the anti-hack scan mode: 'reject' | 'log' | 'off'.
+
+    Explicit off/log/reject wins. None auto-selects 'reject' for generic sidecar
+    backends and 'log' for the byte-locked dynamodb_local / minio, so those paths are
+    scanned for telemetry but never rejected (their output stays byte-identical).
+    """
+    mode = options.cli_app_antihack_scan
+    if mode is not None:
+        return mode
+    return "reject" if _is_generic_backend(options) else "log"
+
+
+def _apply_auto_scope(spec: CliSpec, options: CodeInstructOptions) -> CliSpec:
+    """Narrow a broad generic-service surface to a coherent lifecycle subset.
+
+    Applies ONLY to a generic sidecar profile (``build_compose_overlay`` set) that did
+    NOT curate its own ``default_target_ops`` and exposes more commands than
+    ``cli_app_scope_max_commands``. The byte-locked ``dynamodb_local`` / ``minio``
+    backends, and any profile that curated its ops, are returned unchanged so existing
+    output stays byte-identical. Explicit user scoping (``cli_app_command`` /
+    ``cli_app_target_operations`` / ``cli_app_subsets``) always wins. Recomputes
+    ``spec_sha256`` so content-addressing reflects the scoped command set.
+    """
+    if options.cli_app_command or options.cli_app_target_operations or options.cli_app_subsets:
+        return spec
+    profile = resolve_profile(options.cli_app_backend)
+    if profile is None or profile.build_compose_overlay is None or profile.default_target_ops:
+        return spec
+    cap = options.cli_app_scope_max_commands
+    names = [c.name for c in spec.commands]
+    if cap <= 0 or len(names) <= cap:
+        return spec
+    scope = select_lifecycle_scope(names, max_commands=cap) or sorted(names)[:cap]
+    keep = set(scope)
+    spec.commands = [c for c in spec.commands if c.name in keep]
+    spec.spec_sha256 = _canonical_spec_hash(spec)
+    logger.warning(
+        "cli_app: %s exposes %d commands (> scope cap %d); auto-scoped to %s. "
+        "Override with cli_app_target_operations.",
+        spec.command_prefix,
+        len(names),
+        cap,
+        sorted(keep),
+    )
+    return spec
+
+
 def run_cli_app_pipeline(
     pipeline: CodeInstructPipeline,
     options: CodeInstructOptions,
@@ -1066,6 +1160,12 @@ def run_cli_app_pipeline(
         raise ValueError(
             "cli_app mode requires --pipeline-opt cli_app_command_prefix=<prefix> "
             "(e.g. 's3' for `aws s3 *`)"
+        )
+
+    if resolve_profile(options.cli_app_backend) is None:
+        raise ValueError(
+            f"cli_app_backend={options.cli_app_backend!r} is not a registered ServiceProfile; "
+            f"registered backends: {list(registered_backends())}"
         )
 
     token = resolve_github_token(pipeline.input.repo, pipeline.input.auth)
@@ -1122,6 +1222,8 @@ def run_cli_app_pipeline(
             spec.tests_dir,
         )
 
+        spec = _apply_auto_scope(spec, options)
+
         target_commands: list[CommandSpec] = (
             [c for c in spec.commands if c.name == options.cli_app_command]
             if options.cli_app_command
@@ -1134,12 +1236,29 @@ def run_cli_app_pipeline(
             )
 
         tests_dir_path = clone_dir / spec.tests_dir
-        if options.cli_app_subsets:
+        subsets = options.cli_app_subsets
+        if not subsets and options.cli_app_auto_subsets and _is_generic_backend(options):
+            subsets = sample_subsets(
+                target_commands,
+                min_size=options.cli_app_subset_min_commands,
+                max_size=options.cli_app_subset_max_commands,
+                max_subsets=options.cli_app_max_subsets,
+                tiers=options.cli_app_subset_tiers,
+            )
+            if not subsets:
+                # Surface smaller than the >=6-command window: fall back to the default
+                # sizing so small generic services still emit multi-command tasks.
+                subsets = sample_subsets(
+                    target_commands,
+                    max_subsets=options.cli_app_max_subsets,
+                    tiers=options.cli_app_subset_tiers,
+                )
+        if subsets:
             candidates_seen, emitted = _run_subset_mode(
                 pipeline=pipeline,
                 options=options,
                 spec=spec,
-                subsets=options.cli_app_subsets,
+                subsets=subsets,
                 tests_dir_path=tests_dir_path,
                 out_dir=out_dir,
                 owner_name=owner_name,
@@ -1201,8 +1320,7 @@ def _build_and_push_task_image(
     uid: str,
     aux_files: dict[str, str],
     test_script: str,
-    base_image: str = PINNED_BASE_IMAGE,
-    backend: str = "minio",
+    dockerfile: str,
 ) -> str:
     repo_segment = f"{_safe_repo_segment(owner_name)}__{_safe_repo_segment(task_slug)}"
     image_ref = f"{registry}/{repo_segment}:{uid}"
@@ -1216,9 +1334,7 @@ def _build_and_push_task_image(
     ensure_docker_login_ecr(registry, region, profile=profile)
     with tempfile.TemporaryDirectory() as ctx:
         ctx_path = Path(ctx)
-        (ctx_path / "Dockerfile").write_text(
-            _build_dockerfile(base_image=base_image, bake_tests=True, backend=backend)
-        )
+        (ctx_path / "Dockerfile").write_text(dockerfile)
         for rel, content in aux_files.items():
             target = ctx_path / rel
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -1267,12 +1383,13 @@ def _apply_static_gauntlet(
     test_files: dict[str, str],
     *,
     behaviour_tags: dict[str, str] | None = None,
+    forbid_skips: bool = False,
 ) -> dict[str, str]:
     """Gauntlet G1-G2 (cheap, no Docker). Returns survivors; raises if none survive."""
     survivors: dict[str, str] = {}
     for fname, code in test_files.items():
         tag = behaviour_tags.get(fname) if behaviour_tags else None
-        ok, reason = _gauntlet_static(code, expected_behaviour_tag=tag)
+        ok, reason = _gauntlet_static(code, expected_behaviour_tag=tag, forbid_skips=forbid_skips)
         if ok:
             survivors[fname] = code
         else:
@@ -1280,6 +1397,54 @@ def _apply_static_gauntlet(
     if not survivors:
         raise _TaskRejected("all_tests_failed_static_gauntlet")
     return survivors
+
+
+def _refine_oracle_against_failures(
+    pipeline: CodeInstructPipeline,
+    options: CodeInstructOptions,
+    profile: ServiceProfile,
+    oracle_code: str,
+    failing_tests: dict[str, str],
+    oracle_output: str,
+) -> str | None:
+    """Fix submission/main.py so it also passes the real-aws-verified tests it currently
+    fails, lifting oracle-pass (the tight grounding sub-gate). Returns source or None."""
+    if not failing_tests:
+        return None
+    tests_block = "\n\n".join(
+        f"# ===== {name} =====\n{code}" for name, code in sorted(failing_tests.items())
+    )
+    user = (
+        "The reference `aws` CLI PASSES the tests below, but the current "
+        "submission/main.py FAILS them. Fix main.py so it ALSO passes these tests "
+        "without breaking behaviour it already implements. Stdlib-only (urllib); no "
+        "boto3/botocore/moto/minio. Return the COMPLETE corrected submission/main.py, "
+        "nothing else.\n\n"
+        f"===== CURRENT submission/main.py =====\n{oracle_code}\n\n"
+        f"===== TESTS IT MUST NOW PASS =====\n{tests_block}\n\n"
+        f"===== pytest output tail =====\n{oracle_output[-4000:]}\n"
+    )
+    for attempt in range(1, max(1, options.cli_app_oracle_max_attempts) + 1):
+        try:
+            resp = complete(
+                pipeline._llm,
+                system=profile.oracle_system,
+                user=user,
+                max_tokens=options.cli_app_oracle_max_tokens,
+                temperature=options.llm_temperature,
+            )
+        except Exception as exc:
+            logger.warning("oracle refinement attempt %d failed: %s", attempt, exc)
+            continue
+        pipeline._llm_cost_usd += resp.cost_usd
+        code = _strip_code_fence(resp.content)
+        try:
+            compile(code, "<oracle-refine>", "exec")
+        except SyntaxError as exc:
+            logger.warning("oracle refinement returned invalid Python: %s", exc)
+            continue
+        return code
+    return None
 
 
 def _apply_reference_grounding(
@@ -1291,8 +1456,13 @@ def _apply_reference_grounding(
     test_script: str,
     oracle_code: str,
     extra_tests_aux: dict[str, str] | None = None,
-) -> tuple[dict, dict[str, str]]:
-    """Filter tests via real-aws + oracle reference. Returns (result, filtered_test_files).
+    pipeline: CodeInstructPipeline | None = None,
+    profile: ServiceProfile | None = None,
+) -> tuple[dict, dict[str, str], str]:
+    """Filter tests via real-aws + oracle reference. Returns (result, filtered_test_files,
+    effective_oracle_code). When cli_app_oracle_refine_max_attempts>0 (generic backends),
+    iteratively fix the oracle against tests real-aws passes but the oracle fails, accepting
+    a refinement only when grounded strictly increases.
 
     ``extra_tests_aux`` carries backend helper modules (e.g. tests/_ddb_http.py)
     that the conftest imports; without them the grounding bundle can't collect.
@@ -1302,16 +1472,57 @@ def _apply_reference_grounding(
         tests_aux.update(extra_tests_aux)
     for fname, code in test_files.items():
         tests_aux[f"tests/{fname}"] = code
-    reference_grounding = _run_reference_grounding(
-        dockerfile_content=dockerfile,
-        tests_aux=tests_aux,
-        test_script=test_script,
-        oracle_code=oracle_code,
-        timeout_sec=options.cli_app_docker_timeout_sec,
-        backend=options.cli_app_backend,
-    )
+
+    def _ground(oc: str) -> dict:
+        return _run_reference_grounding(
+            dockerfile_content=dockerfile,
+            tests_aux=tests_aux,
+            test_script=test_script,
+            oracle_code=oc,
+            timeout_sec=options.cli_app_docker_timeout_sec,
+            backend=options.cli_app_backend,
+        )
+
+    reference_grounding = _ground(oracle_code)
     if reference_grounding.get("skipped"):
         raise _TaskRejected("reference_grounding_unavailable")
+
+    refine_budget = (
+        options.cli_app_oracle_refine_max_attempts
+        if _is_generic_backend(options) and pipeline is not None and profile is not None
+        else 0
+    )
+    for _ in range(refine_budget):
+        failing = reference_grounding["reference_pass"] - reference_grounding["oracle_pass"]
+        if not failing:
+            break
+        failing_code = {f: tests_aux[f"tests/{f}"] for f in failing if f"tests/{f}" in tests_aux}
+        refined = _refine_oracle_against_failures(
+            pipeline,
+            options,
+            profile,
+            oracle_code,
+            failing_code,
+            reference_grounding.get("oracle_out", ""),
+        )
+        if refined is None:
+            break
+        candidate = _ground(refined)
+        if candidate.get("skipped"):
+            break
+        improved = len(candidate["oracle_pass"]) >= len(reference_grounding["oracle_pass"]) and len(
+            candidate["grounded_files"]
+        ) > len(reference_grounding["grounded_files"])
+        if not improved:
+            break
+        logger.info(
+            "oracle refinement: grounded %d -> %d",
+            len(reference_grounding["grounded_files"]),
+            len(candidate["grounded_files"]),
+        )
+        oracle_code = refined
+        reference_grounding = candidate
+
     grounded = reference_grounding["grounded_files"]
     logger.info(
         "reference grounding: %d ref-pass & %d oracle-pass -> %d grounded "
@@ -1324,7 +1535,7 @@ def _apply_reference_grounding(
     if len(grounded) < options.cli_app_min_grounded_tests:
         raise _TaskRejected(f"reference_grounding_insufficient_tests_{len(grounded)}")
     test_files = {f: c for f, c in test_files.items() if f in grounded}
-    return reference_grounding, test_files
+    return reference_grounding, test_files, oracle_code
 
 
 def _run_g3g4_gauntlet_gate(
@@ -1376,7 +1587,15 @@ def _build_cliapp_repo2env(
     llm_cost_before: float,
 ) -> dict:
     """Assemble the repo2env metadata block for one cli_app task."""
-    is_ddb = options.cli_app_backend == "dynamodb_local"
+    profile = resolve_profile(options.cli_app_backend)
+    # Integrity: True only when a gate (G3/G4 gauntlet or reference grounding with
+    # empty-stub=0) actually confirmed it — never hardcoded (hardcoding let
+    # non-discriminative / un-gated tasks self-certify).
+    _disc_confirmed = False
+    if gauntlet_g34 is not None and not gauntlet_g34.get("skipped"):
+        _disc_confirmed = bool(gauntlet_g34.get("g3_pass") and gauntlet_g34.get("g4_pass"))
+    elif reference_grounding is not None and not reference_grounding.get("skipped"):
+        _disc_confirmed = reference_grounding.get("n_empty", 1) == 0
     repo2env: dict[str, Any] = {
         "pipeline": "code_instruct",
         "pipeline_version": "0.6.0-cliapp-v1",
@@ -1399,10 +1618,10 @@ def _build_cliapp_repo2env(
             "intents_extracted": len(intents),
             "tests_translated": len(translated),
             "tests_in_task": len(test_files),
-            "simulation_backend": "dynamodb_local" if is_ddb else "minio",
+            "simulation_backend": profile.simulation_backend,
             "python_version": "3.12",
             "entry_point": "submission/main.py",
-            "pinned_deps": list(PINNED_DEPS_DDB if is_ddb else PINNED_DEPS),
+            "pinned_deps": list(profile.pinned_deps),
             "runtime_cpus": 1.0,
             "runtime_memory_mb": 1024,
             "runtime_network": "none",
@@ -1410,12 +1629,10 @@ def _build_cliapp_repo2env(
             "llm_cost_usd": round(pipeline._llm_cost_usd - llm_cost_before, 6),
             "run_llm_cost_usd": round(pipeline._llm_cost_usd, 6),
             "llm_cost_method": "litellm_native",
-            "behaviour_tags": sorted(
-                {_bucket_of(f, test_file_tags.get(f)) for f in test_files}
-            ),
+            "behaviour_tags": sorted({_bucket_of(f, test_file_tags.get(f)) for f in test_files}),
             "behaviour_tag_counts": _shipped_bucket_counts(test_files, test_file_tags),
             "tests_shipped": len(test_files),
-            "discriminative": True,
+            "discriminative": _disc_confirmed,
         },
     }
     if is_subset:
@@ -1428,9 +1645,13 @@ def _build_cliapp_repo2env(
             "n_reference_pass": reference_grounding["n_reference"],
             "n_oracle_pass": reference_grounding["n_oracle"],
             "n_empty_stub_pass": reference_grounding["n_empty"],
+            "sim_completeness": round(
+                reference_grounding["n_reference"] / max(1, len(translated)), 4
+            ),
             "tests_shipped": len(test_files),
-            "discriminative": True,
-            "oracle_solves_all_shipped": True,
+            "discriminative": reference_grounding.get("n_empty", 1) == 0,
+            "oracle_solves_all_shipped": set(test_files)
+            <= (reference_grounding.get("oracle_pass") or set()),
         }
     if gauntlet_g34 is not None and not gauntlet_g34.get("skipped"):
         repo2env["code_instruct"]["docker_gauntlet"] = {
@@ -1440,10 +1661,62 @@ def _build_cliapp_repo2env(
             "g4_oracle_pass_rate": round(gauntlet_g34["g4_oracle_pass_rate"], 4),
             "g4_oracle_passed": gauntlet_g34["g4_oracle_passed"],
             "g4_oracle_total": gauntlet_g34["g4_oracle_total"],
-            "discriminative": True,
+            "discriminative": bool(gauntlet_g34.get("g3_pass") and gauntlet_g34.get("g4_pass")),
             "image_tag": gauntlet_g34.get("image_tag", ""),
         }
     return repo2env
+
+
+def _effective_grounded_floor(options: CodeInstructOptions) -> int:
+    """Per-task grounded-test floor: a per-service override wins over the global
+    cli_app_min_grounded_final (0 = no floor, top-up disabled)."""
+    override = options.cli_app_min_grounded_final_overrides.get(options.cli_app_backend)
+    return override if override is not None else options.cli_app_min_grounded_final
+
+
+def _topup_budget_ok(
+    pipeline: CodeInstructPipeline, options: CodeInstructOptions, cost0: float, t0: float
+) -> bool:
+    over_cost = (
+        options.cli_app_topup_max_cost_usd is not None
+        and pipeline._llm_cost_usd - cost0 >= options.cli_app_topup_max_cost_usd
+    )
+    over_wall = (
+        options.cli_app_topup_max_wall_sec is not None
+        and time.monotonic() - t0 >= options.cli_app_topup_max_wall_sec
+    )
+    return not (over_cost or over_wall)
+
+
+def _topup_more_intents(
+    model: dict,
+    cmd_specs: list[CommandSpec],
+    options: CodeInstructOptions,
+    seen_shas: set[str],
+    attempt: int,
+    deficit: int,
+) -> list[TestIntent]:
+    """Fresh variant intents (escalating happy-path variant count) for the subset's commands,
+    excluding any already-seen intent by source_method_sha256. Deterministic and bounded."""
+    ops = _resolve_target_ops(options)
+    mut = _parse_mutually_exclusive(options)
+    variants = 8 * (attempt + 2)
+    fresh: list[TestIntent] = []
+    for c in cmd_specs:
+        cand = synthesize_intents_from_model(
+            model,
+            c.name,
+            options.cli_app_command_prefix,
+            target_operations=ops,
+            max_intents=None,
+            combinations=_is_generic_backend(options) and options.cli_app_combinations,
+            max_optional_combos=options.cli_app_max_optional_combos,
+            mutually_exclusive=mut,
+            happy_variants=variants,
+        )
+        fresh.extend(it for it in cand if it.source_method_sha256 not in seen_shas)
+    fresh.sort(key=lambda it: it.source_method_sha256)
+    return fresh[: max(12, deficit * 3)]
 
 
 def _build_one_task(
@@ -1456,6 +1729,7 @@ def _build_one_task(
     out_dir: Path,
     intent_idx: int | None = None,
     source_root: Path | None = None,
+    model: dict | None = None,
 ) -> Path:
     """Synthesise + verify + emit ONE Harbor task for one command, or for a
     compatible subset of commands.
@@ -1467,6 +1741,7 @@ def _build_one_task(
     """
     is_subset = len(cmd_specs) > 1
     cmd_names = [c.name for c in cmd_specs]
+    profile = resolve_profile(options.cli_app_backend)
     # Canonical, order-independent slugs. Single-command keeps the bare command
     # name so existing task_ids / cache keys / filenames are unchanged.
     cmd_slug = cmd_names[0] if not is_subset else "+".join(sorted(cmd_names))
@@ -1494,7 +1769,7 @@ def _build_one_task(
             per_intent_codes = list(
                 ex.map(lambda i: _translate_intent(pipeline, options, spec, i), intents)
             )
-    for intent, test_code in zip(intents, per_intent_codes):
+    for intent, test_code in zip(intents, per_intent_codes, strict=True):
         if test_code is None:
             continue
         translated.append(test_code)
@@ -1507,26 +1782,32 @@ def _build_one_task(
     # `solution/reference.diff` alongside `solution/golden.diff`. LLM oracle
     # failure rejects the task — a golden-mode task without a reference is
     # incomplete by contract.
-    golden = getattr(options, "cli_app_oracle", "llm") == "golden"
+    golden = options.cli_app_oracle in ("golden", "both")
     golden_gold_diff: str | None = None
     golden_image_deps: tuple[str, ...] | None = None
+    golden_files: dict[str, str] | None = None
+    golden_prov: dict[str, str] | None = None
     if golden:
         if source_root is None:
-            raise _TaskRejected("golden_oracle_requires_source_root")
-        service = "dynamodb" if options.cli_app_backend == "dynamodb_local" else "s3"
-        slice_commands = cmd_names
-        try:
-            _oracle_files, golden_gold_diff, _prov, slice_externals = build_slice_gold(
-                source_root, commands=slice_commands, service=service
+            # Fail closed: no cloned source => no real golden slice. Never silently
+            # ship the LLM oracle AS the golden (that produced golden.diff==reference.diff
+            # tasks with no ground truth). Offline callers must set cli_app_oracle="llm".
+            raise _TaskRejected("golden_slice_unavailable_no_source_root")
+        else:
+            service = profile.service
+            slice_commands = cmd_names
+            try:
+                golden_files, golden_gold_diff, golden_prov, slice_externals = build_slice_gold(
+                    source_root, commands=slice_commands, service=service
+                )
+            except SliceError as exc:
+                raise _TaskRejected(f"golden_slice_failed_{type(exc).__name__}") from exc
+            harness_deps = (
+                GOLDEN_TEST_HARNESS_DEPS_DDB
+                if options.cli_app_backend == "dynamodb_local" or _is_generic_backend(options)
+                else GOLDEN_TEST_HARNESS_DEPS_MINIO
             )
-        except SliceError as exc:
-            raise _TaskRejected(f"golden_slice_failed_{type(exc).__name__}") from exc
-        harness_deps = (
-            GOLDEN_TEST_HARNESS_DEPS_DDB
-            if options.cli_app_backend == "dynamodb_local"
-            else GOLDEN_TEST_HARNESS_DEPS_MINIO
-        )
-        golden_image_deps = (*slice_externals, *harness_deps)
+            golden_image_deps = (*slice_externals, *harness_deps)
 
     cache_key = f"{spec.spec_sha256}|{cmd_slug}"
     if cache_key in _ORACLE_CACHE:
@@ -1540,22 +1821,35 @@ def _build_one_task(
             "reference_oracle_synthesis_failed" if golden else "oracle_synthesis_failed"
         )
 
+    _antihack_mode = _effective_antihack_mode(options)
+    if _antihack_mode != "off":
+        _hack_findings = scan_oracle_for_reward_hacking(oracle_code)
+        if _hack_findings:
+            if _antihack_mode == "reject":
+                raise _TaskRejected("oracle_reward_hacking_" + "+".join(_hack_findings))
+            logger.warning(
+                "cli_app: anti-hack scan (log-only, backend=%s) findings on %s oracle: %s",
+                options.cli_app_backend,
+                cmd_slug,
+                _hack_findings,
+            )
+
     # ----- Build supporting files -----
-    conftest = _build_conftest(backend=options.cli_app_backend, golden=golden)
+    conftest = profile.build_conftest(golden=golden)
     # Backend helper modules shipped alongside the tests (imported by conftest).
     # For DynamoDB the stdlib raw-HTTP client must be present in EVERY test bundle
     # (grounding, G3/G4, and the emitted task) or the conftest import fails.
     extra_tests_aux: dict[str, str] = {}
-    if options.cli_app_backend == "dynamodb_local":
-        extra_tests_aux["tests/_ddb_http.py"] = _DDB_HTTP_HELPER
+    if profile is not None and profile.client_module_src:
+        extra_tests_aux[profile.client_module_path] = profile.client_module_src
+
     def _test_filename(intent: TestIntent, i: int) -> str:
         cmd_slug_i = (getattr(intent, "command", None) or "unknown").replace("_", "-")
         tag_slug = (intent.behaviour_tag or "unknown").replace("_", "-")
         return f"test_{spec.command_prefix}_{cmd_slug_i}_{tag_slug}_{i:02d}.py"
 
     test_files = {
-        _test_filename(translated_intents[i], i): code
-        for i, code in enumerate(translated)
+        _test_filename(translated_intents[i], i): code for i, code in enumerate(translated)
     }
     test_file_tags = {
         _test_filename(translated_intents[i], i): translated_intents[i].behaviour_tag
@@ -1575,14 +1869,10 @@ def _build_one_task(
         _ecr_registry = options.cli_app_ecr_registry
         _ecr_profile = _resolve_ecr_profile(options)
         _ecr_platforms = _resolve_platforms(options)
-    _default_base_image = (
-        PINNED_DDB_BASE_IMAGE if options.cli_app_backend == "dynamodb_local" else PINNED_BASE_IMAGE
-    )
-    base_image = options.cli_app_base_image or _default_base_image
-    dockerfile = _build_dockerfile(
+    base_image = options.cli_app_base_image or profile.base_image
+    dockerfile = profile.build_dockerfile(
         base_image=base_image,
         bake_tests=options.cli_app_ecr_push,
-        backend=options.cli_app_backend,
         golden=golden,
         golden_deps=golden_image_deps,
     )
@@ -1590,7 +1880,11 @@ def _build_one_task(
 
     # ----- Gauntlet G1-G2 (cheap, no Docker) -----
     if not options.cli_app_skip_gauntlet:
-        test_files = _apply_static_gauntlet(test_files, behaviour_tags=test_file_tags)
+        test_files = _apply_static_gauntlet(
+            test_files,
+            behaviour_tags=test_file_tags,
+            forbid_skips=options.cli_app_forbid_skips,
+        )
 
     # ----- Reference grounding (opt-in): keep ONLY tests that BOTH the real
     # aws CLI AND the synthesised oracle pass, and that the empty stub fails.
@@ -1599,12 +1893,8 @@ def _build_one_task(
     # never in the shipped task image (anti-cheat).
     reference_grounding = None
     if options.cli_app_reference_grounding:
-        grounding_conftest = (
-            _build_conftest(backend=options.cli_app_backend, golden=False)
-            if golden
-            else conftest
-        )
-        reference_grounding, test_files = _apply_reference_grounding(
+        grounding_conftest = profile.build_conftest(golden=False) if golden else conftest
+        reference_grounding, test_files, oracle_code = _apply_reference_grounding(
             options=options,
             dockerfile=dockerfile,
             conftest=grounding_conftest,
@@ -1612,7 +1902,93 @@ def _build_one_task(
             test_script=test_script,
             oracle_code=oracle_code,
             extra_tests_aux=extra_tests_aux,
+            pipeline=pipeline,
+            profile=profile,
         )
+        floor = _effective_grounded_floor(options)
+        if floor and model is not None and _is_generic_backend(options):
+            seen_shas = {ti.source_method_sha256 for ti in translated_intents}
+            cost0 = pipeline._llm_cost_usd
+            t0 = time.monotonic()
+            attempt = 0
+            while (
+                len(test_files) < floor
+                and attempt < options.cli_app_topup_max_attempts
+                and _topup_budget_ok(pipeline, options, cost0, t0)
+            ):
+                fresh = _topup_more_intents(
+                    model, cmd_specs, options, seen_shas, attempt, floor - len(test_files)
+                )
+                attempt += 1
+                if not fresh:
+                    break
+                new_tf: dict[str, str] = {}
+                new_tags: dict[str, str] = {}
+                for it in fresh:
+                    seen_shas.add(it.source_method_sha256)
+                    code = _translate_intent(pipeline, options, spec, it)
+                    if code is None:
+                        continue
+                    if not options.cli_app_skip_gauntlet:
+                        ok, _reason = _gauntlet_static(
+                            code,
+                            expected_behaviour_tag=it.behaviour_tag,
+                            forbid_skips=options.cli_app_forbid_skips,
+                        )
+                        if not ok:
+                            continue
+                    translated.append(code)
+                    translated_intents.append(it)
+                    fname = _test_filename(it, len(translated_intents) - 1)
+                    new_tf[fname] = code
+                    new_tags[fname] = it.behaviour_tag
+                if not new_tf:
+                    continue
+                test_file_tags.update(new_tags)
+                reference_grounding, test_files, oracle_code = _apply_reference_grounding(
+                    options=options,
+                    dockerfile=dockerfile,
+                    conftest=grounding_conftest,
+                    test_files={**test_files, **new_tf},
+                    test_script=test_script,
+                    oracle_code=oracle_code,
+                    extra_tests_aux=extra_tests_aux,
+                    pipeline=pipeline,
+                    profile=profile,
+                )
+                logger.info(
+                    "cli_app top-up attempt %d: grounded=%d / floor=%d",
+                    attempt,
+                    len(test_files),
+                    floor,
+                )
+            if len(test_files) < floor:
+                raise _TaskRejected(f"topup_exhausted_grounded_{len(test_files)}_of_{floor}")
+
+    # ----- G4 alignment: the shipped (grounded) tests are the single source of
+    # truth for which commands the task covers. If grounding/top-up dropped a
+    # command entirely, remove it from the command set so instruction.md, keywords,
+    # description and repo2env (all derived below) never over-claim coverage. -----
+    if _is_generic_backend(options) and options.cli_app_reference_grounding:
+        _fname_cmd = {_test_filename(ti, i): ti.command for i, ti in enumerate(translated_intents)}
+        shipped_cmds: set[str] = {_fname_cmd[f] for f in test_files if f in _fname_cmd}
+        for f, code in test_files.items():
+            if "_workflow_" not in f:
+                continue
+            try:
+                for node in ast.walk(ast.parse(code)):
+                    if isinstance(node, ast.FunctionDef):
+                        shipped_cmds |= _commands_used_in_cli_calls(node, spec.command_prefix)
+            except SyntaxError:
+                pass
+        aligned = [c for c in cmd_names if c in shipped_cmds]
+        if aligned and len(aligned) < len(cmd_names):
+            cmd_names = aligned
+            cmd_specs = [c for c in cmd_specs if c.name in shipped_cmds]
+            is_subset = len(cmd_specs) > 1
+            cmd_slug = cmd_names[0] if not is_subset else "+".join(sorted(cmd_names))
+            id_slug = cmd_names[0] if not is_subset else "_".join(sorted(cmd_names))
+            logger.info("cli_app G4 alignment: shipped commands narrowed to %s", sorted(cmd_names))
 
     # ----- Assemble aux_files for Harbor (tests/ subdir) -----
     aux_files: dict[str, str] = {
@@ -1629,6 +2005,8 @@ def _build_one_task(
         aux_files["environment/docker-compose.yaml"] = _build_disallow_compose(
             BLOCKED_HOSTS_DDB, ddb_sidecar=True
         )
+    elif profile.build_compose_overlay is not None:
+        aux_files["environment/docker-compose.yaml"] = profile.build_compose_overlay()
 
     reference_diff_file = make_multi_file_diff({"submission/main.py": oracle_code})
     if golden:
@@ -1640,13 +2018,9 @@ def _build_one_task(
 
     # ----- instruction.md (rendered from spec, NEVER from tests) -----
     if is_subset:
-        instruction_md = _build_subset_instruction_md(
-            spec, cmd_specs, intents, backend=options.cli_app_backend
-        )
+        instruction_md = profile.build_instruction_subset(spec, cmd_specs, intents)
     else:
-        instruction_md = _build_instruction_md(
-            spec, cmd_specs[0], intents, backend=options.cli_app_backend
-        )
+        instruction_md = profile.build_instruction_single(spec, cmd_specs[0], intents)
     _assert_no_test_leakage(instruction_md, test_files)
 
     # ----- task_id derived from spec sha + command + prompt version (+ intent_idx) -----
@@ -1676,18 +2050,31 @@ def _build_one_task(
     # Without this, tests can be non-discriminative (pass on empty stub).
     # Builds image once per Dockerfile (cached), runs pytest twice per task.
     gauntlet_g34 = None
-    if (
-        not options.cli_app_skip_gauntlet
-        and getattr(options, "cli_app_docker_gauntlet", False)
-        and not golden
-    ):
-        gauntlet_g34 = _run_g3g4_gauntlet_gate(
-            options=options,
-            dockerfile=dockerfile,
-            aux_files=aux_files,
-            test_script=test_script,
-            oracle_code=oracle_code,
-        )
+    golden_cert = None
+    if not options.cli_app_skip_gauntlet and getattr(options, "cli_app_docker_gauntlet", False):
+        if golden:
+            golden_cert = _certify_golden(
+                dockerfile=dockerfile,
+                conftest=conftest,
+                test_files=test_files,
+                test_script=test_script,
+                gold_files=golden_files or {},
+                extra_tests_aux=extra_tests_aux,
+                timeout_sec=options.cli_app_docker_timeout_sec,
+                backend=options.cli_app_backend,
+            )
+            if not golden_cert.get("skipped") and golden_cert.get("pass_rate", 0.0) < 1.0:
+                raise _TaskRejected(
+                    f"golden_cert_failed_{golden_cert.get('passed', 0)}_of_{golden_cert.get('total', 0)}"
+                )
+        else:
+            gauntlet_g34 = _run_g3g4_gauntlet_gate(
+                options=options,
+                dockerfile=dockerfile,
+                aux_files=aux_files,
+                test_script=test_script,
+                oracle_code=oracle_code,
+            )
 
     # ----- repo2env metadata -----
     repo2env = _build_cliapp_repo2env(
@@ -1706,6 +2093,27 @@ def _build_one_task(
         gauntlet_g34=gauntlet_g34,
         llm_cost_before=_llm_cost_before,
     )
+    if golden and golden_files is not None:
+        _prov_items = sorted((golden_prov or {}).items())
+        repo2env["code_instruct"]["golden"] = {
+            "awscli_version": PINNED_AWSCLI_VERSION,
+            "entry_point": "submission/aws",
+            "n_slice_files": len(golden_files),
+            "n_verbatim_files": len(golden_prov or {}),
+            "provenance_sha256": hashlib.sha256(
+                "\n".join(f"{k}:{v}" for k, v in _prov_items).encode()
+            ).hexdigest(),
+            "certified_pass_rate": (
+                golden_cert.get("pass_rate")
+                if golden_cert and not golden_cert.get("skipped")
+                else None
+            ),
+            "oracle_solves_all_shipped": bool(
+                golden_cert
+                and not golden_cert.get("skipped")
+                and golden_cert.get("pass_rate", 0.0) >= 1.0
+            ),
+        }
 
     _task_ecr_ref: str | None = None
     if options.cli_app_ecr_push and _ecr_registry is not None:
@@ -1719,8 +2127,7 @@ def _build_one_task(
             uid=_uid,
             aux_files=aux_files,
             test_script=test_script,
-            base_image=base_image,
-            backend=options.cli_app_backend,
+            dockerfile=dockerfile,
         )
         repo2env["reproducibility"] = {
             "mode": "registry",
@@ -1735,10 +2142,10 @@ def _build_one_task(
         description = (
             f"Implement an `aws {spec.command_prefix}` CLI subset "
             f"({', '.join(sorted(cmd_names))}) from scratch"
-        )[:120]
+        )
         keywords = [spec.name, "code_instruct", "cli_app", "subset", *sorted(cmd_names)]
     else:
-        description = (f"Implement `aws {spec.command_prefix} {cmd_names[0]}` from scratch")[:120]
+        description = f"Implement `aws {spec.command_prefix} {cmd_names[0]}` from scratch"
         keywords = [spec.name, "code_instruct", "cli_app", cmd_names[0]]
 
     task = HarborTask(
@@ -1834,8 +2241,9 @@ def _translate_intent(
 ) -> str | None:
     """One LLM call per intent. Returns translated test code or None on failure."""
     is_ddb = options.cli_app_backend == "dynamodb_local"
-    template = TRANSLATION_USER_TEMPLATE_DDB if is_ddb else TRANSLATION_USER_TEMPLATE
-    system = TRANSLATION_SYSTEM_DDB if is_ddb else TRANSLATION_SYSTEM
+    profile = resolve_profile(options.cli_app_backend)
+    template = profile.translation_user
+    system = profile.translation_system
     user = template.format(
         raw_source=intent.raw_source[:4000],
         command_prefix=spec.command_prefix,
@@ -1893,13 +2301,13 @@ def _synthesise_oracle(
     subset, a multi-command oracle prompt asks for one `main.py` implementing
     every subcommand, dispatched on argv.
     """
-    is_ddb = options.cli_app_backend == "dynamodb_local"
+    profile = resolve_profile(options.cli_app_backend)
     behaviours = _summarise_behaviours_from_intents(intents)
     behaviours_bulleted = "\n".join(f"- {b}" for b in behaviours)
     if len(cmd_specs) > 1:
         commands_csv = ", ".join(f"`{spec.command_prefix} {c.name}`" for c in cmd_specs)
-        system = ORACLE_SUBSET_SYSTEM_DDB if is_ddb else ORACLE_SUBSET_SYSTEM
-        template = ORACLE_SUBSET_USER_TEMPLATE_DDB if is_ddb else ORACLE_SUBSET_USER_TEMPLATE
+        system = profile.oracle_subset_system
+        template = profile.oracle_subset_user
         flags_per_command = "\n".join(
             f"- `{spec.command_prefix} {c.name}`: {', '.join(c.flags) if c.flags else '(no flags)'}"
             for c in cmd_specs
@@ -1911,8 +2319,8 @@ def _synthesise_oracle(
             flags_per_command=flags_per_command,
         )
     else:
-        system = ORACLE_SYSTEM_DDB if is_ddb else ORACLE_SYSTEM
-        template = ORACLE_USER_TEMPLATE_DDB if is_ddb else ORACLE_USER_TEMPLATE
+        system = profile.oracle_system
+        template = profile.oracle_user
         flags_bulleted = (
             "\n".join(f"- `{f}`" for f in cmd_specs[0].flags)
             if cmd_specs[0].flags
@@ -2020,10 +2428,10 @@ def _synthesise_workflow_tests(
             shapes.append(f"- `{shape}`")
     argv_shapes_bulleted = "\n".join(shapes) if shapes else "- (none observed)"
 
-    is_ddb = options.cli_app_backend == "dynamodb_local"
+    profile = resolve_profile(options.cli_app_backend)
     n_workflows = max(1, options.cli_app_workflow_tests)
-    template = WORKFLOW_USER_TEMPLATE_DDB if is_ddb else WORKFLOW_USER_TEMPLATE
-    system = WORKFLOW_SYSTEM_DDB if is_ddb else WORKFLOW_SYSTEM
+    template = profile.workflow_user
+    system = profile.workflow_system
     user = template.format(
         command_prefix=spec.command_prefix,
         subset_csv=", ".join(subset_names),
@@ -2054,7 +2462,9 @@ def _synthesise_workflow_tests(
                     temperature=options.llm_temperature,
                 )
             except Exception as exc:
-                logger.warning("workflow-test synthesis failed for subset=%s: %s", subset_names, exc)
+                logger.warning(
+                    "workflow-test synthesis failed for subset=%s: %s", subset_names, exc
+                )
                 return best_results
             pipeline._llm_cost_usd += resp.cost_usd
             if resp.finish_reason != "length":
@@ -2080,7 +2490,7 @@ def _synthesise_workflow_tests(
             code,
             allowed_commands=set(subset_names),
             prefix=spec.command_prefix,
-            preamble=_WF_IMPORT_PREAMBLE_DDB if is_ddb else _WF_IMPORT_PREAMBLE,
+            preamble=profile.wf_preamble,
         )
         if len(results) > len(best_results):
             best_results = results
@@ -2116,6 +2526,7 @@ def _split_workflow_functions(
         try:
             import os as _os
             import tempfile as _tempfile
+
             dump_dir = _os.environ.get("R2E_WORKFLOW_DUMP_DIR") or _tempfile.gettempdir()
             _os.makedirs(dump_dir, exist_ok=True)
             fd, path = _tempfile.mkstemp(prefix="workflow-fail-", suffix=".py", dir=dump_dir)
@@ -2124,10 +2535,12 @@ def _split_workflow_functions(
             lines = code.splitlines()
             lo = max(0, (exc.lineno or 1) - 4)
             hi = min(len(lines), (exc.lineno or 1) + 3)
-            snippet = "\n".join(f"{i+1:4d}: {lines[i]}" for i in range(lo, hi))
+            snippet = "\n".join(f"{i + 1:4d}: {lines[i]}" for i in range(lo, hi))
             logger.warning(
                 "workflow-test synthesis returned invalid Python: %s (dumped to %s)\n%s",
-                exc, path, snippet,
+                exc,
+                path,
+                snippet,
             )
         except OSError:
             logger.warning("workflow-test synthesis returned invalid Python: %s", exc)
@@ -2207,8 +2620,38 @@ def _commands_used_in_cli_calls(fn: ast.FunctionDef, prefix: str) -> set[str]:
 # ---------------------------------------------------------------------------
 
 
+def _test_uses_pytest_skip_or_xfail(tree: ast.AST) -> bool:
+    """AST-detect a pytest skip/xfail marker or call so the zero-skip gate cannot be
+    fooled by a string/comment mention (matches only pytest.* / pytest.mark.* roots)."""
+    markers = {"skip", "skipif", "xfail"}
+
+    def _pytest_rooted(node: ast.expr) -> bool:
+        cur: ast.expr = node
+        while isinstance(cur, ast.Attribute):
+            cur = cur.value
+        return isinstance(cur, ast.Name) and cur.id in ("pytest", "mark")
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            for dec in node.decorator_list:
+                d = dec.func if isinstance(dec, ast.Call) else dec
+                if isinstance(d, ast.Attribute) and d.attr in markers and _pytest_rooted(d):
+                    return True
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in ("skip", "xfail", "importorskip")
+            and _pytest_rooted(node.func)
+        ):
+            return True
+    return False
+
+
 def _gauntlet_static(
-    test_code: str, *, expected_behaviour_tag: str | None = None
+    test_code: str,
+    *,
+    expected_behaviour_tag: str | None = None,
+    forbid_skips: bool = False,
 ) -> tuple[bool, str]:
     """G1 (compile) + G2 (structural) + G2b (returncode polarity vs tag)."""
     # G1
@@ -2216,6 +2659,8 @@ def _gauntlet_static(
         tree = ast.parse(test_code)
     except SyntaxError as exc:
         return False, f"G1_compile: {exc}"
+    if forbid_skips and _test_uses_pytest_skip_or_xfail(tree):
+        return False, "G2e_noskip: test uses a pytest skip/xfail marker (zero-skip guarantee)"
     # G2: must define at least one `def test_*` function with a body
     found_test = False
     for node in ast.walk(tree):
@@ -2241,21 +2686,25 @@ def _gauntlet_static(
         )
         if not asserts_failure:
             return False, "G2b_polarity: error-tagged test does not assert returncode != 0"
-        # `returncode != 0` is trivially satisfied by a missing submission
-        # (python exits 2 with "can't open file"). Require an aws-cli-specific
-        # signal: stderr substring match, or a pinned exit code in the widened
-        # DDB error set {252 argparse, 254 service, 255 client-unwrapped}.
-        has_stderr_signal = bool(
-            re.search(r"in\s+(?:[A-Za-z_][A-Za-z_0-9]*\.)?stderr\b", test_code)
-            or re.search(r"\.stderr\s*(?:==|\.startswith|\.endswith)", test_code)
+        # `returncode != 0` is trivially satisfied by a missing submission AND by a
+        # token-stub that prints a fixed blob of error words. Require a SPECIFIC signal:
+        # a stderr assertion on a service error code (NOT a generic "error"/"failed"
+        # word a stub can farm), a stderr ==/startswith/endswith, or a pinned exit code.
+        _generic_err = {"error", "errors", "exception", "failed", "failure", "invalid", "usage"}
+        _stderr_tokens = re.findall(
+            r"""["']([^"']+)["']\s+in\s+(?:[A-Za-z_]\w*\.)?stderr\b""", test_code
         )
+        has_specific_stderr = any(
+            t.strip().lower() not in _generic_err and len(t.strip()) >= 4 for t in _stderr_tokens
+        )
+        has_stderr_cmp = bool(re.search(r"\.stderr\s*(?:==|\.startswith|\.endswith)", test_code))
         has_pinned_exit = bool(re.search(r"returncode\s*==\s*(?:252|254|255)\b", test_code))
-        if not (has_stderr_signal or has_pinned_exit):
+        if not (has_specific_stderr or has_stderr_cmp or has_pinned_exit):
             return (
                 False,
-                "G2c_signal: error-tagged test lacks a specific failure signal "
-                "(stderr substring or returncode in {252,254,255}); "
-                "`returncode != 0` alone is nop-discriminative",
+                "G2c_signal: error test lacks a SPECIFIC failure signal (a service error "
+                "code in stderr, not a generic 'error'/'failed' word; or exit in "
+                "{252,254,255}) - a token-stub farms generic words",
             )
     elif expected_behaviour_tag == "happy_path":
         asserts_success = bool(re.search(r"returncode\s*==\s*0", test_code))
@@ -2267,6 +2716,7 @@ def _gauntlet_static(
         # depends on cli's observable effect and not just the exit code.
         has_state_check = bool(
             re.search(r"\b(?:ddb_client|s3_client|minio_client)\s*\.\s*[a-z_]+\s*\(", test_code)
+            or re.search(r"\.\s*rpc\s*\(", test_code)
         )
         if not has_state_check:
             return (
@@ -2327,7 +2777,7 @@ def _build_dockerfile(
         )
     return (
         "# syntax=docker/dockerfile:1\n"
-        "# Auto-generated by Repo2RLEnv code_instruct cli_app mode\n"
+        "# Task environment for the aws CLI (S3/MinIO backend).\n"
         f"ARG BASE_IMAGE={base_image}\n"
         "FROM ${BASE_IMAGE}\n"
         "ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \\\n"
@@ -2340,9 +2790,14 @@ def _build_dockerfile(
         "      git ca-certificates && rm -rf /var/lib/apt/lists/*\n"
         f"ARG MINIO_VERSION={PINNED_MINIO_VERSION}\n"
         'RUN m="$(dpkg --print-architecture)"; \\\n'
-        '    case "$m" in arm64) a=arm64;; amd64) a=amd64;; *) a="$m";; esac; \\\n'
+        '    case "$m" in \\\n'
+        f'      arm64) a=arm64; sha="{PINNED_MINIO_SHA256_ARM64}";; \\\n'
+        f'      amd64) a=amd64; sha="{PINNED_MINIO_SHA256_AMD64}";; \\\n'
+        '      *) echo "unsupported arch: $m" >&2; exit 1;; \\\n'
+        "    esac; \\\n"
         '    curl -fsSL "https://dl.min.io/server/minio/release/linux-${a}/archive/minio.${MINIO_VERSION}" '
         "-o /usr/local/bin/minio && \\\n"
+        '    echo "${sha}  /usr/local/bin/minio" | sha256sum -c - && \\\n'
         "    chmod +x /usr/local/bin/minio && minio --version\n"
         "RUN pip install --no-cache-dir --upgrade pip\n"
         f"RUN pip install --no-cache-dir {deps_line}\n"
@@ -2448,7 +2903,7 @@ def _build_conftest(*, backend: str = "minio", golden: bool = False) -> str:
         if golden
         else 'sys.executable, "/workspace/submission/main.py"'
     )
-    template = '''"""Auto-generated by Repo2RLEnv code_instruct cli_app mode (MinIO backend).
+    template = '''"""Test fixtures for the aws CLI task (MinIO/S3 backend).
 
 Module-scoped MinIO subprocess + iterate-and-delete reset between tests.
 The agent's submission runs as a subprocess; we boot MinIO on a random
@@ -2464,38 +2919,38 @@ import sys
 import time as _time
 import http.client as _http
 
-_R2E_ORIG_CONNECT = _socket.socket.connect
-_R2E_BLOCKED_SUFFIXES = (__BLOCKED_SUFFIXES__,)
+_ORIG_CONNECT = _socket.socket.connect
+_BLOCKED_SUFFIXES = (__BLOCKED_SUFFIXES__,)
 
 
-def _r2e_guarded_connect(self, address):
+def _guarded_connect(self, address):
     if self.family in (_socket.AF_INET, _socket.AF_INET6) and isinstance(address, tuple):
         host = address[0]
         try:
             ip = ipaddress.ip_address(host)
         except ValueError:
-            for suffix in _R2E_BLOCKED_SUFFIXES:
+            for suffix in _BLOCKED_SUFFIXES:
                 if host.lower() == suffix or host.lower().endswith("." + suffix):
-                    raise RuntimeError(f"r2e:network-isolation: connect to {host!r} blocked")
+                    raise RuntimeError(f"network-isolation: connect to {host!r} blocked")
         else:
-            if not (ip.is_loopback or ip.is_private or ip.is_link_local):
+            if not (ip.is_loopback or ip.is_private):
                 raise RuntimeError(
-                    f"r2e:network-isolation: connect to public IP {host!r} blocked"
+                    f"network-isolation: connect to public IP {host!r} blocked"
                 )
-    return _R2E_ORIG_CONNECT(self, address)
+    return _ORIG_CONNECT(self, address)
 
 
-_socket.socket.connect = _r2e_guarded_connect
-def _r2e_guarded_connect_ex(self, addr):
+_socket.socket.connect = _guarded_connect
+def _guarded_connect_ex(self, addr):
     import errno as _errno
     try:
-        _r2e_guarded_connect(self, addr)
+        _guarded_connect(self, addr)
         return 0
     except RuntimeError:
         return _errno.EACCES
     except OSError as exc:
         return exc.errno
-_socket.socket.connect_ex = _r2e_guarded_connect_ex
+_socket.socket.connect_ex = _guarded_connect_ex
 
 import pytest
 from io import BytesIO
@@ -2855,9 +3310,7 @@ def _build_conftest_ddb(*, golden: bool = False) -> str:
         if golden
         else 'sys.executable, "/workspace/submission/main.py"'
     )
-    cli_check_path = (
-        "/workspace/submission/aws" if golden else "/workspace/submission/main.py"
-    )
+    cli_check_path = "/workspace/submission/aws" if golden else "/workspace/submission/main.py"
     template = '''"""Session-scoped DynamoDB Local (compose sidecar) client + drop-all-tables reset
 between tests. The engine is reached via AWS_ENDPOINT_URL_DYNAMODB, wired by
 docker-compose to the ``ddb`` service at http://ddb:8000. The agent's submission
@@ -2871,38 +3324,38 @@ import subprocess
 import sys
 import time as _time
 
-_R2E_ORIG_CONNECT = _socket.socket.connect
-_R2E_BLOCKED_SUFFIXES = (__BLOCKED_SUFFIXES__,)
+_ORIG_CONNECT = _socket.socket.connect
+_BLOCKED_SUFFIXES = (__BLOCKED_SUFFIXES__,)
 
 
-def _r2e_guarded_connect(self, address):
+def _guarded_connect(self, address):
     if self.family in (_socket.AF_INET, _socket.AF_INET6) and isinstance(address, tuple):
         host = address[0]
         try:
             ip = ipaddress.ip_address(host)
         except ValueError:
-            for suffix in _R2E_BLOCKED_SUFFIXES:
+            for suffix in _BLOCKED_SUFFIXES:
                 if host.lower() == suffix or host.lower().endswith("." + suffix):
-                    raise RuntimeError(f"r2e:network-isolation: connect to {host!r} blocked")
+                    raise RuntimeError(f"network-isolation: connect to {host!r} blocked")
         else:
-            if not (ip.is_loopback or ip.is_private or ip.is_link_local):
+            if not (ip.is_loopback or ip.is_private):
                 raise RuntimeError(
-                    f"r2e:network-isolation: connect to public IP {host!r} blocked"
+                    f"network-isolation: connect to public IP {host!r} blocked"
                 )
-    return _R2E_ORIG_CONNECT(self, address)
+    return _ORIG_CONNECT(self, address)
 
 
-_socket.socket.connect = _r2e_guarded_connect
-def _r2e_guarded_connect_ex(self, addr):
+_socket.socket.connect = _guarded_connect
+def _guarded_connect_ex(self, addr):
     import errno as _errno
     try:
-        _r2e_guarded_connect(self, addr)
+        _guarded_connect(self, addr)
         return 0
     except RuntimeError:
         return _errno.EACCES
     except OSError as exc:
         return exc.errno
-_socket.socket.connect_ex = _r2e_guarded_connect_ex
+_socket.socket.connect_ex = _guarded_connect_ex
 
 import pytest
 
@@ -3664,15 +4117,11 @@ def _command_section_parts(
     documented_flags = set(cmd_spec.flags or [])
     if documented_flags:
         parts.append(
-            "Documented flags: "
-            + ", ".join(f"`{f}`" for f in sorted(documented_flags))
-            + "\n"
+            "Documented flags: " + ", ".join(f"`{f}`" for f in sorted(documented_flags)) + "\n"
         )
     flags_union = observed_flags | documented_flags
     if flags_union:
-        parts.append(
-            "Flags observed: " + ", ".join(f"`{f}`" for f in sorted(flags_union)) + "\n"
-        )
+        parts.append("Flags observed: " + ", ".join(f"`{f}`" for f in sorted(flags_union)) + "\n")
 
     state_model = _COMMAND_STATE_MODEL.get((prefix, cmd_spec.name))
     if state_model:
@@ -3906,6 +4355,294 @@ def _build_subset_instruction_md_ddb(
         "  malformed value)\n"
         "- `254` — service-modeled error (the service returned a modeled exception\n"
         "  such as `ResourceNotFoundException`)\n"
+        "- `255` — other or general error\n\n"
+        "Tests only check `returncode != 0` on failure; any non-zero code in this set\n"
+        "is acceptable.\n"
+    )
+    return "\n".join(parts) + "\n"
+
+
+def _build_instruction_md_generic(
+    spec: CliSpec,
+    cmd_spec: CommandSpec,
+    intents: list[TestIntent],
+    *,
+    sidecar: SidecarSpec,
+) -> str:
+    """Model-backend (sidecar) instruction.md, generalised by SidecarSpec.
+
+    Mirrors the leakage-clean shape of ``_build_instruction_md_ddb`` (JSON stdout,
+    error categories, exit-code set, aws-on-PATH) but parameterised by
+    ``sidecar.service``. Wire/endpoint detail (X-Amz-Target, JSON version, the
+    sidecar endpoint) is deliberately kept OUT of instruction.md and lives only in
+    the prompt set, so ``_assert_no_test_leakage`` stays satisfied for any service.
+    """
+    service = sidecar.service
+    by_tag = _group_by_tag(intents)
+    flags = _extract_flags_from_intents(intents)
+    cmd_label = f"{spec.command_prefix} {cmd_spec.name}"
+    state_model = _COMMAND_STATE_MODEL.get((spec.command_prefix, cmd_spec.name))
+
+    parts: list[str] = []
+    parts.append(f"# Build `aws {cmd_label}` CLI\n")
+    parts.append(
+        "## Application overview\n\n"
+        f"You will implement the `aws {cmd_label}` subcommand of the AWS CLI's\n"
+        f"{service} family.\n\n"
+        "Your code is invoked as a subprocess:\n\n"
+        "```bash\n"
+        f"aws {cmd_label} [args...]\n"
+        "```\n\n"
+        "After any successful operation, its effect must be observable via the\n"
+        f"documented {service} read operations. Treat the backend as real AWS\n"
+        f"{service} and keep state consistent with the {service} API contract.\n"
+    )
+
+    parts.append(f"## Command: `{cmd_label}`\n")
+
+    parts.append("Argv shapes observed:\n")
+    seen_shapes: set[str] = set()
+    for intent in intents:
+        if _is_internal_mutation_intent(intent):
+            continue
+        shape = _argv_shape(intent.cmdline_template)
+        if shape and shape not in seen_shapes:
+            seen_shapes.add(shape)
+            parts.append(f"- `{shape}`")
+    parts.append("")
+
+    if flags:
+        parts.append("Flags: " + ", ".join(f"`{f}`" for f in sorted(flags)) + "\n")
+
+    success_ops = sorted(
+        {op for i in intents if i.expected_exit == 0 for op in i.expected_state_calls}
+    )
+    parts.append("Behavior:\n")
+    parts.append(
+        "- On success: the operation's JSON response document is written to stdout\n"
+        "  (parseable with `json.loads`); stderr is empty; exit code is `0`.\n"
+        "  Assertions are on JSON semantic content, never on key order, whitespace,\n"
+        "  or any textual preamble."
+    )
+    if success_ops:
+        bullets = ", ".join(f"`{op}`" for op in success_ops)
+        parts.append(
+            f"- Observable side effects — the underlying {service} operations invoked\n"
+            f"  must include at least: {bullets}."
+        )
+    if by_tag.get("error"):
+        parts.append(
+            "- On error: stdout is empty; stderr identifies the error CATEGORY (the\n"
+            "  service's exception name, e.g. a `...Exception` / `...NotFound` /\n"
+            "  `...InUse` class). Tests match on the error-code keyword, never on\n"
+            "  verbatim wording. Exit is non-zero; tests require `returncode != 0`,\n"
+            "  never equality with any specific non-zero code."
+        )
+        parts.append("- Specific error cases:")
+        shape_key_to_categories: dict[tuple[str, int], list[str]] = {}
+        shape_key_order: list[tuple[str, int]] = []
+        for intent in by_tag["error"]:
+            if _is_internal_mutation_intent(intent):
+                continue
+            shape = _argv_shape(intent.cmdline_template) or "<argv>"
+            key = (shape, intent.expected_exit)
+            if key not in shape_key_to_categories:
+                shape_key_to_categories[key] = []
+                shape_key_order.append(key)
+            if intent.error_category:
+                shape_key_to_categories[key].append(intent.error_category)
+        for shape, exit_code in shape_key_order:
+            cats = shape_key_to_categories[(shape, exit_code)]
+            if cats:
+                unique_cats = sorted(set(cats))
+                cat_txt = ", ".join(f"`{c}`" for c in unique_cats)
+                parts.append(f"  - `{shape}` → any of: {cat_txt}")
+            else:
+                parts.append(f"  - `{shape}` → non-zero exit")
+    parts.append("")
+
+    if state_model:
+        parts.append("## State expectations\n")
+        parts.append(state_model + "\n")
+
+    examples = _render_examples(intents, cmd_label, invocation="aws")
+    if examples:
+        parts.append("## Examples\n")
+        parts.append("```bash")
+        parts.extend(examples)
+        parts.append("```\n")
+
+    parts.append(
+        "## Implementation constraints\n\n"
+        "- Your submission may be written in any language available in the image.\n"
+        "  Use only what the image already provides; no additional packages may be\n"
+        "  fetched.\n"
+        "- Do not import `awscli` or shell out to the real `aws` binary.\n"
+        "- AWS credentials and endpoint are set in the environment; do not override\n"
+        "  the service address, region, or credentials in code.\n"
+        "- Success output (JSON) goes to **stdout**; errors go to **stderr**. Do not\n"
+        "  mix them.\n"
+        "- Do not surface raw library tracebacks; print a brief user-facing error\n"
+        "  string instead.\n"
+        "- Do not fabricate flags that do not exist upstream. Do not validate input\n"
+        "  client-side; the service rejects malformed input with a validation error.\n"
+        "- Your submission must be an executable named `aws` on `$PATH`. It may be\n"
+        "  written in any language. The image provides `/workspace/submission/` first\n"
+        "  on `$PATH` as a convenient writable install location, but any directory on\n"
+        "  `$PATH` is acceptable. Helper files may live alongside it.\n"
+    )
+
+    parts.append(
+        "## Output contract\n\n"
+        "A correct implementation produces output in the *shape* described below,\n"
+        "names the *class* of any error reported, uses the documented exit-code\n"
+        "set, and never surfaces a runtime stack trace. Specific verbs and the\n"
+        "exact wording of any message are deliberately not enumerated here: derive\n"
+        f"them from the underlying {service} service semantics and standard\n"
+        f"`aws {spec.command_prefix}` conventions.\n"
+    )
+
+    parts.append(
+        "### stdout (success path)\n\n"
+        "- A successful command writes the operation's JSON response document to\n"
+        "  stdout (parseable with `json.loads`).\n"
+        "- Assertions are on JSON semantic content, never on key order, whitespace,\n"
+        "  or any textual preamble.\n"
+        "- stderr is empty on success.\n"
+    )
+
+    parts.append(
+        "### stderr (failure path)\n\n"
+        "- stdout is empty on failure.\n"
+        "- A human-readable error line is written to stderr that identifies the\n"
+        "  failure *class*. Any of the following shapes is acceptable:\n"
+        "  - the underlying AWS service error envelope:\n"
+        "    `An error occurred (<ErrorCode>) when calling the <Operation> operation: <message>`\n"
+        "  - a bare `<ErrorCode>: <message>` line naming the service error code\n"
+        "  - a client-side usage-error line whose prefix names the failure class\n"
+        "    (for example, `usage: ...`, `Parameter validation failed: ...`,\n"
+        "    `Unknown options: ...`)\n"
+        "- Tests match the failure *class* against one of these shapes — not\n"
+        "  verbatim wording — so any spec-compliant phrasing is accepted.\n"
+        "- No runtime stack trace is emitted under any condition.\n"
+    )
+
+    parts.append(
+        "### Exit codes\n\n"
+        "The exit code on termination is one of `{0, 1, 252, 254, 255}`:\n\n"
+        "- `0` — success\n"
+        "- `1` — application error (an operation was attempted and failed)\n"
+        "- `252` — parameter/usage error (unknown flag, missing/extra argument,\n"
+        "  malformed value)\n"
+        "- `254` — service-modeled error (the service returned a modeled exception)\n"
+        "- `255` — other or general error\n\n"
+        "Tests only check `returncode != 0` on failure; any non-zero code in this set\n"
+        "is acceptable.\n"
+    )
+    return "\n".join(parts) + "\n"
+
+
+def _build_subset_instruction_md_generic(
+    spec: CliSpec,
+    cmd_specs: list[CommandSpec],
+    intents: list[TestIntent],
+    *,
+    sidecar: SidecarSpec,
+) -> str:
+    service = sidecar.service
+    prefix = spec.command_prefix
+    names = sorted(c.name for c in cmd_specs)
+    label_list = ", ".join(f"`{prefix} {n}`" for n in names)
+    parts: list[str] = []
+
+    parts.append(f"# Build an `aws {prefix}` CLI\n")
+    parts.append(
+        "## Application overview\n\n"
+        f"You will implement the following `aws {prefix}` commands:\n"
+        f"{label_list}.\n\n"
+        "Your code is invoked as a subprocess:\n\n"
+        "```bash\n"
+        f"aws {prefix} <command> [args...]\n"
+        "```\n\n"
+        "Dispatch on the `<command>` token so one program handles every subcommand\n"
+        f"above. State must remain consistent across commands so a sequence of\n"
+        f"{service} operations behaves correctly end-to-end.\n"
+    )
+
+    parts.append("## Commands\n")
+    by_cmd: dict[str, list[TestIntent]] = {}
+    for i in intents:
+        by_cmd.setdefault(i.command, []).append(i)
+    for c in sorted(cmd_specs, key=lambda c: c.name):
+        parts.extend(_command_section_parts(spec, c, by_cmd.get(c.name, [])))
+
+    parts.append("## Cross-command behavior\n")
+    parts.append("State must remain consistent across the command set:\n")
+    parts.append(
+        "- After any successful operation, its effect MUST be observable via the\n"
+        "  documented read operations of the other commands.\n"
+    )
+
+    parts.append(
+        "## Implementation constraints\n\n"
+        "- Your submission may be written in any language available in the image.\n"
+        "  Use only what the image already provides; no additional packages may be\n"
+        "  fetched.\n"
+        "- Do not import `awscli` or shell out to the real `aws` binary.\n"
+        "- AWS credentials and endpoint are set in the environment; do not override\n"
+        "  the service address, region, or credentials in code.\n"
+        "- Success output (JSON) goes to **stdout**; errors go to **stderr**. Do not\n"
+        "  mix them.\n"
+        "- Do not surface raw library tracebacks; print a brief user-facing error\n"
+        "  string instead.\n"
+        "- Do not fabricate flags that do not exist upstream. Do not validate input\n"
+        "  client-side; the service rejects malformed input with a validation error.\n"
+        "- Your submission must be an executable named `aws` on `$PATH`. It may be\n"
+        "  written in any language. The image provides `/workspace/submission/` first\n"
+        "  on `$PATH` as a convenient writable install location, but any directory on\n"
+        "  `$PATH` is acceptable. Helper files may live alongside it.\n"
+    )
+
+    parts.append(
+        "## Output contract\n\n"
+        "A correct implementation produces output in the *shape* described below,\n"
+        "names the *class* of any error reported, uses the documented exit-code\n"
+        "set, and never surfaces a runtime stack trace. Specific verbs and the\n"
+        "exact wording of any message are deliberately not enumerated here: derive\n"
+        f"them from the underlying {service} service semantics and standard\n"
+        f"`aws {prefix}` conventions.\n"
+    )
+    parts.append(
+        "### stdout (success path)\n\n"
+        "- A successful command writes the operation's JSON response document to\n"
+        "  stdout (parseable with `json.loads`).\n"
+        "- Assertions are on JSON semantic content, never on key order, whitespace,\n"
+        "  or any textual preamble.\n"
+        "- stderr is empty on success.\n"
+    )
+    parts.append(
+        "### stderr (failure path)\n\n"
+        "- stdout is empty on failure.\n"
+        "- A human-readable error line is written to stderr that identifies the\n"
+        "  failure *class*. Any of the following shapes is acceptable:\n"
+        "  - the underlying AWS service error envelope:\n"
+        "    `An error occurred (<ErrorCode>) when calling the <Operation> operation: <message>`\n"
+        "  - a bare `<ErrorCode>: <message>` line naming the service error code\n"
+        "  - a client-side usage-error line whose prefix names the failure class\n"
+        "    (for example, `usage: ...`, `Parameter validation failed: ...`,\n"
+        "    `Unknown options: ...`)\n"
+        "- Tests match the failure *class* against one of these shapes — not\n"
+        "  verbatim wording — so any spec-compliant phrasing is accepted.\n"
+        "- No runtime stack trace is emitted under any condition.\n"
+    )
+    parts.append(
+        "### Exit codes\n\n"
+        "The exit code on termination is one of `{0, 1, 252, 254, 255}`:\n\n"
+        "- `0` — success\n"
+        "- `1` — application error (an operation was attempted and failed)\n"
+        "- `252` — parameter/usage error (unknown flag, missing/extra argument,\n"
+        "  malformed value)\n"
+        "- `254` — service-modeled error (the service returned a modeled exception)\n"
         "- `255` — other or general error\n\n"
         "Tests only check `returncode != 0` on failure; any non-zero code in this set\n"
         "is acceptable.\n"
@@ -4287,6 +5024,87 @@ def _build_or_reuse_docker_image(dockerfile_content: str, ctx_dir: Path) -> str 
     return tag
 
 
+# A generic sidecar backend (kinesalite/local-kms/elasticmq/cognito) runs its fake
+# service as a SEPARATE container, so the network-isolated gate containers cannot reach
+# it the way DDB reaches its baked-in loopback JVM. Instead we start the sidecar on a
+# throwaway docker network and have each gate container join that network with
+# AWS_ENDPOINT_URL pointed at it. Internet isolation is still enforced by the conftest's
+# socket guard (public IPs rejected) -- only the private sidecar host is reachable.
+def _wait_sidecar_ready(
+    network: str, host: str, port: int, probe_image: str, timeout_sec: int
+) -> bool:
+    """Poll (from a throwaway container on the net) until the sidecar TCP port opens."""
+    probe = (
+        "import socket,time,sys\n"
+        f"for _ in range({max(1, timeout_sec)} * 2):\n"
+        "    s = socket.socket(); s.settimeout(1)\n"
+        "    try:\n"
+        f"        s.connect(('{host}', {port})); s.close(); sys.exit(0)\n"
+        "    except Exception:\n"
+        "        time.sleep(0.5)\n"
+        "sys.exit(1)\n"
+    )
+    try:
+        r = subprocess.run(
+            ["docker", "run", "--rm", "--network", network, probe_image, "python3", "-c", probe],
+            capture_output=True,
+            timeout=timeout_sec + 15,
+        )
+        return r.returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+
+
+@contextlib.contextmanager
+def _sidecar_up(spec: SidecarSpec, *, probe_image: str, timeout_sec: int = 40):
+    """Start ``spec``'s backend as a sidecar on a throwaway docker network, yielding
+    ``(network, endpoint_url)`` for gate containers to join. Always tears down the
+    container + network, even on failure."""
+    net = f"r2e-side-{uuid4().hex[:10]}"
+    cname = f"{spec.sidecar_service}-{uuid4().hex[:8]}"
+    endpoint = spec.sidecar_endpoint()
+    subprocess.run(["docker", "network", "create", net], check=True, capture_output=True)
+    try:
+        run_cmd = [
+            "docker",
+            "run",
+            "-d",
+            "--name",
+            cname,
+            "--network",
+            net,
+            "--network-alias",
+            spec.sidecar_service,
+        ]
+        for kv in spec.sidecar_env:
+            run_cmd += ["-e", kv]
+        if spec.sidecar_entrypoint:
+            run_cmd += ["--entrypoint", spec.sidecar_entrypoint[0]]
+        run_cmd += [spec.sidecar_image, *spec.sidecar_command]
+        subprocess.run(run_cmd, check=True, capture_output=True)
+        if not _wait_sidecar_ready(
+            net, spec.sidecar_service, spec.sidecar_port, probe_image, timeout_sec
+        ):
+            logger.warning(
+                "sidecar %s not ready within %ds; proceeding (conftest re-polls)",
+                spec.sidecar_service,
+                timeout_sec,
+            )
+        yield net, endpoint
+    finally:
+        subprocess.run(["docker", "rm", "-f", cname], capture_output=True)
+        subprocess.run(["docker", "network", "rm", net], capture_output=True)
+
+
+def _sidecar_docker_args(sidecar: tuple[str, str] | None) -> list[str]:
+    """Network + endpoint args for a gate container: isolated (``--network=none``) by
+    default, or joined to a running sidecar network with AWS_ENDPOINT_URL set."""
+    if sidecar is None:
+        return ["--network=none"]
+    net, endpoint = sidecar
+    return ["--network", net, "-e", f"AWS_ENDPOINT_URL={endpoint}"]
+
+
 def _docker_run_test_sh(
     image_tag: str,
     bundle_dir: Path,
@@ -4294,6 +5112,7 @@ def _docker_run_test_sh(
     oracle_override_path: Path | None = None,
     *,
     wrapper: str | None = None,
+    sidecar: tuple[str, str] | None = None,
 ) -> dict:
     """Run /workspace/tests/test.sh in the container. Returns parsed summary."""
     cmd = [
@@ -4302,7 +5121,7 @@ def _docker_run_test_sh(
         "--rm",
         "--cpus=1.0",
         "--memory=1g",
-        "--network=none",
+        *_sidecar_docker_args(sidecar),
         "-v",
         f"{bundle_dir / 'tests'}:/workspace/tests:ro",
     ]
@@ -4323,6 +5142,110 @@ def _docker_run_test_sh(
     except subprocess.TimeoutExpired:
         return {"passed": 0, "total": 0, "pass_rate": 0.0, "summary": "TIMEOUT"}
     return _parse_test_sh_summary(out)
+
+
+def _certify_golden(
+    *,
+    dockerfile: str,
+    conftest: str,
+    test_files: dict[str, str],
+    test_script: str,
+    gold_files: dict[str, str],
+    extra_tests_aux: dict[str, str] | None = None,
+    timeout_sec: int,
+    backend: str = "minio",
+) -> dict:
+    """Run the shipped tests against the SLICED GOLDEN (submission/aws) in Docker and
+    return the pass summary. A golden that fails any shipped test means an incomplete
+    slice, so the caller rejects the task. Mounts the whole golden submission tree over
+    /workspace/submission (multi-file, unlike the single-main.py oracle override)."""
+    # Network-isolated cert can't reach the ddb:8000 sidecar; bake+start DDB on
+    # loopback via ddb-wrap, same as the gauntlet / ref-grounding paths.
+    cert_dockerfile = dockerfile
+    wrapper: str | None = None
+    if backend == "dynamodb_local":
+        cert_dockerfile = dockerfile + _DDB_GAUNTLET_LAYERS + _AWSCLI_INSTALL_LAYERS
+        wrapper = _DDB_GAUNTLET_WRAPPER
+    with tempfile.TemporaryDirectory(prefix="r2e-goldcert-ctx-") as ctx_str:
+        ctx = Path(ctx_str)
+        (ctx / "Dockerfile").write_text(cert_dockerfile)
+        image = _build_or_reuse_docker_image(cert_dockerfile, ctx)
+    if image is None:
+        return {"skipped": True, "reason": "docker_unavailable"}
+
+    sidecar_spec = resolve_sidecar(backend)
+    sidecar_ctx = (
+        _sidecar_up(sidecar_spec, probe_image=image)
+        if sidecar_spec is not None
+        else contextlib.nullcontext(None)
+    )
+    with (
+        tempfile.TemporaryDirectory(prefix="r2e-goldcert-bundle-") as b_str,
+        sidecar_ctx as sidecar,
+    ):
+        bundle = Path(b_str)
+        tests_dir = bundle / "tests"
+        tests_dir.mkdir()
+        (tests_dir / "conftest.py").write_text(conftest)
+        (tests_dir / "__init__.py").write_text("")
+        for rel, content in (extra_tests_aux or {}).items():
+            if rel.startswith("tests/"):
+                tgt = bundle / rel
+                tgt.parent.mkdir(parents=True, exist_ok=True)
+                tgt.write_text(content)
+        for fname, code in test_files.items():
+            (tests_dir / fname).write_text(code)
+        (tests_dir / "test.sh").write_text(test_script)
+        (tests_dir / "test.sh").chmod(0o755)
+        for rel, content in gold_files.items():
+            tgt = bundle / rel
+            tgt.parent.mkdir(parents=True, exist_ok=True)
+            tgt.write_text(content)
+        aws_shim = bundle / "submission" / "aws"
+        if aws_shim.is_file():
+            aws_shim.chmod(0o755)
+        cmd = [
+            "docker",
+            "run",
+            "--rm",
+            "--cpus=1.0",
+            "--memory=1g",
+            *_sidecar_docker_args(sidecar),
+            "-v",
+            f"{tests_dir}:/workspace/tests:ro",
+            "-v",
+            f"{bundle / 'submission'}:/workspace/submission:ro",
+            image,
+        ]
+        if wrapper is not None:
+            cmd.append(wrapper)
+        cmd.extend(["bash", "/workspace/tests/test.sh"])
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+            full = result.stdout + "\n" + result.stderr
+        except subprocess.TimeoutExpired:
+            return {
+                "skipped": False,
+                "passed": 0,
+                "total": 0,
+                "pass_rate": 0.0,
+                "summary": "TIMEOUT",
+            }
+        parsed = _parse_test_sh_summary(full[-4000:])
+        if parsed.get("pass_rate", 0.0) < 1.0:
+            ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+            dbg = Path(tempfile.gettempdir()) / f"r2e-goldcert-debug-{ts}"
+            dbg.mkdir(parents=True, exist_ok=True)
+            (dbg / "output.log").write_text(full)
+            with contextlib.suppress(Exception):
+                shutil.copytree(bundle / "tests", dbg / "tests")
+            logger.warning(
+                "golden cert failed (%d/%d passed); debug saved to %s",
+                parsed.get("passed", 0),
+                parsed.get("total", 0),
+                dbg,
+            )
+        return {"skipped": False, **parsed}
 
 
 def _run_docker_gauntlet_g3g4(
@@ -4353,7 +5276,16 @@ def _run_docker_gauntlet_g3g4(
     if image is None:
         return {"skipped": True, "reason": "docker_unavailable"}
 
-    with tempfile.TemporaryDirectory(prefix="r2e-gauntlet-bundle-") as b_str:
+    sidecar_spec = resolve_sidecar(backend)
+    sidecar_ctx = (
+        _sidecar_up(sidecar_spec, probe_image=image)
+        if sidecar_spec is not None
+        else contextlib.nullcontext(None)
+    )
+    with (
+        tempfile.TemporaryDirectory(prefix="r2e-gauntlet-bundle-") as b_str,
+        sidecar_ctx as sidecar,
+    ):
         bundle = Path(b_str)
         (bundle / "tests").mkdir()
         for rel, content in aux_files.items():
@@ -4366,7 +5298,7 @@ def _run_docker_gauntlet_g3g4(
 
         # G3: empty stub (image bakes empty stub at /workspace/submission/main.py)
         g3 = _docker_run_test_sh(
-            image, bundle, timeout_sec, oracle_override_path=None, wrapper=wrapper
+            image, bundle, timeout_sec, oracle_override_path=None, wrapper=wrapper, sidecar=sidecar
         )
         logger.info(
             "G3 empty stub: %d/%d passed (rate=%.2f, max=%.2f)",
@@ -4380,7 +5312,12 @@ def _run_docker_gauntlet_g3g4(
         oracle_path = bundle / "main.py"
         oracle_path.write_text(oracle_code)
         g4 = _docker_run_test_sh(
-            image, bundle, timeout_sec, oracle_override_path=oracle_path, wrapper=wrapper
+            image,
+            bundle,
+            timeout_sec,
+            oracle_override_path=oracle_path,
+            wrapper=wrapper,
+            sidecar=sidecar,
         )
         logger.info(
             "G4 oracle: %d/%d passed (rate=%.2f, min=%.2f)",
@@ -4472,6 +5409,7 @@ def _docker_run_pertest(
     override_path: Path | None = None,
     *,
     wrapper: str | None = None,
+    sidecar: tuple[str, str] | None = None,
 ) -> tuple[set[str], str]:
     """Run the test bank in the container; return (passed test-file names, full output).
 
@@ -4483,7 +5421,7 @@ def _docker_run_pertest(
         "--rm",
         "--cpus=1.0",
         "--memory=1g",
-        "--network=none",
+        *_sidecar_docker_args(sidecar),
         "-v",
         f"{bundle_dir / 'tests'}:/workspace/tests:ro",
     ]
@@ -4504,7 +5442,13 @@ def _docker_run_pertest(
             wrapper or "none",
             len(exc.stdout or b"") if exc.stdout else 0,
         )
-        return set(), (exc.stdout or "") + "\n[TIMEOUT]\n" + (exc.stderr or "")
+        partial_out = exc.stdout or ""
+        partial_err = exc.stderr or ""
+        if isinstance(partial_out, bytes):
+            partial_out = partial_out.decode("utf-8", "replace")
+        if isinstance(partial_err, bytes):
+            partial_err = partial_err.decode("utf-8", "replace")
+        return set(), partial_out + "\n[TIMEOUT]\n" + partial_err
     out = result.stdout + "\n" + result.stderr
     return {Path(m.group(1)).name for m in _PERTEST_PASS_RE.finditer(out)}, out
 
@@ -4536,7 +5480,16 @@ def _run_reference_grounding(
     if image is None:
         return {"skipped": True, "reason": "docker_unavailable"}
 
-    with tempfile.TemporaryDirectory(prefix="r2e-refground-bundle-") as b_str:
+    sidecar_spec = resolve_sidecar(backend)
+    sidecar_ctx = (
+        _sidecar_up(sidecar_spec, probe_image=image)
+        if sidecar_spec is not None
+        else contextlib.nullcontext(None)
+    )
+    with (
+        tempfile.TemporaryDirectory(prefix="r2e-refground-bundle-") as b_str,
+        sidecar_ctx as sidecar,
+    ):
         bundle = Path(b_str)
         (bundle / "tests").mkdir()
         for rel, content in tests_aux.items():
@@ -4550,17 +5503,17 @@ def _run_reference_grounding(
         ref_path = bundle / "reference_main.py"
         ref_path.write_text(_REFERENCE_SHIM)
         reference_pass, ref_out = _docker_run_pertest(
-            image, bundle, timeout_sec, ref_path, wrapper=wrapper
+            image, bundle, timeout_sec, ref_path, wrapper=wrapper, sidecar=sidecar
         )
 
         empty_pass, empty_out = _docker_run_pertest(
-            image, bundle, timeout_sec, None, wrapper=wrapper
+            image, bundle, timeout_sec, None, wrapper=wrapper, sidecar=sidecar
         )
 
         oracle_path = bundle / "oracle_main.py"
         oracle_path.write_text(oracle_code)
         oracle_pass, oracle_out = _docker_run_pertest(
-            image, bundle, timeout_sec, oracle_path, wrapper=wrapper
+            image, bundle, timeout_sec, oracle_path, wrapper=wrapper, sidecar=sidecar
         )
 
         grounded = (reference_pass & oracle_pass) - empty_pass
@@ -4588,8 +5541,508 @@ def _run_reference_grounding(
         "skipped": False,
         "image_tag": image,
         "grounded_files": grounded,
+        "reference_pass": reference_pass,
+        "oracle_pass": oracle_pass,
+        "empty_pass": empty_pass,
+        "oracle_out": oracle_out,
         "n_reference": len(reference_pass),
         "n_oracle": len(oracle_pass),
         "n_empty": len(empty_pass),
         "n_grounded": len(grounded),
     }
+
+
+# ---------------------------------------------------------------------------
+# Service-profile registry (plug-and-play). DynamoDB and S3/MinIO are the first
+# two registered profiles; the engine dispatches on the resolved profile instead
+# of hardcoded ``is_ddb`` branches. Adding a service = registering a profile.
+# ---------------------------------------------------------------------------
+register_profile(
+    ServiceProfile(
+        backend_key="dynamodb_local",
+        service="dynamodb",
+        simulation_backend="dynamodb_local",
+        extract_mode="botocore_model",
+        target_prefix="DynamoDB_20120810",
+        json_version="1.0",
+        default_target_ops=_DDB_TARGET_OPS_DEFAULT,
+        client_module_path="tests/_ddb_http.py",
+        client_module_src=_DDB_HTTP_HELPER,
+        translation_system=TRANSLATION_SYSTEM_DDB,
+        translation_user=TRANSLATION_USER_TEMPLATE_DDB,
+        oracle_system=ORACLE_SYSTEM_DDB,
+        oracle_user=ORACLE_USER_TEMPLATE_DDB,
+        oracle_subset_system=ORACLE_SUBSET_SYSTEM_DDB,
+        oracle_subset_user=ORACLE_SUBSET_USER_TEMPLATE_DDB,
+        workflow_system=WORKFLOW_SYSTEM_DDB,
+        workflow_user=WORKFLOW_USER_TEMPLATE_DDB,
+        wf_preamble=_WF_IMPORT_PREAMBLE_DDB,
+        build_conftest=lambda golden=False: _build_conftest(
+            backend="dynamodb_local", golden=golden
+        ),
+        build_dockerfile=lambda **kw: _build_dockerfile(backend="dynamodb_local", **kw),
+        base_image=PINNED_DDB_BASE_IMAGE,
+        pinned_deps=PINNED_DEPS_DDB,
+        build_instruction_single=lambda spec, cmd_spec, intents: _build_instruction_md(
+            spec, cmd_spec, intents, backend="dynamodb_local"
+        ),
+        build_instruction_subset=lambda spec, cmd_specs, intents: _build_subset_instruction_md(
+            spec, cmd_specs, intents, backend="dynamodb_local"
+        ),
+    )
+)
+register_profile(
+    ServiceProfile(
+        backend_key="minio",
+        service="s3",
+        simulation_backend="minio",
+        extract_mode="tests",
+        translation_system=TRANSLATION_SYSTEM,
+        translation_user=TRANSLATION_USER_TEMPLATE,
+        oracle_system=ORACLE_SYSTEM,
+        oracle_user=ORACLE_USER_TEMPLATE,
+        oracle_subset_system=ORACLE_SUBSET_SYSTEM,
+        oracle_subset_user=ORACLE_SUBSET_USER_TEMPLATE,
+        workflow_system=WORKFLOW_SYSTEM,
+        workflow_user=WORKFLOW_USER_TEMPLATE,
+        wf_preamble=_WF_IMPORT_PREAMBLE,
+        build_conftest=lambda golden=False: _build_conftest(backend="minio", golden=golden),
+        build_dockerfile=lambda **kw: _build_dockerfile(backend="minio", **kw),
+        base_image=PINNED_BASE_IMAGE,
+        pinned_deps=PINNED_DEPS,
+        build_instruction_single=lambda spec, cmd_spec, intents: _build_instruction_md(
+            spec, cmd_spec, intents, backend="minio"
+        ),
+        build_instruction_subset=lambda spec, cmd_specs, intents: _build_subset_instruction_md(
+            spec, cmd_specs, intents, backend="minio"
+        ),
+    )
+)
+
+
+# ---------------------------------------------------------------------------
+# Kinesis (kinesalite) — proof that adding a service is ONE registered profile
+# and no engine edits: the whole card routes through the generic
+# _cli_app_generic path. Sidecar + service-base images are digest-pinned;
+# pinned_deps reuse AWSCLI_DEP_CLOSURE so they never drift from the S3/DDB set.
+# ---------------------------------------------------------------------------
+KINESALITE_IMAGE = (
+    "instructure/kinesalite@sha256:34400d82f28fa91b940a7c4afaf3a8ecdf47a0dd15625ebaa077d0ab28343581"
+)
+KINESALITE_BASE_IMAGE = (
+    "426628337772.dkr.ecr.ap-south-1.amazonaws.com/aws_cli_kinesis@sha256:"
+    "41e76338d734597ae1df0e397628497aebd379e5d57de644f7454f1ecaca0fad"
+)
+
+_KINESALITE_SPEC = SidecarSpec(
+    backend_key="kinesalite",
+    service="kinesis",
+    simulation_backend="kinesalite",
+    target_prefix="Kinesis_20131202",
+    json_version="1.1",
+    endpoint_env="AWS_ENDPOINT_URL_KINESIS",
+    signing_service="kinesis",
+    fixture_name="kinesis",
+    sidecar_service="kinesis",
+    sidecar_image=KINESALITE_IMAGE,
+    sidecar_port=4567,
+    sidecar_entrypoint=("",),
+    sidecar_command=(
+        "node",
+        "/usr/src/app/node_modules/kinesalite/cli.js",
+        "--path",
+        "/var/lib/kinesalite",
+        "--port",
+        "4567",
+    ),
+    sidecar_healthcheck="curl -s -o /dev/null http://127.0.0.1:4567/ || exit 1",
+    ready_action="ListStreams",
+    reset_py=(
+        "try:\n"
+        "    for _s in _c.rpc('ListStreams', {}).get('StreamNames', []):\n"
+        "        _c.rpc('DeleteStream', {'StreamName': _s})\n"
+        "    for _ in range(50):\n"
+        "        if not _c.rpc('ListStreams', {}).get('StreamNames', []):\n"
+        "            break\n"
+        "        _time.sleep(0.1)\n"
+        "except Exception:\n"
+        "    pass"
+    ),
+    wire_rules=(
+        "Kinesis wire protocol is JSON 1.1 (X-Amz-Target: Kinesis_20131202.<Op>). "
+        "CreateStream {StreamName, ShardCount} creates a stream; it is not immediately "
+        "ACTIVE — DescribeStream returns StreamDescription with StreamName, StreamARN, "
+        "StreamStatus (CREATING then ACTIVE) and Shards[]. ListStreams returns "
+        "{StreamNames:[...]}. DeleteStream {StreamName}. PutRecord {StreamName, "
+        "Data(base64 string), PartitionKey} -> {ShardId, SequenceNumber}. Assert on "
+        "StreamDescription fields via DescribeStream (StreamName/shard count), not on "
+        "stdout wording. Data blobs are base64 strings in the JSON body and stdout. "
+        "CRITICAL backend timing facts (assert accordingly or the real aws CLI fails): "
+        "(1) After CreateStream the stream is 'CREATING' and stays CREATING on this "
+        "backend — NEVER assert StreamStatus=='ACTIVE'; assert StreamStatus in "
+        "('CREATING','ACTIVE') or just assert StreamName. (2) While CREATING, "
+        "DescribeStream returns Shards==[] regardless of ShardCount — NEVER assert on "
+        "len(Shards) or shard contents for a fresh stream; assert on StreamName only. "
+        "(3) DeleteStream is ASYNC and this backend does NOT faithfully emulate the "
+        "transitional 'DELETING' state: after delete, DescribeStream may return "
+        "StreamStatus in ('DELETING','ACTIVE') OR the stream may already be gone. NEVER "
+        "assert a specific post-delete StreamStatus (StreamStatus=='DELETING' is a known "
+        "failure on this backend); assert ONLY that delete returncode==0, and tolerate the "
+        "stream being either still-present or absent afterward."
+    ),
+    oracle_rules=(
+        "Map CLI flags to Kinesis API params in PascalCase: --stream-name->StreamName, "
+        "--shard-count->ShardCount (int), --partition-key->PartitionKey, --limit->Limit "
+        "(int), --exclusive-start-shard-id->ExclusiveStartShardId. --data is a blob: "
+        "aws-cli v2 cli_binary_format=base64 is the default, so a bare `--data <val>` "
+        "value is ALREADY base64 — put it into the JSON Data field verbatim (do NOT "
+        "re-encode). DescribeStream returns {StreamDescription:{...}} — print the "
+        "response as JSON. On a missing stream the service returns "
+        "ResourceNotFoundException; on a duplicate CreateStream, ResourceInUseException "
+        "— write the error response body (with __type) to stderr."
+    ),
+    base_image=KINESALITE_BASE_IMAGE,
+    pinned_deps=("pytest==8.3.3", "urllib3>=1.25.4,<1.27", *AWSCLI_DEP_CLOSURE),
+    default_target_ops=(
+        "CreateStream",
+        "DescribeStream",
+        "ListStreams",
+        "DeleteStream",
+        "PutRecord",
+    ),
+)
+register_profile(
+    make_generic_profile(
+        _KINESALITE_SPEC,
+        build_instruction_single=lambda spec, cmd_spec, intents: _build_instruction_md_generic(
+            spec, cmd_spec, intents, sidecar=_KINESALITE_SPEC
+        ),
+        build_instruction_subset=lambda spec, cmd_specs, intents: (
+            _build_subset_instruction_md_generic(spec, cmd_specs, intents, sidecar=_KINESALITE_SPEC)
+        ),
+    )
+)
+
+
+# ---------------------------------------------------------------------------
+# KMS (local-kms) — generic sidecar profile. AWS JSON 1.1 wire protocol
+# (X-Amz-Target: TrentService.<Op>); nsmithuk/local-kms is a small Go emulator
+# that listens on :8080. Sidecar + service-base images are digest-pinned.
+# ---------------------------------------------------------------------------
+LOCAL_KMS_IMAGE = (
+    "nsmithuk/local-kms@sha256:e070866476b20973a9e23a9b636204b7a222e4169a6e03198d27b80d47ed28e3"
+)
+LOCAL_KMS_BASE_IMAGE = (
+    "426628337772.dkr.ecr.ap-south-1.amazonaws.com/aws_cli_kms@sha256:"
+    "017f6a2fa8f9e04413a40bf30b2b5f0ac48808462e537d01f576227144dd695f"
+)
+
+_LOCAL_KMS_SPEC = SidecarSpec(
+    backend_key="local_kms",
+    service="kms",
+    simulation_backend="local_kms",
+    target_prefix="TrentService",
+    json_version="1.1",
+    endpoint_env="AWS_ENDPOINT_URL_KMS",
+    signing_service="kms",
+    fixture_name="kms",
+    sidecar_service="kms",
+    sidecar_image=LOCAL_KMS_IMAGE,
+    sidecar_port=8080,
+    sidecar_entrypoint=("",),
+    sidecar_command=("local-kms",),
+    sidecar_healthcheck="nc -z 127.0.0.1 8080 || exit 1",
+    ready_action="ListKeys",
+    reset_py=(
+        "try:\n"
+        "    for _a in _c.rpc('ListAliases', {}).get('Aliases', []):\n"
+        "        _n = _a.get('AliasName', '')\n"
+        "        if _n.startswith('alias/') and not _n.startswith('alias/aws/'):\n"
+        "            try:\n"
+        "                _c.rpc('DeleteAlias', {'AliasName': _n})\n"
+        "            except Exception:\n"
+        "                pass\n"
+        "except Exception:\n"
+        "    pass"
+    ),
+    wire_rules=(
+        "KMS wire protocol is AWS JSON 1.1 (X-Amz-Target: TrentService.<Op>). "
+        "CreateKey {Description?, KeyUsage?, KeySpec?} -> {KeyMetadata:{KeyId, Arn, "
+        "KeyState, Enabled, KeyUsage, ...}}. DescribeKey {KeyId} accepts a raw key id, a "
+        "key ARN, or 'alias/<name>' and returns {KeyMetadata:{...}}. ListKeys -> "
+        "{Keys:[{KeyId, KeyArn}], Truncated}. CreateAlias {AliasName:'alias/<name>', "
+        "TargetKeyId}. ListAliases -> {Aliases:[{AliasName, AliasArn, TargetKeyId?}]}. "
+        "Encrypt {KeyId, Plaintext(base64 string)} -> {CiphertextBlob(base64 string), "
+        "KeyId}. Decrypt {CiphertextBlob(base64 string)} -> {Plaintext(base64 string), "
+        "KeyId}. GenerateDataKey {KeyId, KeySpec|NumberOfBytes} -> {CiphertextBlob, "
+        "Plaintext, KeyId}. Assert on returned KeyMetadata/aliases via DescribeKey/"
+        "ListKeys and on the Encrypt->Decrypt ROUND TRIP (decrypted Plaintext equals the "
+        "input), never on stdout wording or on the exact ciphertext bytes (nondeterministic). "
+        "CRITICAL backend facts (assert accordingly or the real aws CLI fails): "
+        "(1) KeyId is a fresh UUID per CreateKey — never hard-code or assert a specific "
+        "id; capture it from the CreateKey response. "
+        "(2) KMS keys CANNOT be deleted immediately: ScheduleKeyDeletion sets "
+        "KeyState=='PendingDeletion' with a PendingWindowInDays (min 7) and returns exit "
+        "0 — afterwards DescribeKey STILL returns the key (KeyState=='PendingDeletion'), "
+        "it does NOT become NotFound. Never assert describe fails after scheduling "
+        "deletion; assert KeyState. "
+        "(3) A disabled key (DisableKey) still Describes fine (Enabled==false) but Encrypt "
+        "with it returns DisabledException; EnableKey restores it. "
+        "(4) alias names are namespaced 'alias/<name>'; a duplicate CreateAlias returns "
+        "AlreadyExistsException; describing/encrypting a missing key or alias returns "
+        "NotFoundException."
+    ),
+    oracle_rules=(
+        "Map CLI flags to KMS API params in PascalCase: --key-id->KeyId, "
+        "--description->Description, --key-usage->KeyUsage, --key-spec->KeySpec (also "
+        "accept --customer-master-key-spec->KeySpec), --alias-name->AliasName, "
+        "--target-key-id->TargetKeyId, --number-of-bytes->NumberOfBytes (int), "
+        "--pending-window-in-days->PendingWindowInDays (int). --plaintext and "
+        "--ciphertext-blob are BLOB args: aws-cli v2 defaults cli_binary_format=base64, so "
+        "a bare `--plaintext <val>` / `--ciphertext-blob <val>` value is ALREADY base64 — "
+        "put it into the JSON Plaintext/CiphertextBlob field verbatim (do NOT re-encode), "
+        "and pass the base64 strings the service returns straight back. On a missing "
+        "key/alias the service returns NotFoundException; on a disabled key, "
+        "DisabledException; on a duplicate alias, AlreadyExistsException — write the error "
+        "response body (with __type) to stderr."
+    ),
+    base_image=LOCAL_KMS_BASE_IMAGE,
+    pinned_deps=("pytest==8.3.3", "urllib3>=1.25.4,<1.27", *AWSCLI_DEP_CLOSURE),
+    default_target_ops=(
+        "CreateKey",
+        "DescribeKey",
+        "ListKeys",
+        "Encrypt",
+        "Decrypt",
+        "GenerateDataKey",
+        "CreateAlias",
+        "ListAliases",
+        "ScheduleKeyDeletion",
+        "EnableKey",
+        "DisableKey",
+    ),
+)
+register_profile(
+    make_generic_profile(
+        _LOCAL_KMS_SPEC,
+        build_instruction_single=lambda spec, cmd_spec, intents: _build_instruction_md_generic(
+            spec, cmd_spec, intents, sidecar=_LOCAL_KMS_SPEC
+        ),
+        build_instruction_subset=lambda spec, cmd_specs, intents: (
+            _build_subset_instruction_md_generic(spec, cmd_specs, intents, sidecar=_LOCAL_KMS_SPEC)
+        ),
+    )
+)
+
+
+# ---------------------------------------------------------------------------
+# SQS (ElasticMQ) — generic sidecar profile. Modern SQS speaks AWS JSON 1.0
+# (X-Amz-Target: AmazonSQS.<Op>); softwaremill/elasticmq serves it on :9324.
+# Sidecar + service-base images are digest-pinned.
+# ---------------------------------------------------------------------------
+ELASTICMQ_IMAGE = (
+    "softwaremill/elasticmq@sha256:f1de391a9b8c18fd3f2ce37b4f7d1b8989857e8a8e18bb01284fff899e69da82"
+)
+ELASTICMQ_BASE_IMAGE = (
+    "426628337772.dkr.ecr.ap-south-1.amazonaws.com/aws_cli_sqs@sha256:"
+    "5e7d4b7410034dbb0f94e14aa2a3d77a9890daaf01c4bf8409158725f8939ec2"
+)
+
+_ELASTICMQ_SPEC = SidecarSpec(
+    backend_key="elasticmq",
+    service="sqs",
+    simulation_backend="elasticmq",
+    target_prefix="AmazonSQS",
+    json_version="1.0",
+    endpoint_env="AWS_ENDPOINT_URL_SQS",
+    signing_service="sqs",
+    fixture_name="sqs",
+    sidecar_service="sqs",
+    sidecar_image=ELASTICMQ_IMAGE,
+    sidecar_port=9324,
+    sidecar_entrypoint=("",),
+    sidecar_command=(
+        "java",
+        "-Dconfig.file=/opt/elasticmq.conf",
+        "-jar",
+        "/opt/elasticmq/elasticmq-server.jar",
+    ),
+    sidecar_healthcheck="curl -s -o /dev/null http://127.0.0.1:9324/ || exit 1",
+    ready_action="ListQueues",
+    reset_py=(
+        "try:\n"
+        "    for _u in _c.rpc('ListQueues', {}).get('QueueUrls', []):\n"
+        "        try:\n"
+        "            _c.rpc('DeleteQueue', {'QueueUrl': _u})\n"
+        "        except Exception:\n"
+        "            pass\n"
+        "except Exception:\n"
+        "    pass"
+    ),
+    wire_rules=(
+        "SQS wire protocol is AWS JSON 1.0 (X-Amz-Target: AmazonSQS.<Op>). CreateQueue "
+        "{QueueName, Attributes?} -> {QueueUrl}. GetQueueUrl {QueueName} -> {QueueUrl}. "
+        "ListQueues {QueueNamePrefix?} -> {QueueUrls:[...]}. SendMessage {QueueUrl, "
+        "MessageBody} -> {MessageId, MD5OfMessageBody}. ReceiveMessage {QueueUrl, "
+        "MaxNumberOfMessages?, WaitTimeSeconds?} -> {Messages:[{MessageId, ReceiptHandle, "
+        "Body, MD5OfBody}]} (Messages omitted/empty when the queue is empty). "
+        "DeleteMessage {QueueUrl, ReceiptHandle}. GetQueueAttributes {QueueUrl, "
+        "AttributeNames:['All'|...]} -> {Attributes:{...string values...}}. DeleteQueue "
+        "{QueueUrl}. Assert on the message Body/MD5 round trip and on queue presence via "
+        "ListQueues/GetQueueUrl, never on stdout wording. "
+        "CRITICAL ElasticMQ backend facts (assert accordingly or the real aws CLI fails): "
+        "(1) Send EVERY request to the endpoint (AWS_ENDPOINT_URL_SQS); the server routes "
+        "by the QueueUrl's trailing '/<account>/<QueueName>' path, so the HOST in a "
+        "returned QueueUrl is irrelevant. ElasticMQ returns QueueUrls with host "
+        "'localhost:9324' by default — NEVER assert the QueueUrl host/scheme; assert only "
+        "that it ENDS WITH the queue name (…/<QueueName>). Pass the returned QueueUrl "
+        "verbatim in the body of later calls. "
+        "(2) A just-sent message may not appear on the first ReceiveMessage and a received "
+        "message is invisible until its visibility timeout — for a deterministic check "
+        "assert ApproximateNumberOfMessages via GetQueueAttributes after SendMessage, or "
+        "assert the SendMessage returncode==0 and MessageId present and tolerate an empty "
+        "first read. "
+        "(3) A FIFO queue REQUIRES a name ending in '.fifo' plus Attributes "
+        "{'FifoQueue':'true'}, and SendMessage then needs MessageGroupId. "
+        "(4) Operating on a missing queue returns "
+        "AWS.SimpleQueueService.NonExistentQueue; recreating an existing name with "
+        "different attributes returns QueueNameExists."
+    ),
+    oracle_rules=(
+        "Map CLI flags to SQS API params in PascalCase: --queue-name->QueueName, "
+        "--queue-url->QueueUrl, --message-body->MessageBody, --attributes->Attributes "
+        "(JSON map), --attribute-names->AttributeNames (list, e.g. ['All']), "
+        "--max-number-of-messages->MaxNumberOfMessages (int), "
+        "--visibility-timeout->VisibilityTimeout (int), --wait-time-seconds->"
+        "WaitTimeSeconds (int), --receipt-handle->ReceiptHandle, --delay-seconds->"
+        "DelaySeconds (int), --message-group-id->MessageGroupId. Send every request to "
+        "the endpoint host and pass QueueUrl values through verbatim (do not rewrite their "
+        "host). On a missing queue the service returns "
+        "AWS.SimpleQueueService.NonExistentQueue — write the error response body (with "
+        "__type) to stderr."
+    ),
+    base_image=ELASTICMQ_BASE_IMAGE,
+    pinned_deps=("pytest==8.3.3", "urllib3>=1.25.4,<1.27", *AWSCLI_DEP_CLOSURE),
+    default_target_ops=(
+        "CreateQueue",
+        "ListQueues",
+        "GetQueueUrl",
+        "GetQueueAttributes",
+        "SendMessage",
+        "ReceiveMessage",
+        "DeleteMessage",
+        "DeleteQueue",
+    ),
+)
+register_profile(
+    make_generic_profile(
+        _ELASTICMQ_SPEC,
+        build_instruction_single=lambda spec, cmd_spec, intents: _build_instruction_md_generic(
+            spec, cmd_spec, intents, sidecar=_ELASTICMQ_SPEC
+        ),
+        build_instruction_subset=lambda spec, cmd_specs, intents: (
+            _build_subset_instruction_md_generic(spec, cmd_specs, intents, sidecar=_ELASTICMQ_SPEC)
+        ),
+    )
+)
+
+
+# ---------------------------------------------------------------------------
+# Cognito Identity Provider (cognito-local) — generic sidecar profile. AWS
+# JSON 1.1 wire protocol (X-Amz-Target: AWSCognitoIdentityProviderService.<Op>);
+# jagregory/cognito-local serves it on :9229. CLI prefix is `cognito-idp`.
+# Sidecar + service-base images are digest-pinned.
+# ---------------------------------------------------------------------------
+COGNITO_LOCAL_IMAGE = "jagregory/cognito-local@sha256:a5ad30d01da5016a38535a717f6e1642d1b37f886a7b17e90b67f6e5ad134831"
+COGNITO_LOCAL_BASE_IMAGE = (
+    "426628337772.dkr.ecr.ap-south-1.amazonaws.com/aws_cli_cognito@sha256:"
+    "b24fac06ef0ec589f4320bf5b1f02d1996fa527c74e57f56ac4c4f1826d6f6d0"
+)
+
+_COGNITO_LOCAL_SPEC = SidecarSpec(
+    backend_key="cognito_local",
+    service="cognito-idp",
+    simulation_backend="cognito_local",
+    target_prefix="AWSCognitoIdentityProviderService",
+    json_version="1.1",
+    endpoint_env="AWS_ENDPOINT_URL_COGNITO_IDENTITY_PROVIDER",
+    signing_service="cognito-idp",
+    fixture_name="cognito",
+    sidecar_service="cognito",
+    sidecar_image=COGNITO_LOCAL_IMAGE,
+    sidecar_port=9229,
+    sidecar_entrypoint=("",),
+    sidecar_command=("node", "/app/start.js"),
+    sidecar_healthcheck="nc -z 127.0.0.1 9229 || exit 1",
+    ready_action="ListUserPools",
+    reset_py=(
+        "try:\n"
+        "    for _p in _c.rpc('ListUserPools', {'MaxResults': 60}).get('UserPools', []):\n"
+        "        try:\n"
+        "            _c.rpc('DeleteUserPool', {'UserPoolId': _p['Id']})\n"
+        "        except Exception:\n"
+        "            pass\n"
+        "except Exception:\n"
+        "    pass"
+    ),
+    wire_rules=(
+        "Cognito IdP wire protocol is AWS JSON 1.1 (X-Amz-Target: "
+        "AWSCognitoIdentityProviderService.<Op>). CreateUserPool {PoolName} -> "
+        "{UserPool:{Id, Name, ...}}. ListUserPools {MaxResults(int, REQUIRED)} -> "
+        "{UserPools:[{Id, Name}]}. DescribeUserPool {UserPoolId} -> {UserPool:{...}}. "
+        "CreateUserPoolClient {UserPoolId, ClientName} -> {UserPoolClient:{ClientId, "
+        "ClientName, UserPoolId}}. AdminCreateUser {UserPoolId, Username, UserAttributes?} "
+        "-> {User:{Username, Attributes, UserStatus, Enabled}}. AdminGetUser {UserPoolId, "
+        "Username} -> {Username, UserAttributes, UserStatus}. ListUsers {UserPoolId} -> "
+        "{Users:[{Username, Attributes, ...}]}. Assert on Name/Username/ClientName and "
+        "cross-op state (create pool -> describe/list it; create user -> admin-get it), "
+        "never on stdout wording. "
+        "CRITICAL backend facts (assert accordingly or the real aws CLI fails): "
+        "(1) UserPoolId is generated ('<region>_<random>', e.g. 'local_xxxxxxxxx') and "
+        "ClientId is generated per create — never hard-code them; capture from the create "
+        "response and reuse. "
+        "(2) ListUserPools REQUIRES MaxResults; calling it without MaxResults is an error. "
+        "(3) AdminGetUser/AdminCreateUser/CreateUserPoolClient need an existing "
+        "UserPoolId, else ResourceNotFoundException; a brand-new pool has no users. "
+        "(4) A duplicate AdminCreateUser (same Username) returns UsernameExistsException; "
+        "referencing a missing pool/user/client returns ResourceNotFoundException; a "
+        "malformed parameter returns InvalidParameterException."
+    ),
+    oracle_rules=(
+        "Map CLI flags to Cognito IdP API params in PascalCase: --pool-name->PoolName, "
+        "--user-pool-id->UserPoolId, --client-name->ClientName, --client-id->ClientId, "
+        "--username->Username, --user-attributes->UserAttributes (list of "
+        "{'Name':..,'Value':..}; CLI shorthand 'Name=..,Value=..' also appears), "
+        "--max-results->MaxResults (int), --group-name->GroupName, "
+        "--temporary-password->TemporaryPassword. ListUserPools MUST send MaxResults "
+        "(default to 60 when the flag is absent). On a missing pool/user the service "
+        "returns ResourceNotFoundException; on a duplicate user, UsernameExistsException; "
+        "on bad input, InvalidParameterException — write the error response body (with "
+        "__type) to stderr."
+    ),
+    base_image=COGNITO_LOCAL_BASE_IMAGE,
+    pinned_deps=("pytest==8.3.3", "urllib3>=1.25.4,<1.27", *AWSCLI_DEP_CLOSURE),
+    default_target_ops=(
+        "CreateUserPool",
+        "ListUserPools",
+        "DescribeUserPool",
+        "CreateUserPoolClient",
+        "AdminCreateUser",
+        "AdminGetUser",
+        "ListUsers",
+        "DeleteUserPool",
+    ),
+)
+register_profile(
+    make_generic_profile(
+        _COGNITO_LOCAL_SPEC,
+        build_instruction_single=lambda spec, cmd_spec, intents: _build_instruction_md_generic(
+            spec, cmd_spec, intents, sidecar=_COGNITO_LOCAL_SPEC
+        ),
+        build_instruction_subset=lambda spec, cmd_specs, intents: (
+            _build_subset_instruction_md_generic(
+                spec, cmd_specs, intents, sidecar=_COGNITO_LOCAL_SPEC
+            )
+        ),
+    )
+)

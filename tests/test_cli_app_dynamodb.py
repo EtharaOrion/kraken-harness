@@ -307,3 +307,17 @@ def test_blocklist_ddb_is_additive_and_aligned() -> None:
     assert "dynamodb.amazonaws.com" not in harbor.BLOCKED_SUFFIXES
     # Alignment invariant holds for the DDB set (would raise on import otherwise).
     harbor._verify_blocklist_alignment(harbor.BLOCKED_HOSTS_DDB, harbor.BLOCKED_SUFFIXES_DDB)
+
+
+def test_cli_app_oracle_defaults_to_both_with_llm_optout() -> None:
+    o = CodeInstructOptions(
+        mode="cli_app", cli_app_command_prefix="dynamodb", cli_app_backend="dynamodb_local"
+    )
+    assert o.cli_app_oracle == "both"
+    o_llm = CodeInstructOptions(
+        mode="cli_app",
+        cli_app_command_prefix="dynamodb",
+        cli_app_backend="dynamodb_local",
+        cli_app_oracle="llm",
+    )
+    assert o_llm.cli_app_oracle == "llm"

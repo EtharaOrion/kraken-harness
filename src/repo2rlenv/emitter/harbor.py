@@ -467,13 +467,6 @@ def write_harbor_task(
             "chmod +x /workspace/submission/aws 2>/dev/null || true\n",
             encoding="utf-8",
         )
-        (sol_dir / "solve_reference.sh").write_text(
-            "#!/bin/bash\n"
-            "set -euo pipefail\n"
-            'exec env SOLVE_PATCH=reference "$(dirname "$0")/solve.sh" "$@"\n',
-            encoding="utf-8",
-        )
-        (sol_dir / "solve_reference.sh").chmod(0o755)
     else:
         (sol_dir / "patch.diff").write_text(task.oracle_diff, encoding="utf-8")
         (sol_dir / "solve.sh").write_text(

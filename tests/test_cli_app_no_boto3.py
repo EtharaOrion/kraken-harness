@@ -49,9 +49,10 @@ def test_build_dockerfile_emits_minio_no_boto3() -> None:
     out = S._build_dockerfile()
     assert "minio==" in out
     assert "/usr/local/bin/minio" in out
-    assert "/usr/local/bin/mc" in out
-    assert S.PINNED_MINIO_SHA256 in out
-    assert S.PINNED_MC_SHA256 in out
+    # mc (MinIO client) is intentionally NOT shipped — the pipeline grades via the
+    # `minio` Python SDK, never the mc CLI. The server binary is SHA256-pinned per arch.
+    assert S.PINNED_MINIO_SHA256_AMD64 in out
+    assert S.PINNED_MINIO_SHA256_ARM64 in out
     assert "sha256sum -c -" in out
     for token in _FORBIDDEN_PACKAGE_TOKENS:
         assert token not in out, f"{token} leaked into Dockerfile"
@@ -169,3 +170,25 @@ def test_prompts_forbid_client_side_bucket_name_validation() -> None:
         assert "InvalidBucketName" in src, (
             f"{fn_name} must reference server-returned InvalidBucketName"
         )
+
+
+def test_g2c_rejects_farmable_generic_error_test() -> None:
+    loose = (
+        "def test_e(cli):\n"
+        "    r = cli('kinesis', 'create-stream')\n"
+        "    assert r.returncode != 0\n"
+        "    assert 'Error' in r.stderr or 'error' in r.stderr\n"
+    )
+    ok, reason = S._gauntlet_static(loose, expected_behaviour_tag="error_invalid_args")
+    assert ok is False and "G2c" in reason
+
+
+def test_g2c_accepts_specific_error_code_test() -> None:
+    specific = (
+        "def test_e(cli):\n"
+        "    r = cli('kinesis', 'describe-stream', '--stream-name', 'nope')\n"
+        "    assert r.returncode != 0\n"
+        "    assert 'ResourceNotFoundException' in r.stderr\n"
+    )
+    ok, reason = S._gauntlet_static(specific, expected_behaviour_tag="error_nonexistent")
+    assert ok is True, reason

@@ -857,7 +857,7 @@ class CodeInstructPipeline:
         return HarborTask(
             name=task_id,
             org=self.input.output.org,
-            description=parsed.problem.split("\n", 1)[0][:120],
+            description=parsed.problem.split("\n", 1)[0],
             instruction=parsed.problem,
             oracle_diff=gold_diff,
             repo2env=repo2env,

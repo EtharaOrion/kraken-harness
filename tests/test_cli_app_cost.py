@@ -93,7 +93,12 @@ def test_per_task_cost_is_delta_not_cumulative(monkeypatch, tmp_path: Path) -> N
     monkeypatch.setattr(S, "_synthesise_oracle", fake_oracle)
     monkeypatch.setattr(S, "write_harbor_task", fake_write)
 
-    opts = CodeInstructOptions(mode="cli_app", cli_app_command_prefix="s3")
+    opts = CodeInstructOptions(
+        mode="cli_app",
+        cli_app_command_prefix="s3",
+        cli_app_oracle="llm",
+        cli_app_docker_gauntlet=False,
+    )
     spec = _spec()
     pipe = _Pipe()
 
@@ -155,7 +160,12 @@ def test_rejected_task_cost_not_folded_into_next(monkeypatch, tmp_path: Path) ->
         S, "write_harbor_task", lambda task, out, **_kw: captured.append(task) or out
     )
 
-    opts = CodeInstructOptions(mode="cli_app", cli_app_command_prefix="s3")
+    opts = CodeInstructOptions(
+        mode="cli_app",
+        cli_app_command_prefix="s3",
+        cli_app_oracle="llm",
+        cli_app_docker_gauntlet=False,
+    )
     spec = _spec()
     pipe = _Pipe()
 

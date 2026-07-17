@@ -229,9 +229,10 @@ class CodeInstructOptions(_BaseOptions):
     cli_app_skip_suite_verify: bool = False  # skip Docker suite-level verify
     cli_app_translation_model: str | None = None  # override --llm for translation
     cli_app_per_intent: bool = False  # emit one task per (command, intent) instead of per command
-    cli_app_docker_gauntlet: bool = (
-        False  # G3+G4: build image + run empty/oracle to verify discriminative
-    )
+    # Default ON: gate every real generation (golden-cert / G3+G4) so bad tasks are
+    # rejected rather than self-certified. Skips gracefully when Docker is unavailable,
+    # where honest metadata (discriminative=False) marks the task unverified instead.
+    cli_app_docker_gauntlet: bool = True
     cli_app_docker_empty_pass_max: float = 0.05  # G3 reject threshold: empty stub must pass <= 5%
     cli_app_docker_oracle_pass_min: float = 1.0  # G4 reject threshold: oracle must pass 100%
     cli_app_docker_timeout_sec: int = 240  # per-run pytest timeout inside container
@@ -240,6 +241,29 @@ class CodeInstructOptions(_BaseOptions):
     # task per command). Each entry is a comma-joined command list, e.g.
     # ["mb,ls,rb", "mb,cp,ls,rm"]. None = unchanged per-command behaviour.
     cli_app_subsets: list[str] | None = None
+    # Auto-enumerate command SUBSETS from the discovered surface and sample by
+    # difficulty tier, instead of requiring an explicit cli_app_subsets list. Applies
+    # ONLY to generic sidecar backends (never dynamodb_local / minio). Ignored when
+    # cli_app_subsets is set.
+    cli_app_auto_subsets: bool = True
+    # Cap on auto-generated subsets (0 = unbounded); sampled hardest-first.
+    cli_app_max_subsets: int = 24
+    # Difficulty tiers to include when auto-sampling subsets (None = all tiers).
+    cli_app_subset_tiers: list[str] | None = None
+    # --- Coverage matrix (service-agnostic; generic sidecar backends only) ---
+    # Expand each command into a service-model-derived scenario matrix: pairwise
+    # optional-flag combinations, enum-value coverage, and numeric/length boundary
+    # values -- the automatic substitute for hand-authored edge cases, giving a new
+    # service edge/boundary depth. Applies ONLY to generic backends; dynamodb_local
+    # and minio intents are unchanged. Default ON.
+    cli_app_combinations: bool = True
+    # Cap on pairwise optional-flag combinations per command (the required-only
+    # happy path is always emitted regardless of this cap).
+    cli_app_max_optional_combos: int = 6
+    # Mutually-exclusive flag groups for conflict-case generation, each a comma-
+    # joined group that must not co-occur (e.g. "--billing-mode,--provisioned-throughput").
+    # None = no conflict cases. Service-agnostic; declare per service/feature.
+    cli_app_mutually_exclusive: list[str] | None = None
     # Number of cross-command workflow tests to synthesise per subset task
     # (0 disables). Ignored for single-command tasks.
     cli_app_workflow_tests: int = 3
@@ -264,6 +288,11 @@ class CodeInstructOptions(_BaseOptions):
     cli_app_min_error_invalid_args: int = 0
     cli_app_min_workflow: int = 0
     cli_app_min_edge: int = 0
+    # Anti-reward-hacking AST scan of the synthesised oracle. Tri-state: None = auto
+    # ("reject" for generic sidecar backends; "log"-only for the byte-locked
+    # dynamodb_local / minio so they are scanned for telemetry but never rejected);
+    # "off" disables. Resolved by _effective_antihack_mode().
+    cli_app_antihack_scan: Literal["off", "log", "reject"] | None = None
     cli_app_ecr_push: bool = False
     cli_app_ecr_registry: str | None = None
     cli_app_ecr_profile: str | None = None
@@ -272,10 +301,12 @@ class CodeInstructOptions(_BaseOptions):
     # the pipeline default (repo2rlenv.pipelines._cli_app_synthesis.PINNED_BASE_IMAGE).
     cli_app_base_image: str | None = None
     # --- cli_app backend + extraction mode (S3/MinIO defaults; DynamoDB opt-in) ---
-    # Which simulation backend the emitted task boots. "minio" is the shipped S3
-    # path (byte-identical output). "dynamodb_local" swaps the conftest for an
-    # in-container DynamoDB Local JVM subprocess + a stdlib raw-HTTP test client.
-    cli_app_backend: Literal["minio", "dynamodb_local"] = "minio"
+    # Which simulation backend the emitted task boots -- the key of a registered
+    # ServiceProfile. "minio" (S3, byte-identical output) and "dynamodb_local"
+    # (in-container DynamoDB Local JVM + stdlib raw-HTTP client) ship built-in; any
+    # newly registered profile is selectable. A plain str (not Literal) so adding a
+    # service needs no options edit; validated against the registry at pipeline runtime.
+    cli_app_backend: str = "minio"
     # How the command surface is extracted. "tests" derives commands from
     # aws-cli `test_<cmd>_command.py` filenames (the S3 path). "botocore_model"
     # reads the vendored `botocore/data/<service>/*/service-2.json` off disk and
@@ -288,12 +319,18 @@ class CodeInstructOptions(_BaseOptions):
     # CamelCase operation names to lift in botocore_model mode. None = the 8
     # default DynamoDB pilot verbs (see _cli_app_extract._DDB_TARGET_OPS_DEFAULT).
     cli_app_target_operations: list[str] | None = None
-    # Oracle strategy. "llm" (default) = synthesise submission/main.py from the
-    # test intents via LLM (existing behaviour). "golden" = deterministically
-    # slice the real aws-cli source tree (awscli + botocore + s3transfer static
-    # import closure + service data) and ship it verbatim as the gold patch.
-    # Requires source_root (the cloned aws-cli checkout) to be threaded through.
-    cli_app_oracle: Literal["llm", "golden"] = "llm"
+    # Auto-scope cap: when a generic sidecar profile declares NO default_target_ops
+    # and discovers more commands than this, narrow to a coherent lifecycle subset
+    # via select_lifecycle_scope(). 0 disables. Never applies to dynamodb_local /
+    # minio (byte-locked) nor to a profile that curated its own default_target_ops.
+    cli_app_scope_max_commands: int = 7
+    # Oracle strategy. "both" (default) ships BOTH a deterministic real-aws-cli golden
+    # slice (awscli + botocore + s3transfer static-import closure + service data, verbatim
+    # as solution/golden.diff) AND the LLM-synthesised solution/reference.diff, for every
+    # service. "golden" ships only the slice; "llm" opts out to the LLM oracle alone
+    # (offline / no-Docker / cheap runs). golden/both require source_root (the cloned
+    # aws-cli checkout); a slice failure hard-rejects the task rather than shipping an LLM golden.
+    cli_app_oracle: Literal["llm", "golden", "both"] = "both"
     # Max output tokens for the reference-oracle LLM call. Scales with the number
     # of commands in a subset: a single-command oracle is ~130 lines (~2k tokens);
     # an 8-command subset can approach ~1000 lines. `max_llm_tokens` (2048) is
@@ -303,6 +340,33 @@ class CodeInstructOptions(_BaseOptions):
     # LLM refusal, provider hiccup). 1 = no retry (original behaviour). The
     # LLM output cache is bypassed per attempt so we get a fresh sample.
     cli_app_oracle_max_attempts: int = 3
+
+    # --- Team-guarantee knobs: >=100 real-aws-grounded, zero-skip, >=6-command tasks ---
+    # Generic sidecar backends only. The byte-locked minio / dynamodb_local paths never
+    # reach the auto-subset / top-up / refinement code (all gated on _is_generic_backend),
+    # so every field below is inert for them and cannot perturb their locked output.
+    #
+    # Auto-subset command-count window, threaded into sample_subsets (generic backends).
+    cli_app_subset_min_commands: int = 6
+    cli_app_subset_max_commands: int = 11
+    # Hard floor on grounded tests per emitted task (0 = disabled). The top-up loop drives
+    # toward this; still below it after the loop -> _TaskRejected. Generic path only.
+    cli_app_min_grounded_final: int = 0
+    # Per-service overrides for the floor, e.g. {"local_kms": 100}; wins over the global.
+    cli_app_min_grounded_final_overrides: dict[str, int] = {}
+    # Top-up loop budget per subset task (0 attempts = loop disabled). First cap hit stops.
+    cli_app_topup_max_attempts: int = 0
+    cli_app_topup_max_cost_usd: float | None = None
+    cli_app_topup_max_wall_sec: int | None = None
+    # Oracle refinement: feed failing grounded tests back to the LLM to fix submission/main.py
+    # (raises oracle-pass -> survival). 0 = disabled. Generic path only.
+    cli_app_oracle_refine_max_attempts: int = 0
+    # G5: enrich the pinned aws-cli 2.28.23 model's shapes (enum / error-code / example
+    # values) from other aws-cli model versions. NEVER adds new ops/flags (they would fail
+    # 2.28.23 reference grounding). Opt-in.
+    cli_app_multi_version_enrichment: bool = False
+    # Zero-skip guarantee: reject shipped tests containing pytest.skip / skipif / xfail.
+    cli_app_forbid_skips: bool = False
 
 
 class RefactorSynthesisOptions(_BaseOptions):

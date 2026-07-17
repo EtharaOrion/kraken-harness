@@ -254,7 +254,8 @@ def test_cli_app_conftest_blocks_public_ips_and_imports_canonical_suffixes():
     from repo2rlenv.pipelines._cli_app_synthesis import _build_conftest
 
     conftest = _build_conftest()
-    assert "ip.is_loopback or ip.is_private or ip.is_link_local" in conftest
+    assert "ip.is_loopback or ip.is_private" in conftest
+    assert "is_link_local" not in conftest
     assert "public IP" in conftest
     for suffix in BLOCKED_SUFFIXES:
         assert repr(suffix) in conftest

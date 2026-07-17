@@ -1,0 +1,110 @@
+{
+  "S.ORACLE_SUBSET_SYSTEM": {
+    "len": 2164,
+    "sha256": "eee45e795b38c53eee065692831d6bd1f8f04af49d15e56492be68cedb165129"
+  },
+  "S.ORACLE_SUBSET_SYSTEM_DDB": {
+    "len": 2141,
+    "sha256": "f7f2466fed1de8ae4880516ac326ed76f99592dd7cebdafdb6ea3aa1139439a7"
+  },
+  "S.ORACLE_SUBSET_USER_TEMPLATE": {
+    "len": 442,
+    "sha256": "4aadb4e882c57b91018d867a3abddea48f84bb8867ba93ff86922b1311d05ec3"
+  },
+  "S.ORACLE_SUBSET_USER_TEMPLATE_DDB": {
+    "len": 1072,
+    "sha256": "1bae42d4ab7b5ed93dd8c04ad04845599123dec169dbef4fe263ffe560d87c51"
+  },
+  "S.ORACLE_SYSTEM": {
+    "len": 2064,
+    "sha256": "638592b80bd21bda85baeaeb91e3cf96a403ab0d7970dd8efdaffbeabe2fe70d"
+  },
+  "S.ORACLE_SYSTEM_DDB": {
+    "len": 2598,
+    "sha256": "272de8ce6fff4484cb97819a1ef0a4ed34fc27ab19d753b63c40cc922ab53e7e"
+  },
+  "S.ORACLE_USER_TEMPLATE": {
+    "len": 289,
+    "sha256": "deb52b8eb73e9d5fa9b9f73e2badf6b1e8f283a6b90be0d5d62a1e34374ad158"
+  },
+  "S.ORACLE_USER_TEMPLATE_DDB": {
+    "len": 794,
+    "sha256": "f28486e41afa38d7721cd960a4f633fc7a388f48bdff32ff34caa63f6241d5b4"
+  },
+  "S.PROMPT_TEMPLATE_VERSION_DDB": {
+    "len": 10,
+    "sha256": "35f8f99554701b93e218842ce2c0342d5b0b03f2a472744ec0043e9981291621"
+  },
+  "S.TRANSLATION_SYSTEM": {
+    "len": 6029,
+    "sha256": "f4efd7f059c42c9572b84f834d3fbe282cdb216068217629a7742c16bd07716f"
+  },
+  "S.TRANSLATION_SYSTEM_DDB": {
+    "len": 7193,
+    "sha256": "8c2f17ae7d9285419eb4afffad1400d6a92b57417073f5fa3e980836091ab869"
+  },
+  "S.TRANSLATION_USER_TEMPLATE": {
+    "len": 876,
+    "sha256": "7965bac42f252bf8b8dc5d0aa1e7f9a4177652f38dad9dc4ac21bc0c030ac42d"
+  },
+  "S.TRANSLATION_USER_TEMPLATE_DDB": {
+    "len": 813,
+    "sha256": "51a17f40bf591c1d1acf17310ac3288a2aef95a12dd66ce4c14468610e7eea2b"
+  },
+  "S.WORKFLOW_SYSTEM": {
+    "len": 3140,
+    "sha256": "0598a92a7dec0efe45f0e8a1d1b4de881ab654f6e6558e34a8315bd14a9c5b06"
+  },
+  "S.WORKFLOW_SYSTEM_DDB": {
+    "len": 5462,
+    "sha256": "4d1f834c6cb0a0c2b4726912f168e426446dc95895e2be826f11b97414f1d355"
+  },
+  "S.WORKFLOW_USER_TEMPLATE": {
+    "len": 777,
+    "sha256": "cd1df04c7ed7ce0c77559b5e62cdd7a207fba02ff6ff1f7a97a36f3484e9049f"
+  },
+  "S.WORKFLOW_USER_TEMPLATE_DDB": {
+    "len": 836,
+    "sha256": "59cad6ee8490040c1be693e320e527aaef5123bec1cbe0b463ead5058a5c1f0f"
+  },
+  "S._DDB_HTTP_HELPER": {
+    "len": 7142,
+    "sha256": "614d90435b9b49f38909c41ad1ce5f79378207aaf19460aae46b3df6fcd1088e"
+  },
+  "S._WF_IMPORT_PREAMBLE": {
+    "len": 81,
+    "sha256": "ba8c8be964cccf00792c65aa058f22e39438266bef3f55910b46cc55546cea42"
+  },
+  "S._WF_IMPORT_PREAMBLE_DDB": {
+    "len": 59,
+    "sha256": "fa996e7276d3bba635a411cd95abfa386045668de698803d009a10f288e18888"
+  },
+  "_build_conftest_ddb": {
+    "len": 3899,
+    "sha256": "7cd7faa27598267a6268144d2096ec62dc8910c3fdf001aba607821d35c6de66"
+  },
+  "_build_dockerfile": {
+    "len": 2711,
+    "sha256": "9afb601bddfe7eae5ed9133840ea83ad0299a730987739fa6c836a0e3f2963f8"
+  },
+  "_build_dockerfile_ddb": {
+    "len": 1395,
+    "sha256": "70e808906837ba4d0e9d803022da5916d4f43f1c32f514c4e08c1c56d061dbb1"
+  },
+  "conftest_ddb": {
+    "len": 3899,
+    "sha256": "7cd7faa27598267a6268144d2096ec62dc8910c3fdf001aba607821d35c6de66"
+  },
+  "conftest_ddb_golden": {
+    "len": 3871,
+    "sha256": "5dd9acc002245f77daa1ad32f73a6047b46d0cb5dda532c646871a8cf59c0957"
+  },
+  "conftest_minio": {
+    "len": 5097,
+    "sha256": "f4895244b56e80ea8e5081187cc3959d654f8ec1f3567e353e9822e2509b82a1"
+  },
+  "test_script": {
+    "len": 1808,
+    "sha256": "dc56c7f4e047896da20a5cf3617bb50b7a0ab4fd763c97f353225aa98d032b4e"
+  }
+}

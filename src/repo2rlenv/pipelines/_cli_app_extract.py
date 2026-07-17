@@ -269,6 +269,85 @@ def _canonical_spec_hash(spec: CliSpec) -> str:
     return h.hexdigest()
 
 
+# CRUD verb vocabulary in lifecycle order (create -> read -> update -> delete) so a
+# selected scope reads as a natural workflow. Service-agnostic: scope selection uses
+# only command-name structure, never service names.
+_CRUD_VERBS: tuple[str, ...] = (
+    "create",
+    "put",
+    "register",
+    "add",
+    "import",
+    "start",
+    "describe",
+    "get",
+    "list",
+    "batch-get",
+    "query",
+    "scan",
+    "update",
+    "modify",
+    "set",
+    "enable",
+    "disable",
+    "tag",
+    "untag",
+    "delete",
+    "remove",
+    "deregister",
+    "stop",
+)
+_VERB_RANK: dict[str, int] = {v: i for i, v in enumerate(_CRUD_VERBS)}
+
+
+def _command_verb_resource(cmd: str) -> tuple[str | None, str]:
+    """Split a kebab command into (verb, resource-noun).
+
+    'admin-create-user' -> ('create', 'user'); 'list-user-pools' -> ('list',
+    'user-pools'). Verb is the first recognised CRUD token after an optional
+    'admin' prefix; two-word verbs (batch-get) match first.
+    """
+    parts = cmd.split("-")
+    idx = 1 if parts[:1] == ["admin"] else 0
+    verb: str | None = None
+    if idx + 1 < len(parts) and f"{parts[idx]}-{parts[idx + 1]}" in _VERB_RANK:
+        verb = f"{parts[idx]}-{parts[idx + 1]}"
+        idx += 2
+    elif idx < len(parts) and parts[idx] in _VERB_RANK:
+        verb = parts[idx]
+        idx += 1
+    return verb, "-".join(parts[idx:])
+
+
+def select_lifecycle_scope(command_names: list[str], *, max_commands: int = 7) -> list[str]:
+    """Pick a coherent, stateful command subset from a broad surface.
+
+    Service-agnostic: groups commands by resource noun (singular/plural folded so
+    `list-user-pools` joins `create-user-pool`), chooses the resource whose commands
+    span the most distinct lifecycle stages so the scope forms a natural
+    create -> read -> update -> delete workflow that cross-command tests can
+    exercise, orders by lifecycle rank, and caps the count. Returns [] when nothing
+    can be grouped (the caller falls back to a plain alphabetical cap).
+    """
+    groups: dict[str, list[tuple[int, str]]] = {}
+    for cmd in command_names:
+        verb, resource = _command_verb_resource(cmd)
+        if verb is None or not resource:
+            continue
+        key = resource[:-1] if resource.endswith("s") else resource
+        groups.setdefault(key, []).append((_VERB_RANK[verb], cmd))
+    if not groups:
+        return []
+
+    def _score(item: tuple[str, list[tuple[int, str]]]) -> tuple[int, int, int]:
+        _resource, cmds = item
+        return (len({rank for rank, _ in cmds}), len(cmds), -len(_resource))
+
+    _key, best = max(groups.items(), key=_score)
+    ordered = [cmd for _rank, cmd in sorted(set(best))]
+    return ordered[:max_commands]
+
+
 # ---------------------------------------------------------------------------
 # TestIntent extraction (aws-cli BaseAWSCommandParamsTest pattern)
 # ---------------------------------------------------------------------------
@@ -772,6 +851,193 @@ def _op_input_shape(model: dict, op_def: dict) -> dict:
     return model.get("shapes", {}).get(shape_name, {})
 
 
+def _slug(v: object) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "_", str(v)).strip("_").lower() or "x"
+
+
+def _resolved_input_members(model: dict, op_def: dict) -> dict[str, dict]:
+    """member name -> resolved shape dict (carries type/enum/min/max)."""
+    raw = _op_input_shape(model, op_def).get("members") or {}
+    shapes = model.get("shapes", {})
+    resolved: dict[str, dict] = {}
+    for m, ref in raw.items():
+        shape_name = ref.get("shape") if isinstance(ref, dict) else None
+        resolved[m] = (shapes.get(shape_name) or {}) if shape_name else {}
+    return resolved
+
+
+def _pairwise_optional_combos(optional: list[str], cap: int) -> list[frozenset[str]]:
+    """Bounded strength-2 optional-flag cover in n+1 rows (not 2**n).
+
+    The required-only happy path supplies the all-OFF row; {all-ON} plus each
+    {all-but-one} row then makes every optional-flag pair take all four on/off
+    combinations. Deterministic; truncated to ``cap``.
+    """
+    if not optional or cap <= 0:
+        return []
+    rows: list[frozenset[str]] = [frozenset(optional)]
+    rows += [frozenset(o for o in optional if o != drop) for drop in optional]
+    seen: set[frozenset[str]] = set()
+    out: list[frozenset[str]] = []
+    for row in rows:
+        if not row or row in seen:
+            continue
+        seen.add(row)
+        out.append(row)
+    return out[:cap]
+
+
+_NUMERIC_SHAPE_TYPES = frozenset({"integer", "long", "double", "float"})
+
+# A length-boundary probe longer than this is skipped. A multi-KB/MB filler (e.g.
+# Kinesis's 1 MB Data blob or a large NextToken max) is untestable as a literal CLI
+# arg and, aggregated across a subset's intents, blows the oracle LLM prompt past
+# its context window. Numeric boundaries are unaffected (they stringify to a few chars).
+_MAX_BOUNDARY_FILLER_LEN = 1024
+
+
+def _boundary_value(shape: dict, n: int) -> str | None:
+    """Concrete value hitting count ``n`` for a shape's min/max: the number itself
+    for numeric shapes, an n-length filler for length-constrained shapes. None when
+    ``n`` is unrepresentable (n < 0) or pathologically long (> _MAX_BOUNDARY_FILLER_LEN)."""
+    if shape.get("type", "string") in _NUMERIC_SHAPE_TYPES:
+        return str(n)
+    if n < 0 or n > _MAX_BOUNDARY_FILLER_LEN:
+        return None
+    return "x" * n
+
+
+def _boundary_probes(shape: dict) -> list[tuple[str, int, str, int]]:
+    """(kind, count, behaviour_tag, exit) probes for a shape's min/max, if any."""
+    probes: list[tuple[str, int, str, int]] = []
+    lo, hi = shape.get("min"), shape.get("max")
+    if isinstance(lo, int):
+        probes.append(("boundary_min", lo, "edge", 0))
+        probes.append(("boundary_below_min", lo - 1, "error_invalid_args", 252))
+    if isinstance(hi, int):
+        probes.append(("boundary_max", hi, "edge", 0))
+        probes.append(("boundary_above_max", hi + 1, "error_invalid_args", 252))
+    return probes
+
+
+def _coverage_matrix_intents(
+    model: dict,
+    op_def: dict,
+    *,
+    op_name: str,
+    command: str,
+    command_prefix: str,
+    max_optional_combos: int,
+    mutually_exclusive: tuple[tuple[str, ...], ...] = (),
+) -> list[TestIntent]:
+    """Service-model scenario matrix for one command (no LLM, no per-service constants).
+
+    De-duplicated by argv signature: pairwise optional-flag combinations
+    (happy_path), one case per enum value (edge), in-range boundary values (edge)
+    and out-of-range ones (error_invalid_args), and mutually-exclusive flag
+    conflicts (error_invalid_args). Reads only the botocore shape model, so it is
+    the automatic substitute for hand-authored edge cases on any AWS service.
+    """
+    input_shape = _op_input_shape(model, op_def)
+    members_dict = input_shape.get("members") or {}
+    members = list(members_dict.keys())
+    required = [m for m in (input_shape.get("required") or []) if m in members]
+    optional = [m for m in members if m not in required]
+    resolved = _resolved_input_members(model, op_def)
+    op_doc = _strip_doc(op_def.get("documentation", ""))
+    member_lines = _render_member_lines(model, members_dict, required)
+    errors = [e.get("shape", "") for e in op_def.get("errors", []) if e.get("shape")]
+
+    seen: set[tuple[str, ...]] = set()
+    out: list[TestIntent] = []
+
+    def _argv(overrides: dict[str, str] | None = None, extra: list[str] | None = None) -> list[str]:
+        ov = overrides or {}
+        argv = [command_prefix, command]
+        for m in required:
+            argv += [_member_to_flag(m), ov.get(m, "<value>")]
+        return argv + (extra or [])
+
+    def _emit(kind: str, argv: list[str], tag: str, exit_code: int) -> None:
+        sig = tuple(argv)
+        if sig in seen:
+            return
+        seen.add(sig)
+        out.append(
+            _make_model_intent(
+                command=command,
+                command_prefix=command_prefix,
+                op_name=op_name,
+                kind=kind,
+                cmdline=argv,
+                expected_exit=exit_code,
+                behaviour_tag=tag,
+                raw_source=_spec_block(
+                    op_name,
+                    command_prefix,
+                    command,
+                    op_doc,
+                    member_lines,
+                    errors,
+                    kind="happy" if exit_code == 0 else "invalid_arg",
+                    detail=kind,
+                ),
+                state_calls=[op_name] if exit_code == 0 else [],
+            )
+        )
+
+    conflict_groups = [set(g) for g in mutually_exclusive]
+    for i, combo in enumerate(_pairwise_optional_combos(optional, max_optional_combos)):
+        combo_flags = {_member_to_flag(m) for m in combo}
+        if any(g <= combo_flags for g in conflict_groups):
+            continue
+        extra: list[str] = []
+        for m in optional:
+            if m in combo:
+                extra += [_member_to_flag(m), "<value>"]
+        _emit(f"opt_combo_{i:02d}", _argv(extra=extra), "happy_path", 0)
+
+    for m, shape in resolved.items():
+        for v in shape.get("enum") or []:
+            argv = (
+                _argv(overrides={m: str(v)})
+                if m in required
+                else _argv(extra=[_member_to_flag(m), str(v)])
+            )
+            _emit(f"enum_{_camel_to_kebab(m)}_{_slug(v)}", argv, "edge", 0)
+
+    for m, shape in resolved.items():
+        for kind, n, tag, exit_code in _boundary_probes(shape):
+            val = _boundary_value(shape, n)
+            if val is None:
+                continue
+            argv = (
+                _argv(overrides={m: val})
+                if m in required
+                else _argv(extra=[_member_to_flag(m), val])
+            )
+            _emit(f"{kind}_{_camel_to_kebab(m)}", argv, tag, exit_code)
+
+    cmd_flags = {_member_to_flag(m) for m in required + optional}
+    required_flags = {_member_to_flag(m) for m in required}
+    for group in mutually_exclusive:
+        present = [f for f in group if f in cmd_flags]
+        if len(present) < 2:
+            continue
+        argv_extra: list[str] = []
+        for f in present:
+            if f not in required_flags:
+                argv_extra += [f, "<value>"]
+        _emit(
+            "conflict_" + _slug("_".join(present)),
+            _argv(extra=argv_extra),
+            "error_invalid_args",
+            252,
+        )
+
+    return out
+
+
 def synthesize_intents_from_model(
     model: dict,
     command: str,
@@ -779,6 +1045,10 @@ def synthesize_intents_from_model(
     *,
     target_operations: tuple[str, ...] = _DDB_TARGET_OPS_DEFAULT,
     max_intents: int | None = None,
+    combinations: bool = False,
+    max_optional_combos: int = 0,
+    mutually_exclusive: tuple[tuple[str, ...], ...] = (),
+    happy_variants: int | None = None,
 ) -> list[TestIntent]:
     """Synthesise TestIntents for one CLI command from its model operation.
 
@@ -808,7 +1078,9 @@ def synthesize_intents_from_model(
 
     out: list[TestIntent] = []
 
-    for variant_ix in range(_HAPPY_PATH_VARIANTS_PER_CMD):
+    for variant_ix in range(
+        happy_variants if happy_variants is not None else _HAPPY_PATH_VARIANTS_PER_CMD
+    ):
         variant_cmd = [command_prefix, command]
         for m in required:
             ph = _placeholder_for_shape(
@@ -940,6 +1212,19 @@ def synthesize_intents_from_model(
             errors=errors,
         )
     )
+
+    if combinations:
+        out.extend(
+            _coverage_matrix_intents(
+                model,
+                op_def,
+                op_name=op_name,
+                command=command,
+                command_prefix=command_prefix,
+                max_optional_combos=max_optional_combos,
+                mutually_exclusive=mutually_exclusive,
+            )
+        )
 
     out = _interleave_by_behaviour(out)
     if max_intents:
