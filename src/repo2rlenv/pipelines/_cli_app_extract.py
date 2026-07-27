@@ -85,6 +85,7 @@ class TestIntent:
     ] = "happy_path"
     raw_source: str = ""  # original method source (for LLM context)
     error_category: str | None = None
+    kind: str | None = None
 
 
 # ---------------------------------------------------------------------------

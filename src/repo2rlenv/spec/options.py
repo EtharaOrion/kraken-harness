@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 
 class _BaseOptions(BaseModel):
@@ -235,7 +235,7 @@ class CodeInstructOptions(_BaseOptions):
     cli_app_docker_gauntlet: bool = True
     cli_app_docker_empty_pass_max: float = 0.05  # G3 reject threshold: empty stub must pass <= 5%
     cli_app_docker_oracle_pass_min: float = 1.0  # G4 reject threshold: oracle must pass 100%
-    cli_app_docker_timeout_sec: int = 240  # per-run pytest timeout inside container
+    cli_app_docker_timeout_sec: int = 480  # per-run pytest timeout inside container; 480s accommodates ~30s kwokctl cluster startup on the two gauntlet runs plus real pytest time
     # --- cli_app subset (multi-command) tasks ---
     # When set, emit ONE task per compatible subset of commands (instead of one
     # task per command). Each entry is a comma-joined command list, e.g.
@@ -316,6 +316,26 @@ class CodeInstructOptions(_BaseOptions):
     # Absolute path escape hatch to a service-2.json (or a botocore data dir) when
     # the extractor cannot locate the model inside the clone. None = auto-detect.
     cli_app_service_model_override: str | None = None
+    # Absolute path escape hatch to a kubectl YAML bundle (kwok backend only).
+    # None = auto-locate at envs/<owner>_<repo>/kubectl_spec.yaml (built by the
+    # C4 Go extractor at pipelines/_cli_app_backends/source/cobra_extractor/).
+    cli_app_kubectl_yaml_bundle_path: str | None = None
+    # Absolute path escape hatch to a directory of hand-authored kubectl pytest
+    # fixtures (test_kubectl_<verb>_<behaviour>_NN.py + test_kubectl_workflow_*.py
+    # + conftest.py). Kwok backend only. When set and every command in the subset
+    # has fixture coverage, the LLM-synthesised tests + gauntlet + reference
+    # grounding are skipped and the fixture files ship verbatim. Missing verb
+    # coverage falls back to the LLM path unchanged.
+    cli_app_kubectl_fixture_dir: str | None = None
+    # Cap on shipped fixture tests per task; kwok backend only, applied after the
+    # workflow relevance filter. None = ship every matched fixture. Sampling is
+    # stratified by (verb, behaviour-tag) and deterministic across reruns via a
+    # sha256 seed of the sorted subset commas.
+    cli_app_kubectl_fixture_max_tests: int | None = None
+    # Kubernetes kinds subset for kwok tasks. When set, fixture selection filters
+    # by (verb, kind) using tests/fixtures/kubectl_testcases/kind_index.json;
+    # uncovered (verb, kind) pairs fall back to LLM synthesis. None = kind-agnostic.
+    cli_app_kubectl_kinds: list[str] | None = None
     # CamelCase operation names to lift in botocore_model mode. None = the 8
     # default DynamoDB pilot verbs (see _cli_app_extract._DDB_TARGET_OPS_DEFAULT).
     cli_app_target_operations: list[str] | None = None
@@ -340,6 +360,10 @@ class CodeInstructOptions(_BaseOptions):
     # LLM refusal, provider hiccup). 1 = no retry (original behaviour). The
     # LLM output cache is bypassed per attempt so we get a fresh sample.
     cli_app_oracle_max_attempts: int = 3
+    # When True, synthesise the reference oracle command-by-command rather than
+    # in a single LLM call; used by the kwok kubectl backend to keep per-call
+    # output bounded on large subsets.
+    cli_app_oracle_split_by_command: bool = False
 
     # --- Team-guarantee knobs: >=100 real-aws-grounded, zero-skip, >=6-command tasks ---
     # Generic sidecar backends only. The byte-locked minio / dynamodb_local paths never
@@ -367,6 +391,29 @@ class CodeInstructOptions(_BaseOptions):
     cli_app_multi_version_enrichment: bool = False
     # Zero-skip guarantee: reject shipped tests containing pytest.skip / skipif / xfail.
     cli_app_forbid_skips: bool = False
+
+    # --- In-pipeline dynamic validation gate (kwok backend only) ---
+    # Runs pytest inside the freshly built task image against the golden slice,
+    # the LLM reference, and an empty stub, then applies pass/fail thresholds
+    # before shipping. Inert for minio/dynamodb_local (they use the static
+    # docker-gauntlet path above).
+    cli_app_validation_gate: bool = True
+    cli_app_validation_timeout_sec: int = 300
+    cli_app_validation_min_golden_reward: float = 0.99
+    cli_app_validation_max_empty_reward: float = 0.05
+    cli_app_validation_min_reference_reward: float = 0.5
+    cli_app_validation_gate_required: bool = False
+    cli_app_validation_gate_compile: bool = True
+    cli_app_validation_gate_compile_timeout_sec: int = 600
+
+    @model_validator(mode="after")
+    def _validate_aws_mode_backend(self) -> CodeInstructOptions:
+        if self.aws_mode and self.cli_app_backend not in {"minio", "dynamodb_local"}:
+            raise ValueError(
+                f"aws_mode=True requires cli_app_backend in {{'minio', 'dynamodb_local'}}, "
+                f"got {self.cli_app_backend!r}"
+            )
+        return self
 
 
 class RefactorSynthesisOptions(_BaseOptions):

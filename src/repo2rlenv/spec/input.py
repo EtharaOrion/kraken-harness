@@ -56,7 +56,7 @@ class LLMSpec(BaseModel):
     api_key_env: str | None = None
     endpoint: str | None = None
     max_concurrent: int = 5
-    timeout_sec: int = 120
+    timeout_sec: int = 900
     fallback: LLMSpec | None = None
 
     @property

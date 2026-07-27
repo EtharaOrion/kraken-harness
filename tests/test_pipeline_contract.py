@@ -67,7 +67,6 @@ def test_python_only_pipelines_declare_supported_languages():
 
     python_only = {
         "mutation_bugs",
-        "code_instruct",
         "equivalence_tests",
         "refactor_synthesis",
     }
@@ -78,6 +77,12 @@ def test_python_only_pipelines_declare_supported_languages():
         assert supported == frozenset({LanguageHint.PYTHON}), (
             f"{name}: expected frozenset({{PYTHON}}), got {supported}"
         )
+
+    code_instruct_cls = PIPELINES["code_instruct"]
+    code_instruct_supported = getattr(code_instruct_cls, "supported_languages", None)
+    assert code_instruct_supported == frozenset({LanguageHint.PYTHON, LanguageHint.GO}), (
+        f"code_instruct: expected frozenset({{PYTHON, GO}}), got {code_instruct_supported}"
+    )
 
 
 def test_language_agnostic_pipelines_have_no_restriction():

@@ -315,11 +315,15 @@ class DockerSandbox:
             return []
         return [line for line in r.stdout.splitlines() if line.strip()]
 
-    def commit(self, tag: str, *, message: str = "repo2rlenv bootstrap", timeout: int = 600) -> str:
+    def commit(
+        self, tag: str, *, message: str = "repo2rlenv bootstrap", timeout: int = 1800
+    ) -> str:
         """Commit the container to an image. Returns the image's content digest.
 
-        Default 600s timeout because large full-stack-app images (Django + OCR +
-        ML deps; multi-GB final layer) can take several minutes to write out.
+        Default 1800s timeout because heavy toolchains (Go 1.26 via GOTOOLCHAIN,
+        Rust nightly, JDK) plus fetched deps + build cache can push the final
+        layer past 3 GB — commit is single-threaded on the daemon and stalls a
+        600s budget on repos like kubernetes/kubectl.
         """
         if not self._alive:
             raise DockerError("sandbox has been cleaned up; cannot commit")

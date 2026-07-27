@@ -145,8 +145,11 @@ def test_synthesis_prompt_picked_by_flag():
     class _LLM:
         qualified_name = "fake/model"
 
+    from repo2rlenv.bootstrap.spec import LanguageHint
+    from repo2rlenv.pipelines._code_instruct_backends import get_backend
+
     class _Bootstrap:
-        pass
+        language = LanguageHint.PYTHON
 
     class _Input:
         llm = _LLM()
@@ -158,6 +161,7 @@ def test_synthesis_prompt_picked_by_flag():
             self.options = CodeInstructOptions(aws_mode=aws_mode)
             self.bootstrap = _Bootstrap()
             self._llm_cost_usd = 0.0
+            self._backend = get_backend(LanguageHint.PYTHON)
 
     pipe_off = _Pipeline(aws_mode=False)
     pipe_on = _Pipeline(aws_mode=True)

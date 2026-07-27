@@ -41,8 +41,10 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -117,7 +119,12 @@ def _prompt_template_version(options: CodeInstructOptions) -> str:
     MinIO tasks keep the exact ``PROMPT_TEMPLATE_VERSION`` literal so their
     task_id/content_hash stay byte-identical after DynamoDB support lands.
     """
-    if getattr(options, "cli_app_backend", "minio") == "dynamodb_local":
+    backend = getattr(options, "cli_app_backend", "minio")
+    if backend == "kwok":
+        from repo2rlenv.pipelines._cli_app_backends import get_backend
+
+        return get_backend("kwok").prompt_template_version
+    if backend == "dynamodb_local":
         return PROMPT_TEMPLATE_VERSION_DDB
     return PROMPT_TEMPLATE_VERSION
 
@@ -906,7 +913,16 @@ def _extract_intents_for(
 
     ``model`` (a parsed service-2.json) is required for botocore_model mode;
     tests mode falls back to the aws-cli white-box test corpus (S3 path).
+    ``cli_app_backend='kwok'`` routes to the kubectl_cobra_yaml source instead.
     """
+    if options.cli_app_backend == "kwok":
+        from repo2rlenv.pipelines._cli_app_backends.source.base import get_source
+
+        return get_source("kubectl_cobra_yaml").extract_intents(
+            spec,
+            command,
+            max_intents=options.cli_app_max_intents,
+        )
     if options.cli_app_extract_mode == "botocore_model" and model is not None:
         return synthesize_intents_from_model(
             model,
@@ -1196,7 +1212,19 @@ def run_cli_app_pipeline(
         git_sha = _resolve_git_sha(clone_dir)
 
         model: dict | None = None
-        if options.cli_app_extract_mode == "botocore_model":
+        if options.cli_app_backend == "kwok":
+            from repo2rlenv.pipelines._cli_app_backends.source.base import get_source
+
+            _yaml_override = getattr(options, "cli_app_kubectl_yaml_bundle_path", None)
+            _yaml_kwargs = {"yaml_bundle_path": _yaml_override} if _yaml_override else {}
+            spec = get_source("kubectl_cobra_yaml").extract_spec(
+                clone_dir,
+                options.cli_app_command_prefix,
+                repo=owner_name,
+                git_sha=git_sha,
+                **_yaml_kwargs,
+            )
+        elif options.cli_app_extract_mode == "botocore_model":
             spec, model = extract_cli_spec_from_model(
                 clone_dir,
                 options.cli_app_command_prefix,
@@ -1384,12 +1412,20 @@ def _apply_static_gauntlet(
     *,
     behaviour_tags: dict[str, str] | None = None,
     forbid_skips: bool = False,
+    backend_name: str | None = None,
+    source_name: str | None = None,
 ) -> dict[str, str]:
     """Gauntlet G1-G2 (cheap, no Docker). Returns survivors; raises if none survive."""
     survivors: dict[str, str] = {}
     for fname, code in test_files.items():
         tag = behaviour_tags.get(fname) if behaviour_tags else None
-        ok, reason = _gauntlet_static(code, expected_behaviour_tag=tag, forbid_skips=forbid_skips)
+        ok, reason = _gauntlet_static(
+            code,
+            expected_behaviour_tag=tag,
+            forbid_skips=forbid_skips,
+            backend_name=backend_name,
+            source_name=source_name,
+        )
         if ok:
             survivors[fname] = code
         else:
@@ -1545,9 +1581,16 @@ def _run_g3g4_gauntlet_gate(
     aux_files: dict[str, str],
     test_script: str,
     oracle_code: str,
+    task_id: str = "",
+    oracle_go_files: dict[str, str] | None = None,
 ) -> dict:
-    """Gauntlet G3 (empty-stub-fails) + G4 (oracle-passes). Raises on non-discriminative."""
-    gauntlet_g34 = _run_docker_gauntlet_g3g4(
+    """Gauntlet G3 (empty-stub-fails) + G4 (oracle-passes). Raises on non-discriminative.
+
+    ``task_id`` is logged with each kwok verdict so failed runs can be traced
+    back to their originating task. ``oracle_go_files`` and ``command_prefix``
+    forward kwok-specific artefacts through the docker gauntlet runner.
+    """
+    runner_kwargs: dict = dict(
         dockerfile_content=dockerfile,
         aux_files=aux_files,
         test_script=test_script,
@@ -1557,15 +1600,61 @@ def _run_g3g4_gauntlet_gate(
         timeout_sec=options.cli_app_docker_timeout_sec,
         backend=options.cli_app_backend,
     )
-    if not gauntlet_g34.get("skipped"):
+    try:
+        gauntlet_g34 = _run_docker_gauntlet_g3g4(
+            **runner_kwargs,
+            oracle_go_files=oracle_go_files,
+            command_prefix=options.cli_app_command_prefix or "",
+        )
+    except TypeError:
+        gauntlet_g34 = _run_docker_gauntlet_g3g4(**runner_kwargs)
+    if gauntlet_g34.get("skipped"):
+        return gauntlet_g34
+    is_kwok = options.cli_app_backend == "kwok"
+    empty_rate = gauntlet_g34["g3_empty_pass_rate"]
+    oracle_rate = gauntlet_g34["g4_oracle_pass_rate"]
+    if is_kwok:
+        if gauntlet_g34["g3_empty_total"] == 0 and gauntlet_g34["g4_oracle_total"] == 0:
+            reason = "docker_gauntlet_kwok_startup_failed"
+            logger.info(
+                "gauntlet kwok task %s: empty_reward=%.2f, oracle_reward=%.2f, verdict=reject:%s",
+                task_id or "<unknown>",
+                empty_rate,
+                oracle_rate,
+                reason,
+            )
+            raise _TaskRejected(reason)
         if not gauntlet_g34["g3_pass"]:
-            raise _TaskRejected(
-                f"gauntlet_g3_non_discriminative_{gauntlet_g34['g3_empty_pass_rate']:.2f}"
+            reason = f"docker_gauntlet_kwok_empty_pass_too_high_{empty_rate:.2f}"
+            logger.info(
+                "gauntlet kwok task %s: empty_reward=%.2f, oracle_reward=%.2f, verdict=reject:%s",
+                task_id or "<unknown>",
+                empty_rate,
+                oracle_rate,
+                reason,
             )
+            raise _TaskRejected(reason)
         if not gauntlet_g34["g4_pass"]:
-            raise _TaskRejected(
-                f"gauntlet_g4_oracle_failing_{gauntlet_g34['g4_oracle_pass_rate']:.2f}"
+            reason = f"docker_gauntlet_kwok_oracle_pass_too_low_{oracle_rate:.2f}"
+            logger.info(
+                "gauntlet kwok task %s: empty_reward=%.2f, oracle_reward=%.2f, verdict=reject:%s",
+                task_id or "<unknown>",
+                empty_rate,
+                oracle_rate,
+                reason,
             )
+            raise _TaskRejected(reason)
+        logger.info(
+            "gauntlet kwok task %s: empty_reward=%.2f, oracle_reward=%.2f, verdict=accept",
+            task_id or "<unknown>",
+            empty_rate,
+            oracle_rate,
+        )
+        return gauntlet_g34
+    if not gauntlet_g34["g3_pass"]:
+        raise _TaskRejected(f"gauntlet_g3_non_discriminative_{empty_rate:.2f}")
+    if not gauntlet_g34["g4_pass"]:
+        raise _TaskRejected(f"gauntlet_g4_oracle_failing_{oracle_rate:.2f}")
     return gauntlet_g34
 
 
@@ -1717,6 +1806,117 @@ def _topup_more_intents(
         fresh.extend(it for it in cand if it.source_method_sha256 not in seen_shas)
     fresh.sort(key=lambda it: it.source_method_sha256)
     return fresh[: max(12, deficit * 3)]
+
+
+def _load_kubectl_fixtures(
+    fixture_dir_path: str,
+    cmd_names: list[str],
+    *,
+    max_tests: int | None = None,
+    kinds: list[str] | None = None,
+) -> tuple[dict[str, str], str, set[str], set[tuple[str, str]]] | None:
+    import hashlib as _h
+    import json as _json
+    import re as _re
+    from pathlib import Path as _Path
+
+    fixture_dir = _Path(fixture_dir_path)
+    if not fixture_dir.is_dir():
+        return None
+    conftest_path = fixture_dir / "conftest.py"
+    if not conftest_path.is_file():
+        return None
+    kind_filter: set[str] | None = set(kinds) if kinds else None
+    kind_index: dict[str, dict] = {}
+    if kind_filter is not None:
+        index_path = fixture_dir / "kind_index.json"
+        if index_path.is_file():
+            try:
+                kind_index = _json.loads(index_path.read_text(encoding="utf-8"))
+            except Exception:
+                kind_index = {}
+    subset = set(cmd_names)
+    _cli_verb_re = _re.compile(r"""cli\(\s*["']([a-z][a-z0-9-]*)["']""")
+    _bin_verb_re = _re.compile(r"""kubectl_bin\(\s*\[\s*["']([a-z][a-z0-9-]*)["']""")
+    tests: dict[str, str] = {}
+    covered_verbs: set[str] = set()
+    covered_pairs: set[tuple[str, str]] = set()
+    workflow_dropped = 0
+    kind_dropped = 0
+    for f in sorted(fixture_dir.glob("test_kubectl_*.py")):
+        parts = f.stem.split("_")
+        if len(parts) < 3:
+            continue
+        verb = parts[2]
+        file_kinds: list[str] = []
+        if kind_filter is not None:
+            entry = kind_index.get(f.name)
+            file_kinds = entry.get("kinds", []) if isinstance(entry, dict) else []
+            if file_kinds and not (set(file_kinds) & kind_filter):
+                kind_dropped += 1
+                continue
+        if verb == "workflow":
+            body = f.read_text(encoding="utf-8")
+            used_verbs = set(_cli_verb_re.findall(body)) | set(_bin_verb_re.findall(body))
+            if used_verbs and used_verbs.issubset(subset):
+                tests[f.name] = body
+                _kinds_for_pairs = [k for k in file_kinds if kind_filter is None or k in kind_filter] or ["_"]
+                for k in _kinds_for_pairs:
+                    for v in used_verbs:
+                        covered_pairs.add((v, k))
+            else:
+                workflow_dropped += 1
+            continue
+        if verb in cmd_names:
+            tests[f.name] = f.read_text(encoding="utf-8")
+            covered_verbs.add(verb)
+            _kinds_for_pairs = [k for k in file_kinds if kind_filter is None or k in kind_filter] or ["_"]
+            for k in _kinds_for_pairs:
+                covered_pairs.add((verb, k))
+    if not covered_verbs:
+        return None
+    if max_tests is not None and len(tests) > max_tests:
+        # Stratified deterministic downsample. Bucket by (verb, behaviour-tag)
+        # derived from filename shape `test_kubectl_<verb>_<tag>_<NNNN>.py`, then
+        # keep floor(bucket_share * max_tests) from each bucket via a subset-seeded
+        # sha256 sort so reruns of the same subset land on the same tests.
+        _total_in = len(tests)
+        _seed = ",".join(sorted(cmd_names))
+        _buckets: dict[tuple[str, str], list[str]] = {}
+        for _fname in tests:
+            _fparts = _fname[:-3].split("_") if _fname.endswith(".py") else _fname.split("_")
+            _fverb = _fparts[2] if len(_fparts) > 2 else "unknown"
+            _ftag = _fparts[3] if len(_fparts) > 3 else "unknown"
+            _buckets.setdefault((_fverb, _ftag), []).append(_fname)
+        _selected: set[str] = set()
+        for _names in _buckets.values():
+            _target = max(1, round(len(_names) / _total_in * max_tests))
+            _scored = sorted(_names, key=lambda n: _h.sha256(f"{_seed}:{n}".encode()).hexdigest())
+            _selected.update(_scored[:_target])
+        if len(_selected) > max_tests:
+            _scored_all = sorted(
+                _selected, key=lambda n: _h.sha256(f"{_seed}:{n}".encode()).hexdigest()
+            )
+            _selected = set(_scored_all[:max_tests])
+        tests = {n: c for n, c in tests.items() if n in _selected}
+        logger.info(
+            "cli_app: kwok fixture cap: sampled %d tests from %d (max_tests=%d)",
+            len(tests),
+            _total_in,
+            max_tests,
+        )
+    if kind_filter is not None:
+        logger.info(
+            "cli_app: kwok fixture kind filter: dropped %d out-of-kind files (kinds=%s)",
+            kind_dropped,
+            sorted(kind_filter),
+        )
+    logger.info(
+        "cli_app: kwok fixture workflow filter: kept %d, dropped %d (out-of-subset verbs)",
+        sum(1 for name in tests if "_workflow_" in name),
+        workflow_dropped,
+    )
+    return tests, conftest_path.read_text(encoding="utf-8"), covered_verbs, covered_pairs
 
 
 def _build_one_task(
@@ -1878,13 +2078,61 @@ def _build_one_task(
     )
     test_script = _build_test_script()
 
-    # ----- Gauntlet G1-G2 (cheap, no Docker) -----
-    if not options.cli_app_skip_gauntlet:
+    _fixture_dir = getattr(options, "cli_app_kubectl_fixture_dir", None)
+    _using_fixtures = False
+    _fixture_test_files: dict[str, str] = {}
+    _fixture_test_tags: dict[str, str] = {}
+    if options.cli_app_backend == "kwok" and _fixture_dir:
+        _fx = _load_kubectl_fixtures(
+            _fixture_dir,
+            list(cmd_names),
+            max_tests=getattr(options, "cli_app_kubectl_fixture_max_tests", None),
+            kinds=getattr(options, "cli_app_kubectl_kinds", None),
+        )
+        if _fx is not None:
+            _fixture_test_files, conftest, _covered_verbs, _covered_pairs = _fx
+            _uncovered_verbs = [v for v in cmd_names if v not in _covered_verbs]
+            _fixture_test_tags = {
+                f: (
+                    "workflow"
+                    if "_workflow_" in f
+                    else "error-nonexistent"
+                    if "error-nonexistent" in f
+                    else "error-invalid-args"
+                    if "error-invalid-args" in f
+                    else "happy-path"
+                )
+                for f in _fixture_test_files
+            }
+            _has_fixture_workflow = any("_workflow_" in f for f in _fixture_test_files)
+
+            def _llm_keep(fname: str) -> bool:
+                if "_workflow_" in fname:
+                    return not _has_fixture_workflow
+                return any(f"_{v}_" in fname for v in _uncovered_verbs)
+
+            test_files = {f: c for f, c in test_files.items() if _llm_keep(f)}
+            test_file_tags = {f: t for f, t in test_file_tags.items() if f in test_files}
+            _using_fixtures = True
+            logger.info(
+                "cli_app: kwok fixture hybrid for %s: %d fixture tests (verbs: %s), "
+                "%d LLM tests (uncovered verbs: %s)",
+                cmd_slug,
+                len(_fixture_test_files),
+                sorted(_covered_verbs),
+                len(test_files),
+                sorted(_uncovered_verbs),
+            )
+
+    if not options.cli_app_skip_gauntlet and test_files:
         test_files = _apply_static_gauntlet(
             test_files,
             behaviour_tags=test_file_tags,
             forbid_skips=options.cli_app_forbid_skips,
+            backend_name=options.cli_app_backend,
         )
+        if _using_fixtures:
+            test_file_tags = {f: t for f, t in test_file_tags.items() if f in test_files}
 
     # ----- Reference grounding (opt-in): keep ONLY tests that BOTH the real
     # aws CLI AND the synthesised oracle pass, and that the empty stub fails.
@@ -1892,7 +2140,7 @@ def _build_one_task(
     # solves its own task. The `aws` binary lives only in the gauntlet image,
     # never in the shipped task image (anti-cheat).
     reference_grounding = None
-    if options.cli_app_reference_grounding:
+    if options.cli_app_reference_grounding and not _using_fixtures:
         grounding_conftest = profile.build_conftest(golden=False) if golden else conftest
         reference_grounding, test_files, oracle_code = _apply_reference_grounding(
             options=options,
@@ -1934,6 +2182,7 @@ def _build_one_task(
                             code,
                             expected_behaviour_tag=it.behaviour_tag,
                             forbid_skips=options.cli_app_forbid_skips,
+                            backend_name=options.cli_app_backend,
                         )
                         if not ok:
                             continue
@@ -1990,7 +2239,10 @@ def _build_one_task(
             id_slug = cmd_names[0] if not is_subset else "_".join(sorted(cmd_names))
             logger.info("cli_app G4 alignment: shipped commands narrowed to %s", sorted(cmd_names))
 
-    # ----- Assemble aux_files for Harbor (tests/ subdir) -----
+    if _using_fixtures:
+        test_files = {**_fixture_test_files, **test_files}
+        test_file_tags = {**_fixture_test_tags, **test_file_tags}
+
     aux_files: dict[str, str] = {
         "tests/conftest.py": conftest,
         "tests/__init__.py": "",
@@ -2005,6 +2257,14 @@ def _build_one_task(
         aux_files["environment/docker-compose.yaml"] = _build_disallow_compose(
             BLOCKED_HOSTS_DDB, ddb_sidecar=True
         )
+    elif options.cli_app_backend == "kwok":
+        from repo2rlenv.pipelines._cli_app_backends.simulation.kwok import (
+            _KWOK_BLOCKED_HOSTS_EXPANDED,
+        )
+
+        aux_files["environment/docker-compose.yaml"] = _build_disallow_compose(
+            _KWOK_BLOCKED_HOSTS_EXPANDED
+        )
     elif profile.build_compose_overlay is not None:
         aux_files["environment/docker-compose.yaml"] = profile.build_compose_overlay()
 
@@ -2015,6 +2275,26 @@ def _build_one_task(
     else:
         gold_diff = reference_diff_file
         reference_diff = reference_diff_file
+
+    # Kwok golden must come from the AST slicer, not the LLM. reference_diff
+    # keeps the LLM output so both signals ship in the task.
+    if options.cli_app_backend == "kwok":
+        from types import SimpleNamespace
+
+        from repo2rlenv.pipelines._cli_app_backends.simulation.kwok import (
+            KwokSimulationBackend,
+        )
+
+        _kwok_slice_spec = SimpleNamespace(commands=list(cmd_names))
+        _sliced_diff = KwokSimulationBackend.emit_golden_diff(_kwok_slice_spec)
+        if _sliced_diff is not None:
+            gold_diff = _sliced_diff
+        else:
+            logger.warning(
+                "cli_app: kwok golden slicer returned None for %s; "
+                "falling back to LLM oracle diff (slicer requires docker + network)",
+                cmd_slug,
+            )
 
     # ----- instruction.md (rendered from spec, NEVER from tests) -----
     if is_subset:
@@ -2244,7 +2524,7 @@ def _translate_intent(
     profile = resolve_profile(options.cli_app_backend)
     template = profile.translation_user
     system = profile.translation_system
-    user = template.format(
+    fmt_kwargs: dict[str, object] = dict(
         raw_source=intent.raw_source[:4000],
         command_prefix=spec.command_prefix,
         command=intent.command,
@@ -2252,7 +2532,23 @@ def _translate_intent(
         expected_exit=intent.expected_exit,
         expected_state_calls=intent.expected_state_calls,
         behaviour_tag=intent.behaviour_tag,
+        kind=intent.kind or spec.command_prefix,
     )
+    if "{real_output_samples}" in template:
+        real_section = ""
+        if options.cli_app_backend == "kwok":
+            from repo2rlenv.pipelines._cli_app_backends.simulation.kwok import (
+                format_real_output_section,
+            )
+
+            samples = getattr(pipeline, "_kubectl_samples", None) or {}
+            real_section = format_real_output_section(
+                intent.command,
+                samples,
+                command_prefix=spec.command_prefix,
+            )
+        fmt_kwargs["real_output_samples"] = real_section
+    user = template.format(**fmt_kwargs)
     try:
         resp = complete(
             pipeline._llm,
@@ -2652,8 +2948,16 @@ def _gauntlet_static(
     *,
     expected_behaviour_tag: str | None = None,
     forbid_skips: bool = False,
+    source_name: str | None = None,
+    backend_name: str | None = None,
 ) -> tuple[bool, str]:
-    """G1 (compile) + G2 (structural) + G2b (returncode polarity vs tag)."""
+    """G1 (compile) + G2 (structural) + G2b (returncode polarity vs tag).
+
+    ``backend_name='kwok'`` swaps the client-state regex to k8s_client/kubectl_bin
+    and accepts pinned ``returncode == 1`` (kubectl's error signal) in addition
+    to the {252, 254, 255} pinned exits AWS backends accept.
+    """
+    is_kwok = backend_name == "kwok"
     # G1
     try:
         tree = ast.parse(test_code)
@@ -2698,7 +3002,12 @@ def _gauntlet_static(
             t.strip().lower() not in _generic_err and len(t.strip()) >= 4 for t in _stderr_tokens
         )
         has_stderr_cmp = bool(re.search(r"\.stderr\s*(?:==|\.startswith|\.endswith)", test_code))
-        has_pinned_exit = bool(re.search(r"returncode\s*==\s*(?:252|254|255)\b", test_code))
+        _exit_pattern = (
+            r"returncode\s*==\s*(?:1|252|254|255)\b"
+            if is_kwok
+            else r"returncode\s*==\s*(?:252|254|255)\b"
+        )
+        has_pinned_exit = bool(re.search(_exit_pattern, test_code))
         if not (has_specific_stderr or has_stderr_cmp or has_pinned_exit):
             return (
                 False,
@@ -2714,17 +3023,25 @@ def _gauntlet_static(
         # (empty main.py is valid Python and exits 0). Require the test to
         # verify state via the CLIENT fixture after cli() runs, so the assertion
         # depends on cli's observable effect and not just the exit code.
-        has_state_check = bool(
-            re.search(r"\b(?:ddb_client|s3_client|minio_client)\s*\.\s*[a-z_]+\s*\(", test_code)
-            or re.search(r"\.\s*rpc\s*\(", test_code)
-        )
-        if not has_state_check:
-            return (
-                False,
+        if is_kwok:
+            _state_regex = r"\b(?:k8s_client|kubectl_bin)\s*\.\s*[a-z_]+\s*\("
+            _state_reason = (
+                "G2d_state: happy_path-tagged test lacks a client-side state assertion "
+                "(k8s_client./kubectl_bin. call); `returncode == 0` alone is "
+                "nop-discriminative - an empty submission also exits 0"
+            )
+        else:
+            _state_regex = r"\b(?:ddb_client|s3_client|minio_client)\s*\.\s*[a-z_]+\s*\("
+            _state_reason = (
                 "G2d_state: happy_path-tagged test lacks a client-side state assertion "
                 "(ddb_client./s3_client./minio_client. call); `returncode == 0` alone is "
-                "nop-discriminative - an empty main.py also exits 0",
+                "nop-discriminative - an empty main.py also exits 0"
             )
+        has_state_check = bool(
+            re.search(_state_regex, test_code) or re.search(r"\.\s*rpc\s*\(", test_code)
+        )
+        if not has_state_check:
+            return False, _state_reason
     return True, ""
 
 
@@ -2752,7 +3069,16 @@ def _build_dockerfile(
     golden=True installs ``golden_deps`` (slice externals + grader harness) in
     place of ``PINNED_DEPS`` and SKIPS the ``AWSCLI_DEP_CLOSURE`` install —
     botocore and s3transfer are vendored under ``submission/`` by the slice.
+
+    backend="kwok" routes to KwokSimulationBackend's dockerfile methods.
     """
+    if backend == "kwok":
+        from repo2rlenv.pipelines._cli_app_backends import get_backend
+
+        kwok = get_backend("kwok")
+        if golden:
+            return kwok.dockerfile_golden_layer(golden_deps or ())
+        return kwok.dockerfile_base(base_image)
     if backend == "dynamodb_local":
         # DDB defaults to the materialized DDB task_env image, not the S3 base.
         return _build_dockerfile_ddb(
@@ -2895,6 +3221,10 @@ def _build_conftest(*, backend: str = "minio", golden: bool = False) -> str:
     layout) to ``["/workspace/submission/aws", ...]`` (the sliced-aws-cli shim
     the golden slice ships). The rest of the conftest is identical.
     """
+    if backend == "kwok":
+        from repo2rlenv.pipelines._cli_app_backends import get_backend
+
+        return get_backend("kwok").build_conftest(golden=golden)
     if backend == "dynamodb_local":
         return _build_conftest_ddb(golden=golden)
     suffixes_literal = ", ".join(repr(s) for s in BLOCKED_SUFFIXES)
@@ -3447,6 +3777,7 @@ def _build_test_script() -> str:
 set -uxo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TASK_TOML="$SCRIPT_DIR/../task.toml"
+mkdir -p /workspace/submission
 cd /workspace
 mkdir -p /logs/verifier
 
@@ -3694,6 +4025,8 @@ def _build_instruction_md(
     """
     if backend == "dynamodb_local":
         return _build_instruction_md_ddb(spec, cmd_spec, intents)
+    if backend == "kwok":
+        return _build_instruction_md_kwok(spec, cmd_spec, intents)
     by_tag = _group_by_tag(intents)
     flags = _extract_flags_from_intents(intents)
     cmd_label = f"{spec.command_prefix} {cmd_spec.name}"
@@ -4162,6 +4495,8 @@ def _build_subset_instruction_md(
     """
     if backend == "dynamodb_local":
         return _build_subset_instruction_md_ddb(spec, cmd_specs, intents)
+    if backend == "kwok":
+        return _build_subset_instruction_md_kwok(spec, cmd_specs, intents)
     prefix = spec.command_prefix
     names = sorted(c.name for c in cmd_specs)
     label_list = ", ".join(f"`{prefix} {n}`" for n in names)
@@ -5399,6 +5734,12 @@ _REFERENCE_SHIM = (
     "raise SystemExit(subprocess.run(['aws', *sys.argv[1:]]).returncode)\n"
 )
 
+_REFERENCE_SHIM_KWOK = (
+    "import subprocess\n"
+    "import sys\n"
+    "raise SystemExit(subprocess.run(['kubectl', *sys.argv[1:]]).returncode)\n"
+)
+
 _PERTEST_PASS_RE = re.compile(r"^(tests/\S+\.py)::\S+\s+PASSED", re.M)
 
 
@@ -5501,7 +5842,7 @@ def _run_reference_grounding(
         (bundle / "tests" / "test.sh").chmod(0o755)
 
         ref_path = bundle / "reference_main.py"
-        ref_path.write_text(_REFERENCE_SHIM)
+        ref_path.write_text(_REFERENCE_SHIM_KWOK if backend == "kwok" else _REFERENCE_SHIM)
         reference_pass, ref_out = _docker_run_pertest(
             image, bundle, timeout_sec, ref_path, wrapper=wrapper, sidecar=sidecar
         )
@@ -6046,3 +6387,1011 @@ register_profile(
         ),
     )
 )
+
+
+# ---------------------------------------------------------------------------
+# Kwok validation gate — in-pipeline dynamic gate that runs the emitted task
+# image + shipped test.sh against a golden shim (expect reward >= min) and
+# an empty stub (expect reward <= max), with optional golden-vendored and
+# reference-compiled legs. Ported from Kubectl integration.
+# ---------------------------------------------------------------------------
+
+_KWOK_EMPTY_STUB: dict[str, str] = {"submission/kubectl": "#!/bin/bash\nexit 0\n"}
+
+
+@dataclass(slots=True)
+class _ValidationGateResult:
+    passed: bool
+    golden_reward: float
+    empty_reward: float
+    reason: str
+    golden_summary: str = ""
+    empty_summary: str = ""
+    skipped: bool = False
+    golden_vendored_reward: float = 0.0
+    reference_reward: float = 0.0
+    golden_vendored_summary: str = ""
+    reference_summary: str = ""
+
+
+def _validation_gate_run_container(
+    image_tag: str,
+    bundle_dir: Path,
+    timeout_sec: int,
+    mounts: list[tuple[Path, str]],
+    *,
+    network_mode: str = "none",
+    pre_test_script: str | None = None,
+) -> dict:
+    cmd = [
+        "docker",
+        "run",
+        "--platform",
+        "linux/amd64",
+        "--rm",
+        "--cpus=1.0",
+        "--memory=1g",
+        f"--network={network_mode}",
+        "-v",
+        f"{bundle_dir / 'tests'}:/workspace/tests:ro",
+    ]
+    for local, target in mounts:
+        cmd.extend(["-v", f"{local}:{target}:ro"])
+    if pre_test_script is not None:
+        cmd.extend(
+            [
+                image_tag,
+                "bash",
+                "-c",
+                f"set -eo pipefail; {pre_test_script} && bash /workspace/tests/test.sh",
+            ]
+        )
+    else:
+        cmd.extend([image_tag, "bash", "/workspace/tests/test.sh"])
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+        out = (result.stdout + "\n" + result.stderr)[-4000:]
+    except subprocess.TimeoutExpired:
+        return {"passed": 0, "total": 0, "pass_rate": 0.0, "summary": "TIMEOUT"}
+    summary = _parse_test_sh_summary(out)
+    if pre_test_script is not None and result.returncode != 0 and summary.get("total", 0) == 0:
+        summary = {"passed": 0, "total": 0, "pass_rate": 0.0, "summary": "BUILD_FAILED"}
+    return summary
+
+
+def _materialise_mounts(root: Path, files: dict[str, str]) -> list[tuple[Path, str]]:
+    mounts: list[tuple[Path, str]] = []
+    for rel, content in files.items():
+        local = root / rel.replace("/", "__")
+        local.write_text(content)
+        local.chmod(0o755)
+        mounts.append((local, f"/workspace/{rel}"))
+    return mounts
+
+
+_GOLDEN_VENDORED_PRE_TEST = (
+    "cd /workspace && git apply --whitespace=nowarn /work/golden.diff && "
+    "cd /workspace/submission/kubectl-src && "
+    "GOFLAGS=-mod=vendor go build -o /workspace/submission/kubectl ./cmd/kubectl"
+)
+
+_REFERENCE_PRE_TEST = (
+    "cd /workspace && git apply --whitespace=nowarn /work/reference.diff && "
+    "cd /workspace/submission && go build -o kubectl ."
+)
+
+
+def _run_validation_gate(
+    *,
+    dockerfile_content: str,
+    aux_files: dict[str, str],
+    test_script: str,
+    golden_shim: dict[str, str],
+    empty_stub: dict[str, str],
+    min_golden_reward: float,
+    max_empty_reward: float,
+    timeout_sec: int,
+    backend: str = "minio",
+    golden_vendored_diff: str | None = None,
+    reference_diff: str | None = None,
+    min_reference_reward: float = 0.5,
+    compile_timeout_sec: int | None = None,
+) -> _ValidationGateResult:
+    with tempfile.TemporaryDirectory(prefix="r2e-valgate-ctx-") as ctx_str:
+        ctx = Path(ctx_str)
+        (ctx / "Dockerfile").write_text(dockerfile_content)
+        image = _build_or_reuse_docker_image(dockerfile_content, ctx)
+    if image is None:
+        return _ValidationGateResult(
+            passed=False,
+            golden_reward=0.0,
+            empty_reward=0.0,
+            reason="validation_gate_docker_unavailable",
+            skipped=True,
+        )
+
+    with tempfile.TemporaryDirectory(prefix="r2e-valgate-bundle-") as b_str:
+        bundle = Path(b_str)
+        (bundle / "tests").mkdir()
+        for rel, content in aux_files.items():
+            if rel.startswith("tests/"):
+                tgt = bundle / rel
+                tgt.parent.mkdir(parents=True, exist_ok=True)
+                tgt.write_text(content)
+        (bundle / "tests" / "test.sh").write_text(test_script)
+        (bundle / "tests" / "test.sh").chmod(0o755)
+
+        golden_dir = bundle / "_golden"
+        golden_dir.mkdir()
+        golden_mounts = _materialise_mounts(golden_dir, golden_shim)
+
+        empty_dir = bundle / "_empty"
+        empty_dir.mkdir()
+        empty_mounts = _materialise_mounts(empty_dir, empty_stub)
+
+        network_mode = "bridge" if backend == "kwok" else "none"
+        compile_to = compile_timeout_sec if compile_timeout_sec is not None else timeout_sec
+        golden_summary = _validation_gate_run_container(
+            image, bundle, timeout_sec, golden_mounts, network_mode=network_mode
+        )
+        empty_summary = _validation_gate_run_container(
+            image, bundle, timeout_sec, empty_mounts, network_mode=network_mode
+        )
+
+        golden_vendored_summary: dict = {}
+        if golden_vendored_diff is not None:
+            gv_dir = bundle / "_golden_vendored"
+            gv_dir.mkdir()
+            gv_diff_path = gv_dir / "golden.diff"
+            gv_diff_path.write_text(golden_vendored_diff)
+            gv_diff_path.chmod(0o644)
+            golden_vendored_summary = _validation_gate_run_container(
+                image,
+                bundle,
+                compile_to,
+                [(gv_diff_path, "/work/golden.diff")],
+                network_mode=network_mode,
+                pre_test_script=_GOLDEN_VENDORED_PRE_TEST,
+            )
+
+        reference_summary: dict = {}
+        if reference_diff is not None:
+            ref_dir = bundle / "_reference"
+            ref_dir.mkdir()
+            ref_diff_path = ref_dir / "reference.diff"
+            ref_diff_path.write_text(reference_diff)
+            ref_diff_path.chmod(0o644)
+            reference_summary = _validation_gate_run_container(
+                image,
+                bundle,
+                compile_to,
+                [(ref_diff_path, "/work/reference.diff")],
+                network_mode=network_mode,
+                pre_test_script=_REFERENCE_PRE_TEST,
+            )
+
+    golden_reward = float(golden_summary.get("pass_rate", 0.0))
+    empty_reward = float(empty_summary.get("pass_rate", 0.0))
+    golden_vendored_reward = float(golden_vendored_summary.get("pass_rate", 0.0))
+    reference_reward = float(reference_summary.get("pass_rate", 0.0))
+    g_out = golden_summary.get("summary", "")
+    e_out = empty_summary.get("summary", "")
+    gv_out = golden_vendored_summary.get("summary", "")
+    ref_out = reference_summary.get("summary", "")
+
+    def _fail(reason: str) -> _ValidationGateResult:
+        return _ValidationGateResult(
+            passed=False,
+            golden_reward=golden_reward,
+            empty_reward=empty_reward,
+            golden_vendored_reward=golden_vendored_reward,
+            reference_reward=reference_reward,
+            reason=reason,
+            golden_summary=g_out,
+            empty_summary=e_out,
+            golden_vendored_summary=gv_out,
+            reference_summary=ref_out,
+        )
+
+    if g_out == "TIMEOUT":
+        return _fail("validation_gate_timeout_golden")
+    if e_out == "TIMEOUT":
+        return _fail("validation_gate_timeout_empty")
+    if golden_vendored_diff is not None and gv_out == "TIMEOUT":
+        return _fail("validation_gate_timeout_golden_vendored")
+    if reference_diff is not None and ref_out == "TIMEOUT":
+        return _fail("validation_gate_timeout_reference")
+
+    if golden_vendored_diff is not None and gv_out == "BUILD_FAILED":
+        return _fail("validation_gate_golden_vendored_build_failed")
+    if reference_diff is not None and ref_out == "BUILD_FAILED":
+        return _fail("validation_gate_reference_build_failed")
+
+    if golden_reward < min_golden_reward:
+        return _fail(f"all_tests_failed_validation_gate_golden_{golden_reward:.2f}")
+    if empty_reward > max_empty_reward:
+        return _fail(f"all_tests_failed_validation_gate_empty_{empty_reward:.2f}")
+    if golden_vendored_diff is not None and golden_vendored_reward < min_golden_reward:
+        return _fail(
+            f"all_tests_failed_validation_gate_golden_vendored_{golden_vendored_reward:.2f}"
+        )
+    if reference_diff is not None and reference_reward < min_reference_reward:
+        return _fail(f"all_tests_failed_validation_gate_reference_{reference_reward:.2f}")
+
+    return _ValidationGateResult(
+        passed=True,
+        golden_reward=golden_reward,
+        empty_reward=empty_reward,
+        golden_vendored_reward=golden_vendored_reward,
+        reference_reward=reference_reward,
+        reason="ok",
+        golden_summary=g_out,
+        empty_summary=e_out,
+        golden_vendored_summary=gv_out,
+        reference_summary=ref_out,
+    )
+
+
+def validate_backend_pairing(sim_name: str, source_name: str) -> None:
+    """Raise ValueError if the (sim, source) pairing violates either side's compatibility.
+
+    Both sides must handshake: the sim's compatible_sources must contain source_name
+    AND the source's compatible_sims must contain sim_name. Called at pipeline
+    startup to short-circuit obvious mismatches like ``aws_tests + kwok`` before
+    the extractor runs.
+    """
+    from repo2rlenv.pipelines._cli_app_backends import get_backend
+    from repo2rlenv.pipelines._cli_app_backends.source.base import get_source
+
+    sim = get_backend(sim_name)
+    src = get_source(source_name)
+    if source_name not in sim.compatible_sources:
+        raise ValueError(
+            f"cli_app: source {source_name!r} is not compatible with sim {sim_name!r}; "
+            f"sim advertises compatible_sources={sorted(sim.compatible_sources)}"
+        )
+    if sim_name not in src.compatible_sims:
+        raise ValueError(
+            f"cli_app: sim {sim_name!r} is not compatible with source {source_name!r}; "
+            f"source advertises compatible_sims={sorted(src.compatible_sims)}"
+        )
+
+
+def _build_kwok_task_spec(cmd_specs, translated_intents, command_prefix: str = ""):
+    """Build a duck-typed task_spec for KwokSimulationBackend.emit_reference_client.
+
+    The pruner reads `.commands` (verbs) to filter client methods, `.kinds`
+    (resource kinds) to trim the KINDS catalog, and `.command_prefix` to
+    generate a golden shim that strips the synthesis-time prefix arg before
+    exec'ing real kubectl.
+    """
+    verbs = sorted({c.name for c in cmd_specs})
+    kinds: set[str] = set()
+    for intent in translated_intents or ():
+        template = getattr(intent, "cmdline_template", None)
+        if template and len(template) >= 3 and template[0] == "kubectl":
+            kinds.add(template[2])
+    return SimpleNamespace(
+        commands=verbs,
+        kinds=sorted(kinds),
+        command_prefix=command_prefix or "",
+    )
+
+
+_KWOK_SUBSET_IMAGE_CACHE: dict[str, str] = {}
+
+
+def _kwok_subset_hash(
+    cmd_names: list[str],
+    kubectl_version: str,
+    kwok_base_image: str,
+) -> str:
+    payload = "|".join(
+        [
+            ",".join(sorted(cmd_names)),
+            kubectl_version,
+            kwok_base_image,
+        ]
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()[:8]
+
+
+def _git_short_sha() -> str:
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return "unknown"
+    sha = proc.stdout.strip()
+    if proc.returncode != 0 or not sha:
+        return "unknown"
+    return sha[:8]
+
+
+def _preflight_ecr_env(profile: str | None) -> None:
+    if profile or os.environ.get("AWS_PROFILE"):
+        return
+    if not os.environ.get("AWS_ACCESS_KEY_ID"):
+        raise RuntimeError(
+            "ECR push enabled but AWS_ACCESS_KEY_ID missing "
+            "(and no AWS_PROFILE / cli_app_ecr_profile set). "
+            "Export AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY + AWS_REGION, "
+            "or set cli_app_ecr_profile to a configured named profile."
+        )
+
+
+def _get_manifest_digest(image_ref: str, *, timeout: int = 60) -> str:
+    proc = subprocess.run(
+        ["docker", "buildx", "imagetools", "inspect", "--raw", image_ref],
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
+    if proc.returncode != 0:
+        stderr = proc.stderr.decode(errors="replace").strip() if proc.stderr else ""
+        raise RuntimeError(f"docker buildx imagetools inspect --raw {image_ref} failed: {stderr}")
+    return "sha256:" + hashlib.sha256(proc.stdout).hexdigest()
+
+
+def _build_and_push_kwok_subset_image(
+    *,
+    registry: str,
+    profile: str | None,
+    platforms: list[str],
+    cmd_names: list[str],
+    kubectl_version: str,
+    kwok_base_image: str,
+    dockerfile: str,
+    git_sha: str | None = None,
+) -> str:
+    sha8 = _kwok_subset_hash(cmd_names, kubectl_version, kwok_base_image)
+    cached = _KWOK_SUBSET_IMAGE_CACHE.get(sha8)
+    if cached is not None:
+        logger.info("cli_app: kwok subset image cache hit sha=%s ref=%s", sha8, cached)
+        return cached
+    if git_sha is None:
+        git_sha = _git_short_sha()
+    repo_segment = f"r2e-kubectl-{sha8}"
+    tag_ref = f"{registry}/{repo_segment}:v{git_sha}"
+    region = parse_ecr_region(registry)
+    if region is None:
+        raise _TaskRejected(f"cli_app_ecr_unsupported_registry_{registry}")
+    ensure_ecr_repository(tag_ref, profile=profile)
+    ensure_docker_login_ecr(registry, region, profile=profile)
+    if not manifest_exists(tag_ref):
+        with tempfile.TemporaryDirectory() as ctx:
+            ctx_path = Path(ctx)
+            (ctx_path / "Dockerfile").write_text(dockerfile)
+            logger.info(
+                "cli_app: pushing shared kwok subset image sha=%s git=%s ref=%s",
+                sha8,
+                git_sha,
+                tag_ref,
+            )
+            build_and_push_multiarch(context_dir=ctx_path, image_ref=tag_ref, platforms=platforms)
+    else:
+        logger.info(
+            "cli_app: kwok subset image already exists on registry sha=%s ref=%s",
+            sha8,
+            tag_ref,
+        )
+    digest = _get_manifest_digest(tag_ref)
+    sha_pinned_ref = f"{registry}/{repo_segment}@{digest}"
+    _KWOK_SUBSET_IMAGE_CACHE[sha8] = sha_pinned_ref
+    return sha_pinned_ref
+
+
+_KUBECTL_VERB_BEHAVIOR: dict[str, list[str]] = {
+    "get": [
+        "Reads one or more resources from the apiserver via the corresponding "
+        "`list_<kind>` / `read_<kind>` call and writes a human-readable table to stdout "
+        "(`NAME  READY  STATUS  RESTARTS  AGE` for pods; analogous columns per kind).",
+        "`-o json` / `-o yaml` MUST emit a machine-parseable object; keys are stable "
+        "but ordering is not asserted.",
+        "`--namespace <ns>` (or `-n`) restricts the list to that namespace. Without "
+        "it, the default namespace is used; `--all-namespaces` widens the scope.",
+        "Getting a resource that does not exist FAILS with exit `1` and stderr "
+        "containing `NotFound` (or lowercase `not found`).",
+        "Getting from a namespace that does not exist FAILS with exit `1` and stderr "
+        "containing `NotFound`.",
+        "`get` never mutates cluster state; a second `get` over an unchanged cluster "
+        "MUST return the same set of names (order-independent).",
+    ],
+    "apply": [
+        "Applies a manifest (`-f <file>`) declaratively: creates the resource if "
+        "absent, patches it toward the manifest if present (idempotent).",
+        "After success, `kubectl get` on the same name/namespace MUST list the "
+        "resource; a re-apply of the SAME manifest is a no-op with respect to spec.",
+        "Success stdout is real-kubectl shape: `<kind>/<name> created` on first apply, "
+        "`<kind>/<name> configured` or `<kind>/<name> unchanged` on re-apply.",
+        "Missing manifest file, malformed YAML, or a manifest that fails apiserver "
+        "validation FAILS with exit `1` (stderr contains `Invalid`) or exit `2` "
+        "(stderr contains `invalid` for argparse-style flag errors).",
+        "`kubectl apply` has NO `--wait-for` flag upstream; only `--wait` exists. Do "
+        "NOT invent flags outside the observed argv shapes.",
+        "State invariant: after `apply -f pod.yaml`, `read_namespaced_pod` returns the "
+        "pod with `.metadata.name` matching the manifest's `metadata.name`.",
+    ],
+    "delete": [
+        "Removes one or more resources from the apiserver via `delete_<kind>` and "
+        "prints `<kind>/<name> deleted` on stdout, once per removed object.",
+        "After success, the resource MUST NOT appear in the corresponding "
+        "`list_<kind>` result; a follow-up `read_<kind>` raises `ApiException` with "
+        "`.status == 404`.",
+        "Deleting a non-existent resource FAILS with exit `1` and stderr containing "
+        "`NotFound` (or lowercase `not found`).",
+        "Bulk shapes such as `--all` (all objects in ns) or `--all-namespaces` remove "
+        "the corresponding set atomically per kind.",
+        "`--namespace <ns>` (or `-n`) selects the namespace; without it the default "
+        "namespace is used.",
+        "A missing positional name AND missing `--all` MUST fail with exit `2` and "
+        "stderr containing `invalid` / `resource(s) were provided`.",
+    ],
+    "create": [
+        "Creates a resource from a manifest (`-f <file>`) or from typed sub-forms "
+        "such as `create namespace <name>` / `create configmap <name>`.",
+        "After success, the resource MUST appear in the corresponding "
+        "`list_<kind>` result; `read_<kind>` returns the created object.",
+        "Success stdout is real-kubectl shape: `<kind>/<name> created`.",
+        "Creating a resource that already exists FAILS with exit `1` and stderr "
+        "containing `AlreadyExists`.",
+        "`create` is NOT idempotent (unlike `apply`) — a second `create` of the same "
+        "name errors out with `AlreadyExists`.",
+        "Missing or unparseable `-f` payload FAILS with exit `1` (stderr `Invalid`) "
+        "or exit `2` (stderr `invalid` for missing-arg errors).",
+    ],
+    "describe": [
+        "Prints a multi-section, human-readable view of one or more resources on "
+        "stdout: `Name`, `Namespace`, `Labels`, `Annotations`, `Status`, `Events` "
+        "sections at minimum for pods; analogous sections per kind.",
+        "Reads via `read_<kind>` (single object) or `list_<kind>` (bulk) and formats "
+        "the result; NEVER mutates state.",
+        "Describing a resource that does not exist FAILS with exit `1` and stderr "
+        "containing `NotFound`.",
+        "Section output is stable enough to substring-match on section headers "
+        "(`Name:`, `Namespace:`, `Status:`) but tests should NOT pin on exact "
+        "whitespace or full-line format.",
+        "`--namespace <ns>` restricts the lookup; without it the default namespace is used.",
+    ],
+    "patch": [
+        "Applies a strategic-merge or JSON patch (`--patch <body>` or `-p <body>`) to "
+        "an existing resource via `patch_<kind>`; only the fields named in the patch "
+        "are changed, others are preserved.",
+        "After success, `read_<kind>` MUST return the object with the patched fields "
+        "reflecting the patch body; unmodified fields keep their prior value.",
+        "Success stdout is real-kubectl shape: `<kind>/<name> patched`.",
+        "Patching a non-existent resource FAILS with exit `1` and stderr containing `NotFound`.",
+        "A malformed patch body (invalid JSON, unknown field, illegal value) FAILS "
+        "with exit `1` and stderr containing `Invalid`.",
+        "`--type strategic|merge|json` selects the patch semantics; the default is "
+        "`strategic` for built-in kinds.",
+    ],
+    "scale": [
+        "Sets the replica count of a scalable workload (Deployment, StatefulSet, "
+        "ReplicaSet) via `patch_<kind>_scale` or an equivalent PATCH to `/scale`.",
+        "After `scale deployment <name> --replicas=N`, `read_namespaced_deployment` "
+        "MUST return `.spec.replicas == N`.",
+        "Success stdout is real-kubectl shape: `deployment.apps/<name> scaled`.",
+        "`--replicas <n>` is REQUIRED; a missing value FAILS with exit `2` and "
+        "stderr containing `invalid` / `required`.",
+        "Scaling a non-existent workload FAILS with exit `1` and stderr containing `NotFound`.",
+        "Scaling to `0` is legal and MUST succeed; the deployment's spec-replica "
+        "count reads back as `0`.",
+    ],
+    "label": [
+        "Adds, updates, or removes labels on an existing resource via a PATCH to "
+        "`.metadata.labels`.",
+        "`kubectl label <kind>/<name> key=value` sets the label; `kubectl label "
+        "<kind>/<name> key-` (trailing hyphen) removes it.",
+        "After success, `read_<kind>` MUST return the object with the mutated "
+        "`.metadata.labels` map reflecting the change.",
+        "Success stdout is real-kubectl shape: `<kind>/<name> labeled`.",
+        "Setting a label that already exists WITHOUT `--overwrite` FAILS with exit "
+        "`1` and stderr containing `already has a value` / `Invalid`.",
+        "Labeling a non-existent resource FAILS with exit `1` and stderr containing `NotFound`.",
+    ],
+    "annotate": [
+        "Adds, updates, or removes annotations on an existing resource via a PATCH "
+        "to `.metadata.annotations`; same shape as `label` but for annotations.",
+        "After success, `read_<kind>` MUST return the object with the mutated "
+        "`.metadata.annotations` map reflecting the change.",
+        "Success stdout is real-kubectl shape: `<kind>/<name> annotated`.",
+        "Setting an annotation that already exists WITHOUT `--overwrite` FAILS with "
+        "exit `1` and stderr containing `already has a value` / `Invalid`.",
+        "Annotating a non-existent resource FAILS with exit `1` and stderr containing `NotFound`.",
+    ],
+    "edit": [
+        "Reads the current object via `read_<kind>`, hands the caller-supplied edit "
+        "(via `--filename` or in-place buffer) and re-applies via `patch_<kind>`.",
+        "After success, the mutated fields MUST be observable via `read_<kind>`.",
+        "Editing a non-existent resource FAILS with exit `1` and stderr containing `NotFound`.",
+    ],
+    "replace": [
+        "Replaces an existing resource by re-applying a full manifest via "
+        "`replace_<kind>`; unlike `apply`, it requires the object to already exist.",
+        "After success, `read_<kind>` returns the manifest-supplied object; every "
+        "field NOT in the manifest is either reset to its zero value or dropped.",
+        "Replacing a non-existent resource FAILS with exit `1` and stderr containing "
+        "`NotFound`. Use `--force` to fall back to delete+create.",
+        "Malformed YAML or a manifest that fails apiserver validation FAILS with "
+        "exit `1` and stderr containing `Invalid`.",
+    ],
+    "rollout": [
+        "Manages the rollout state of a workload: `rollout status <kind>/<name>` "
+        "polls the workload's `.status` until the rollout completes; "
+        "`rollout restart` triggers a rolling restart via a PATCH; "
+        "`rollout undo` reverts to the previous ReplicaSet.",
+        "`rollout status` prints progress lines followed by "
+        '`deployment "<name>" successfully rolled out` on completion.',
+        "Rollout on a non-existent workload FAILS with exit `1` and stderr containing `NotFound`.",
+        "State invariant: after `rollout restart`, the target's "
+        "`.spec.template.metadata.annotations` gains a `kubectl.kubernetes.io/"
+        "restartedAt` timestamp observable via `read_namespaced_deployment`.",
+    ],
+    "expose": [
+        "Creates a Service targeting an existing workload via `create_namespaced_service`.",
+        "After success, `read_namespaced_service` MUST return the created Service "
+        "with `.spec.selector` matching the workload's labels.",
+        "Exposing a non-existent workload FAILS with exit `1` and stderr containing `NotFound`.",
+        "Missing `--port` FAILS with exit `2` and stderr containing `required` / `invalid`.",
+    ],
+    "autoscale": [
+        "Creates a HorizontalPodAutoscaler targeting an existing workload via "
+        "`create_namespaced_horizontal_pod_autoscaler`.",
+        "After success, `read_namespaced_horizontal_pod_autoscaler` MUST return the "
+        "HPA with `.spec.min_replicas` / `.spec.max_replicas` matching the flags.",
+        "Autoscaling a non-existent workload FAILS with exit `1` and stderr containing `NotFound`.",
+    ],
+}
+
+
+# Fallback bullets when a verb is not in the map above — used defensively so
+# rendering never yields an empty section for unknown or unusual verbs.
+_KUBECTL_VERB_BEHAVIOR_FALLBACK: list[str] = [
+    "Invokes the corresponding apiserver operation for this verb; the resulting "
+    "state MUST be observable via the documented read APIs of the other verbs.",
+    "On success: exit `0`, real-kubectl-shaped stdout line (`<kind>/<name> "
+    "<verb-past-tense>`), stderr empty.",
+    "On failure: exit `1` for API errors (stderr contains a stable category "
+    "keyword — `NotFound`, `AlreadyExists`, `Invalid`, `Forbidden`, `Conflict`, "
+    "`Timeout`) or exit `2` for argparse-style usage errors (stderr contains "
+    "`invalid`).",
+]
+
+
+def _kwok_verb_behavior_bullets(verb: str) -> list[str]:
+    """Return the 4-8 raiden-style behavior bullets for a kubectl verb."""
+    return _KUBECTL_VERB_BEHAVIOR.get(verb.lower(), _KUBECTL_VERB_BEHAVIOR_FALLBACK)
+
+
+_KWOK_IMPLEMENTATION_CONSTRAINTS = (
+    "## Implementation constraints\n\n"
+    "- Your submission may be written in any language available in the image.\n"
+    "  Use only what the image already provides; no additional packages may be\n"
+    "  fetched.\n"
+    "- Do NOT shell out to the real `kubectl` binary from inside your program.\n"
+    "- The kwok cluster exposes a standard Kubernetes REST API on the endpoint\n"
+    "  configured in `$KUBECONFIG`. Use any client library idiomatic for your\n"
+    "  language, or speak the Kubernetes REST API directly.\n"
+    "- Read `KUBECONFIG` from the environment; the runtime configures it to point\n"
+    "  at a sandboxed kwok cluster. Do NOT override the apiserver endpoint,\n"
+    "  credentials, or context in code.\n"
+    "- Success messages go to **stdout**; errors go to **stderr**. Do NOT mix them.\n"
+    "- Exit codes are STRICT and must match real kubectl semantics:\n"
+    "  - `0` on success\n"
+    "  - `1` on API errors from the apiserver (404 `NotFound`, 409 `Conflict`,\n"
+    "    422 `Invalid`, 403 `Forbidden`, timeouts, connection failures)\n"
+    "  - `2` on cobra usage errors (unknown flag, missing required positional,\n"
+    "    malformed flag value, invalid subcommand)\n"
+    "  Tests enforce the SPECIFIC code — `returncode == 1` for apiserver\n"
+    "  errors and `returncode == 2` for usage errors. Returning the\n"
+    "  wrong non-zero code will fail verification.\n"
+    "- Do NOT surface raw runtime tracebacks or internal error dumps; print a\n"
+    "  brief user-facing error string that names the failure class instead\n"
+    "  (for example, `NotFound (404)` or `Invalid: ...`).\n"
+    "- Do NOT fabricate flags that don't exist upstream. In particular,\n"
+    "  `kubectl apply` has NO `--wait-for` flag (only `--wait`).\n"
+    "- Do NOT validate resource names client-side; the apiserver rejects\n"
+    "  DNS-1123-invalid names with `Invalid`. Defer to the server.\n"
+    "- Do NOT implement or delegate to the unsupported verbs `logs`, `exec`,\n"
+    "  `port-forward`, `attach`, `top`, `cp` — kwok returns synthetic data for\n"
+    "  these and no test will exercise them.\n"
+    "- Your submission must be an executable at `/workspace/submission/kubectl`\n"
+    "  (any language — shebang script or compiled binary). The image provides\n"
+    "  `/workspace/submission/` first on `$PATH`, so the executable shadows the\n"
+    "  real `/usr/local/bin/kubectl` for the test harness.\n"
+)
+
+
+_KWOK_OUTPUT_CONTRACT = (
+    "## Output contract\n\n"
+    "A correct implementation produces output in the *shape* described below,\n"
+    "names the *class* of any error reported, uses the documented exit-code set,\n"
+    "and never surfaces a runtime stack trace. Specific verbs, error codes, and\n"
+    "the exact wording of any message are deliberately not enumerated here:\n"
+    "derive them from the underlying Kubernetes API semantics and standard\n"
+    "`kubectl` conventions.\n\n"
+    "### stdout (success path)\n\n"
+    "- A successful mutation writes one line per affected resource. `create`,\n"
+    "  `apply`, `patch`, `scale`, `label`, `annotate`, `rollout` use the shape\n"
+    "  `<kind>/<name> <verb-past-tense>` (for example, `pod/foo created`,\n"
+    "  `deployment.apps/bar scaled`). `delete` uses a DIFFERENT shape:\n"
+    '  `<kind> "<name>" deleted` (for example, `namespace "baz" deleted`,\n'
+    '  `pod "foo" deleted`). The `<kind>` fragment may be short (`pod`) or\n'
+    "  qualified (`deployment.apps`); both are acceptable to the tests.\n"
+    "- `kubectl get` (default output) writes a human-readable table with a header\n"
+    "  row and one line per resource. `-o json` / `-o yaml` write a\n"
+    "  machine-parseable document.\n"
+    "- `kubectl describe` writes a multi-section report (section headers end\n"
+    "  with `:` — `Name:`, `Namespace:`, `Labels:`, `Annotations:`, `Status:`,\n"
+    "  `Events:`).\n"
+    "- Implementations MAY emit informational progress lines BEFORE the success\n"
+    '  line (for example, `Waiting for deployment "foo" rollout to finish...`).\n'
+    "  Conformance is checked by looking for the success line anywhere in stdout,\n"
+    "  not as the first line.\n"
+    "- stderr is empty on success.\n\n"
+    "### stderr (failure path)\n\n"
+    "- stdout is empty on failure.\n"
+    "- A human-readable error line is written to stderr that identifies the\n"
+    "  failure *class*. Any of the following shapes is acceptable:\n"
+    "  - the underlying apiserver error envelope surfaced as\n"
+    "    `<reason> (<status>)` (for example, `NotFound (404)`,\n"
+    "    `AlreadyExists (409)`, `Invalid (422)`)\n"
+    "  - a bare `<reason>: <message>` line naming the apiserver error reason\n"
+    "    (`NotFound`, `AlreadyExists`, `Invalid`, `Forbidden`, `Conflict`,\n"
+    "    `Timeout`)\n"
+    "  - a client-side usage-error line whose prefix names the failure class\n"
+    "    (for example, `Error: unknown flag: --nope`, `error: resource(s) were\n"
+    '    not provided`, `invalid argument "..."`)\n'
+    "- Tests match the failure *class* against one of these shapes — not\n"
+    "  verbatim wording — so any spec-compliant phrasing is accepted.\n"
+    "- No runtime stack trace is emitted under any condition.\n\n"
+    "### Exit codes\n\n"
+    "The exit code on termination is one of `{0, 1, 2}`:\n\n"
+    "- `0` — success\n"
+    "- `1` — apiserver / API error (an `ApiException` was raised: `NotFound`,\n"
+    "  `AlreadyExists`, `Invalid`, `Forbidden`, `Conflict`, `Timeout`)\n"
+    "- `2` — parameter/usage error (unknown flag, missing/extra positional,\n"
+    "  malformed value)\n\n"
+    "Tests only check `returncode != 0` on failure; any non-zero code in\n"
+    "`{1, 2}` is acceptable.\n"
+)
+
+
+def _build_instruction_md_kwok(
+    spec: CliSpec, cmd_spec: CommandSpec, intents: list[TestIntent]
+) -> str:
+    """Render the kwok/kubectl agent-facing instruction.md at raiden parity.
+
+    Structure mirrors ``_build_instruction_md`` (the AWS variant) but authors
+    every prose block in kubectl terms: verbs (`get`, `apply`, `delete`, ...)
+    over resources (pods, deployments, ...), the kubernetes-python-client
+    surface, and the apiserver-shaped error envelope. Built ONLY from CliSpec
+    + extracted intents + the hand-authored ``_KUBECTL_VERB_BEHAVIOR`` map —
+    never reads test bodies. ``_assert_no_test_leakage`` is the safety net.
+    """
+    from repo2rlenv.pipelines._cli_app_backends import get_backend
+    from repo2rlenv.pipelines._cli_app_backends.simulation.kwok import _REAL_KUBECTL_FLAGS
+
+    kwok = get_backend("kwok")
+    flags = _extract_flags_from_intents(intents)
+    verb = cmd_spec.name
+    kind_hint = spec.command_prefix
+
+    parts: list[str] = []
+
+    parts.append(f"# Build `kubectl {verb}` from scratch (targeting `{kind_hint}`)\n")
+    parts.append(
+        "## Application overview\n\n"
+        f"You are implementing the real kubectl `{verb}` verb. Real kubectl is\n"
+        "**verb-first** — the invocation shape is `kubectl VERB [TYPE] [NAME] [flags]`\n"
+        "(see https://kubernetes.io/docs/reference/kubectl/). There is no\n"
+        "`kubectl <resource> <verb>` subcommand form; `kubectl pods apply` DOES NOT\n"
+        f"EXIST. This task's tests focus on the `{kind_hint}` resource kind, which\n"
+        "enters the CLI either via the manifest's `kind:` field (for\n"
+        "`apply`/`create -f`) or as the TYPE positional after the verb (for\n"
+        "`get`/`delete`/`describe`/`patch`/`scale`/`label`).\n\n"
+        "The agent is given **no source code**, only this specification. Your\n"
+        "implementation is an executable at `/workspace/submission/kubectl`,\n"
+        "invoked as a subprocess:\n\n"
+        "```bash\n"
+        f"/workspace/submission/kubectl {verb} [TYPE] [NAME] [flags...]\n"
+        "```\n\n"
+        "Any executable format works — shebang script or compiled binary. The\n"
+        "runtime image ships toolchains for a range of general-purpose\n"
+        "languages; use whichever you prefer, with any client library idiomatic\n"
+        "for that language.\n\n"
+        "Make sure the file is executable (`chmod +x`). The runtime configures\n"
+        "`KUBECONFIG` in the environment to point at a sandboxed kwok cluster\n"
+        "(lightweight apiserver + etcd-backed storage simulating Kubernetes\n"
+        "control-plane semantics faithfully). Read `KUBECONFIG` from the\n"
+        "environment; do NOT hard-code endpoints. Treat the backend as real\n"
+        "Kubernetes, and keep state consistent across verbs so a sequence like\n"
+        "create -> get -> patch -> scale -> delete behaves correctly end-to-end.\n"
+    )
+
+    parts.append(f"## Verb: `kubectl {verb}` (primary resource kind: `{kind_hint}`)\n")
+
+    parts.append("### Interface\n\nObserved argv patterns (after invoking `submission/kubectl`):\n")
+    seen_shapes: set[str] = set()
+    for intent in intents:
+        if _is_internal_mutation_intent(intent):
+            continue
+        shape = _argv_shape(intent.cmdline_template)
+        if shape and shape not in seen_shapes:
+            seen_shapes.add(shape)
+            parts.append(f"- `{shape}`")
+    parts.append("")
+
+    real_flags = _REAL_KUBECTL_FLAGS.get(verb, ())
+    if flags or real_flags:
+        parts.append("### Flags\n")
+        parts.append(
+            "Real kubectl v1.31 flags for this verb (support all of them; the "
+            "reference test suite exercises a subset):\n"
+        )
+        parts.append("| Flag | Example value |")
+        parts.append("|---|---|")
+        seen_keys: set[str] = set()
+        for f, v in sorted(flags.items()):
+            seen_keys.add(f)
+            parts.append(f"| `{f}` | `{v}` |" if v else f"| `{f}` | _(boolean)_ |")
+        for real in real_flags:
+            key = real.split("/", 1)[0].split("=", 1)[0].strip()
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            parts.append(f"| `{real}` | _(v1.31)_ |")
+        parts.append("")
+
+    parts.append("### Behavior\n")
+    for bullet in _kwok_verb_behavior_bullets(cmd_spec.name):
+        parts.append(f"- {bullet}")
+    parts.append("")
+
+    parts.append("### State expectations (kwok cluster is real apiserver state)\n")
+    parts.append(kwok.cross_command_invariants([cmd_spec.name]))
+
+    examples = _render_examples(intents, verb, invocation="/workspace/submission/kubectl")
+    if examples:
+        parts.append("### Examples\n")
+        parts.append("```bash")
+        parts.extend(examples)
+        parts.append("```\n")
+
+    parts.append(_KWOK_IMPLEMENTATION_CONSTRAINTS)
+    parts.append(_KWOK_OUTPUT_CONTRACT)
+
+    return "\n".join(parts) + "\n"
+
+
+def _build_subset_instruction_md_kwok(
+    spec: CliSpec, cmd_specs: list[CommandSpec], intents: list[TestIntent]
+) -> str:
+    """Render the kwok/kubectl multi-verb subset instruction.md at raiden parity.
+
+    One `## Command: kubectl <prefix> <verb>` section per verb (Interface +
+    Flags + Behavior), followed by cross-command state invariants and the
+    shared implementation + output contract. Mirrors the shape of
+    ``_build_subset_instruction_md`` (the AWS variant).
+    """
+    from repo2rlenv.pipelines._cli_app_backends import get_backend
+
+    kwok = get_backend("kwok")
+    kind_hint = spec.command_prefix
+    names = sorted(c.name for c in cmd_specs)
+    label_list = ", ".join(f"`kubectl {n}`" for n in names)
+
+    parts: list[str] = []
+
+    parts.append(f"# Build a `kubectl` CLI (verbs: {', '.join(names)}; targeting `{kind_hint}`)\n")
+    parts.append(
+        "## Application overview\n\n"
+        "You are implementing a subset of real kubectl verbs:\n"
+        f"{label_list}. Real kubectl is **verb-first** — the invocation shape is\n"
+        "`kubectl VERB [TYPE] [NAME] [flags]` (see\n"
+        "https://kubernetes.io/docs/reference/kubectl/). There is no\n"
+        "`kubectl <resource> <verb>` subcommand form; `kubectl pods apply` DOES NOT\n"
+        f"EXIST. This task's tests focus on the `{kind_hint}` resource kind, which\n"
+        "enters the CLI either via the manifest's `kind:` field (for\n"
+        "`apply`/`create -f`) or as the TYPE positional after the verb (for\n"
+        "`get`/`delete`/`describe`/`patch`/`scale`/`label`).\n\n"
+        "The agent is given **no source code**, only this specification. Your\n"
+        "implementation is an executable at `/workspace/submission/kubectl`,\n"
+        "invoked as a subprocess:\n\n"
+        "```bash\n"
+        "/workspace/submission/kubectl <verb> [TYPE] [NAME] [flags...]\n"
+        "```\n\n"
+        "Dispatch on argv[1] (the verb: `apply`, `get`, `delete`, `describe`,\n"
+        "`patch`, `scale`, `label`, `create`) so one program handles every verb\n"
+        "above.\n\n"
+        "Any executable format works — shebang script or compiled binary. The\n"
+        "runtime image ships toolchains for a range of general-purpose\n"
+        "languages; use whichever you prefer, with any client library idiomatic\n"
+        "for that language.\n\n"
+        "Make sure the file is executable (`chmod +x`). The runtime configures\n"
+        "`KUBECONFIG` in the environment to point at a sandboxed kwok cluster\n"
+        "(lightweight apiserver + etcd-backed storage simulating Kubernetes\n"
+        "control-plane semantics faithfully). Read `KUBECONFIG` from the\n"
+        "environment; do NOT hard-code endpoints. Treat the backend as real\n"
+        "Kubernetes, and keep state consistent across verbs so a sequence like\n"
+        "create -> get -> patch -> scale -> delete behaves correctly end-to-end.\n"
+    )
+
+    parts.append("## Verbs\n")
+    by_cmd: dict[str, list[TestIntent]] = {}
+    for i in intents:
+        by_cmd.setdefault(i.command, []).append(i)
+    for c in sorted(cmd_specs, key=lambda c: c.name):
+        parts.extend(_kwok_command_section_parts(spec, c, by_cmd.get(c.name, [])))
+
+    parts.append("## Cross-command behaviour (state must stay consistent)\n")
+    parts.append(kwok.cross_command_invariants(names))
+    parts.append(
+        "State must remain consistent across the verb set:\n\n"
+        "- The kwok apiserver persists every mutation to etcd via kine, so the\n"
+        "  effect of any successful mutation MUST be immediately observable via\n"
+        "  the corresponding read verb (`get`, `describe`) or client method\n"
+        "  (`read_<kind>`, `list_<kind>`).\n"
+        "- After `create <kind> <name>` (or `apply -f manifest.yaml`), a follow-up\n"
+        "  `get <kind> <name>` returns the resource; `read_<kind>` on the same\n"
+        "  name succeeds. `apply` is idempotent — re-applying the same manifest\n"
+        "  is a no-op with respect to spec fields.\n"
+        "- After `delete <kind> <name>`, the resource disappears from\n"
+        "  `list_<kind>` and `read_<kind>` raises `ApiException` with\n"
+        "  `.status == 404`. Deleting the same name a second time FAILS with\n"
+        "  `NotFound` (unlike some AWS delete APIs, kubectl delete is NOT\n"
+        "  idempotent by default).\n"
+        "- After `patch <kind>/<name>` or `label <kind>/<name>`, `read_<kind>`\n"
+        "  reflects the mutated fields; unmodified fields keep their prior value\n"
+        "  (strategic-merge semantics for built-in kinds).\n"
+        "- After `scale <workload>/<name> --replicas=N`, "
+        "`read_<workload>(name)` returns\n"
+        "  `.spec.replicas == N`.\n"
+        "- Read verbs (`get`, `describe`) never mutate state; two consecutive\n"
+        "  reads over an unchanged cluster return the same set of names\n"
+        "  (order-independent).\n"
+    )
+
+    parts.append(_KWOK_IMPLEMENTATION_CONSTRAINTS)
+    parts.append(_KWOK_OUTPUT_CONTRACT)
+
+    return "\n".join(parts) + "\n"
+
+
+def _kwok_command_section_parts(
+    spec: CliSpec, cmd_spec: CommandSpec, intents: list[TestIntent]
+) -> list[str]:
+    """Compact per-verb spec section for a kwok subset instruction.md.
+
+    Emits `### Command: kubectl <prefix> <verb>` with Interface + Flags +
+    Behavior sub-sections, mirroring the aws `_command_section_parts` shape
+    but scoped to kubectl semantics.
+    """
+    kind_hint = spec.command_prefix
+    verb = cmd_spec.name
+    parts: list[str] = [f"### Verb: `kubectl {verb}` (primary resource kind: `{kind_hint}`)\n"]
+
+    shapes: list[str] = []
+    seen: set[str] = set()
+    for intent in intents:
+        if _is_internal_mutation_intent(intent):
+            continue
+        shape = _argv_shape(intent.cmdline_template)
+        if shape and shape not in seen:
+            seen.add(shape)
+            shapes.append(f"- `{shape}`")
+    if shapes:
+        parts.append("**Interface — observed argv patterns:**\n")
+        parts.extend(shapes)
+        parts.append("")
+
+    from repo2rlenv.pipelines._cli_app_backends.simulation.kwok import _REAL_KUBECTL_FLAGS
+
+    non_mutation_intents = [i for i in intents if not _is_internal_mutation_intent(i)]
+    observed_flags = _extract_flags_from_intents(non_mutation_intents)
+    documented_flags = set(cmd_spec.flags or [])
+    flags_union = set(observed_flags.keys()) | documented_flags
+    real_flags = _REAL_KUBECTL_FLAGS.get(verb, ())
+    if flags_union or real_flags:
+        parts.append("**Flags (real kubectl v1.31 — support all):**\n")
+        parts.append("| Flag | Example value |")
+        parts.append("|---|---|")
+        seen_keys: set[str] = set()
+        for f in sorted(flags_union):
+            seen_keys.add(f)
+            v = observed_flags.get(f)
+            parts.append(f"| `{f}` | `{v}` |" if v else f"| `{f}` | _(boolean)_ |")
+        for real in real_flags:
+            key = real.split("/", 1)[0].split("=", 1)[0].strip()
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            parts.append(f"| `{real}` | _(v1.31)_ |")
+        parts.append("")
+
+    parts.append("**Behavior:**\n")
+    for bullet in _kwok_verb_behavior_bullets(cmd_spec.name):
+        parts.append(f"- {bullet}")
+    parts.append("")
+
+    by_tag = _group_by_tag(intents)
+    error_intents: list[TestIntent] = []
+    for tag in ("error", "error_nonexistent", "error_invalid_args"):
+        error_intents.extend(by_tag.get(tag, []))
+    if error_intents:
+        parts.append("**Error cases observed:**\n")
+        seen_errors: set[tuple[str, int]] = set()
+        for intent in error_intents:
+            if _is_internal_mutation_intent(intent):
+                continue
+            shape = _argv_shape(intent.cmdline_template) or "<argv>"
+            key = (shape, intent.expected_exit)
+            if key in seen_errors:
+                continue
+            seen_errors.add(key)
+            parts.append(f"- `{shape}` -> exit `{intent.expected_exit}`")
+        parts.append("")
+
+    return parts
+
+
+def _resolve_source_name(options: CodeInstructOptions) -> str:
+    if getattr(options, "cli_app_backend", "minio") == "kwok":
+        return "kubectl_cobra_yaml"
+    if options.cli_app_extract_mode == "botocore_model":
+        return "aws_botocore"
+    return "aws_tests"
+
+
+def _kwok_profile_build_dockerfile(**kwargs) -> str:
+    from repo2rlenv.pipelines._cli_app_backends import get_backend
+
+    base_image = kwargs.get("base_image")
+    golden = kwargs.get("golden", False)
+    golden_deps = kwargs.get("golden_deps") or ()
+    kwok = get_backend("kwok")
+    if golden:
+        return kwok.dockerfile_golden_layer(tuple(golden_deps))
+    return kwok.dockerfile_base(base_image)
+
+
+def _kwok_profile_build_conftest(**kwargs) -> str:
+    from repo2rlenv.pipelines._cli_app_backends import get_backend
+
+    return get_backend("kwok").build_conftest(golden=kwargs.get("golden", False))
+
+
+def _register_kwok_profile() -> None:
+    from repo2rlenv.pipelines._cli_app_backends.simulation.kwok import KwokSimulationBackend
+
+    register_profile(
+        ServiceProfile(
+            backend_key="kwok",
+            service="kubectl",
+            simulation_backend="kwok",
+            extract_mode="tests",
+            base_image=KwokSimulationBackend.pinned_base_image,
+            pinned_deps=KwokSimulationBackend.pinned_deps,
+            translation_system=KwokSimulationBackend.prompts.translation_system,
+            translation_user=KwokSimulationBackend.prompts.translation_user_template,
+            oracle_system=KwokSimulationBackend.prompts.oracle_single_system,
+            oracle_user=KwokSimulationBackend.prompts.oracle_single_user_template,
+            oracle_subset_system=KwokSimulationBackend.prompts.oracle_subset_system,
+            oracle_subset_user=KwokSimulationBackend.prompts.oracle_subset_user_template,
+            workflow_system=KwokSimulationBackend.prompts.workflow_system,
+            workflow_user=KwokSimulationBackend.prompts.workflow_user_template,
+            build_conftest=_kwok_profile_build_conftest,
+            build_dockerfile=_kwok_profile_build_dockerfile,
+            build_instruction_single=_build_instruction_md_kwok,
+            build_instruction_subset=_build_subset_instruction_md_kwok,
+        )
+    )
+
+
+_register_kwok_profile()

@@ -34,6 +34,8 @@ Released under Apache-2.0.
 from __future__ import annotations
 
 import hashlib
+import logging
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -41,6 +43,8 @@ from typing import Any
 from uuid import uuid4
 
 import tomli_w
+
+logger = logging.getLogger(__name__)
 
 # Anti-reward-hacking disallow-list. BLOCKED_HOSTS is the canonical set of
 # hosts we blackhole at the DNS layer via Docker `extra_hosts -> 0.0.0.0`.
@@ -180,10 +184,33 @@ BLOCKED_HOSTS_DDB: tuple[str, ...] = (*BLOCKED_HOSTS, "dynamodb.amazonaws.com")
 BLOCKED_SUFFIXES_DDB: tuple[str, ...] = (*BLOCKED_SUFFIXES, "dynamodb.amazonaws.com")
 _verify_blocklist_alignment(BLOCKED_HOSTS_DDB, BLOCKED_SUFFIXES_DDB)
 
+# Kwok-backend variant. Kwok tasks don't touch AWS or MinIO, so those entries
+# would be dead weight (and confuse a reader inspecting the emitted compose).
+# We swap them for k8s-native release infra so the agent can't re-download
+# kubectl / kwok binaries at test time and shadow the pinned base image.
+_KWOK_STRIP_SUFFIXES = ("amazonaws.com", "min.io")
+_KWOK_ADD_HOSTS: tuple[str, ...] = (
+    "dl.k8s.io",
+    "storage.googleapis.com",
+    "registry.k8s.io",
+)
+_KWOK_ADD_SUFFIXES: tuple[str, ...] = (
+    "k8s.io",
+    "storage.googleapis.com",
+)
+BLOCKED_HOSTS_KWOK: tuple[str, ...] = (
+    tuple(h for h in BLOCKED_HOSTS if not h.endswith(_KWOK_STRIP_SUFFIXES)) + _KWOK_ADD_HOSTS
+)
+BLOCKED_SUFFIXES_KWOK: tuple[str, ...] = (
+    tuple(s for s in BLOCKED_SUFFIXES if not s.endswith(_KWOK_STRIP_SUFFIXES)) + _KWOK_ADD_SUFFIXES
+)
+_verify_blocklist_alignment(BLOCKED_HOSTS_KWOK, BLOCKED_SUFFIXES_KWOK)
+
 # Compose overlay emitted next to every sandbox task's Dockerfile. Harbor's
 # docker.py picks it up via `_environment_docker_compose_path` and appends
 # it to the compose stack, so extra_hosts merge with the base stack.
 NETWORK_DISALLOW_COMPOSE = _build_disallow_compose(BLOCKED_HOSTS)
+NETWORK_DISALLOW_COMPOSE_KWOK = _build_disallow_compose(BLOCKED_HOSTS_KWOK)
 
 
 @dataclass(slots=True)
@@ -290,13 +317,14 @@ def _build_samples_payload(
     if "behaviour_tag_counts" in ci:
         metadata["behaviour_tag_counts"] = ci["behaviour_tag_counts"]
 
-    # Samples convention: entry_point is always the ``submission/aws`` shim
-    # (created by solve.sh even in LLM-oracle mode, so it's the true runtime
-    # entrypoint regardless of whether the oracle is ``main.py`` or a slice).
+    _rg = ci.get("reference_grounding")
+    if isinstance(_rg, dict) and _rg:
+        metadata["reference_grounding"] = dict(_rg)
+
     metadata["runtime"] = {
         "python_version": ci.get("python_version", "3.12"),
         "simulation_backend": ci.get("simulation_backend", "minio"),
-        "entry_point": "submission/aws",
+        "entry_point": ci.get("entry_point", "submission/aws"),
         "cpus": ci.get("runtime_cpus", 1.0),
         "memory_mb": ci.get("runtime_memory_mb", 1024),
         "timeout_sec": ci.get("runtime_timeout_sec", 300),
@@ -367,9 +395,9 @@ def write_harbor_task(
             re.IGNORECASE | re.MULTILINE,
         ):
             arg_defaults[arg_m.group(1)] = arg_m.group(2).strip()
-        m = re.search(r"^(\s*FROM\s+)(\S+)", df, re.IGNORECASE | re.MULTILINE)
-        if m:
-            raw = m.group(2).strip()
+        _from_matches = list(re.finditer(r"^(\s*FROM\s+)(\S+)", df, re.IGNORECASE | re.MULTILINE))
+        if _from_matches:
+            raw = _from_matches[-1].group(2).strip()
             var_m = re.fullmatch(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", raw)
             if var_m and var_m.group(1) in arg_defaults:
                 bootstrap_image = arg_defaults[var_m.group(1)]
@@ -426,9 +454,24 @@ def write_harbor_task(
     if task.reference_diff is not None:
         (sol_dir / "golden.diff").write_text(task.oracle_diff, encoding="utf-8")
         (sol_dir / "reference.diff").write_text(task.reference_diff, encoding="utf-8")
+        _sim_backend = (task.repo2env.get("code_instruct") or {}).get("simulation_backend", "")
+        _aws_shim_block = (
+            ""
+            if _sim_backend == "kwok"
+            else (
+                "if [ ! -f /workspace/submission/aws ] && [ -f /workspace/submission/main.py ]; then\n"
+                "  cat > /workspace/submission/aws <<'EOF'\n"
+                "#!/bin/bash\n"
+                'exec python /workspace/submission/main.py "$@"\n'
+                "EOF\n"
+                "fi\n"
+                "chmod +x /workspace/submission/aws 2>/dev/null || true\n"
+            )
+        )
         (sol_dir / "solve.sh").write_text(
             "#!/bin/bash\n"
             "set -euxo pipefail\n"
+            "mkdir -p /workspace/submission\n"
             "cd /workspace\n"
             "git config --global --add safe.directory /workspace\n"
             'DIR="$(dirname "$0")"\n'
@@ -458,13 +501,18 @@ def write_harbor_task(
             "  exit 1\n"
             "fi\n"
             'git apply --verbose --reject "$PATCH"\n'
-            "if [ ! -f /workspace/submission/aws ] && [ -f /workspace/submission/main.py ]; then\n"
-            "  cat > /workspace/submission/aws <<'EOF'\n"
-            "#!/bin/bash\n"
-            'exec python /workspace/submission/main.py "$@"\n'
-            "EOF\n"
+            + _aws_shim_block
+            + "if [ -f /workspace/submission/kubectl.go ] && [ ! -x /workspace/submission/kubectl ]; then\n"
+            "  ( cd /workspace/submission && go build -o kubectl . )\n"
+            "  chmod +x /workspace/submission/kubectl\n"
             "fi\n"
-            "chmod +x /workspace/submission/aws 2>/dev/null || true\n",
+            "if [ -f /workspace/submission/kubectl-src/vendor/modules.txt ]; then\n"
+            "  ( cd /workspace/submission/kubectl-src && GOFLAGS=-mod=vendor go build -o /workspace/submission/kubectl ./cmd/kubectl ) || echo 'solve.sh: kubectl-src vendored go build failed; retaining pre-existing /workspace/submission/kubectl' >&2\n"
+            "  chmod +x /workspace/submission/kubectl 2>/dev/null || true\n"
+            "elif [ -f /workspace/submission/kubectl-src/go.mod ]; then\n"
+            "  ( cd /workspace/submission/kubectl-src && go build -o /workspace/submission/kubectl ./cmd/kubectl ) || echo 'solve.sh: kubectl-src go build failed; retaining pre-existing /workspace/submission/kubectl' >&2\n"
+            "  chmod +x /workspace/submission/kubectl 2>/dev/null || true\n"
+            "fi\n",
             encoding="utf-8",
         )
     else:
@@ -472,6 +520,7 @@ def write_harbor_task(
         (sol_dir / "solve.sh").write_text(
             "#!/bin/bash\n"
             "set -euxo pipefail\n"
+            "mkdir -p /workspace/submission\n"
             "cd /workspace\n"
             "git config --global --add safe.directory /workspace\n"
             'PATCH="$(dirname "$0")/patch.diff"\n'
@@ -492,7 +541,40 @@ def write_harbor_task(
         # overrides this default. Harbor's docker.py picks the file up via
         # _environment_docker_compose_path and appends it to the compose
         # stack, so extra_hosts merge with the base stack.
-        (env_dir / "docker-compose.yaml").write_text(NETWORK_DISALLOW_COMPOSE, encoding="utf-8")
+        _is_kwok_base = bootstrap_image and "kubectl_kwok" in bootstrap_image
+        _compose = NETWORK_DISALLOW_COMPOSE_KWOK if _is_kwok_base else NETWORK_DISALLOW_COMPOSE
+        (env_dir / "docker-compose.yaml").write_text(_compose, encoding="utf-8")
+        if _is_kwok_base and not os.environ.get("R2E_SKIP_BASE_DOCKERFILE"):
+            try:
+                _kwok_base_path = (
+                    Path(__file__).resolve().parent.parent
+                    / "pipelines"
+                    / "_cli_app_backends"
+                    / "simulation"
+                    / "kwok_base.Dockerfile"
+                )
+                _base_content = _kwok_base_path.read_text(encoding="utf-8")
+                base_dir = env_dir / "base"
+                base_dir.mkdir(exist_ok=True)
+                (base_dir / "Dockerfile").write_text(_base_content, encoding="utf-8")
+            except Exception as exc:
+                logger.info("harbor: skipping kwok base Dockerfile (%s)", exc)
+        elif bootstrap_image and not os.environ.get("R2E_SKIP_BASE_DOCKERFILE"):
+            try:
+                from repo2rlenv.registry.image_dockerfile import (
+                    reconstruct_base_dockerfile,
+                )
+
+                _base_content = reconstruct_base_dockerfile(bootstrap_image)
+                base_dir = env_dir / "base"
+                base_dir.mkdir(exist_ok=True)
+                (base_dir / "Dockerfile").write_text(_base_content, encoding="utf-8")
+            except Exception as exc:
+                logger.info(
+                    "harbor: skipping environment/base/Dockerfile for %s (%s)",
+                    bootstrap_image,
+                    exc,
+                )
     if task.test_script is not None:
         tests_dir = task_path / "tests"
         tests_dir.mkdir(exist_ok=True)
