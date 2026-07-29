@@ -351,11 +351,11 @@ class CodeInstructOptions(_BaseOptions):
     # (offline / no-Docker / cheap runs). golden/both require source_root (the cloned
     # aws-cli checkout); a slice failure hard-rejects the task rather than shipping an LLM golden.
     cli_app_oracle: Literal["llm", "golden", "both"] = "both"
-    # Max output tokens for the reference-oracle LLM call. Scales with the number
-    # of commands in a subset: a single-command oracle is ~130 lines (~2k tokens);
-    # an 8-command subset can approach ~1000 lines. `max_llm_tokens` (2048) is
-    # too small even for 2 commands and truncates output mid-expression.
-    cli_app_oracle_max_tokens: int = 16000
+    # Max output tokens for the reference-oracle LLM call. Kubectl kwok
+    # 8-verb x 14-kind subsets need ~1800 lines (~30k tokens); the previous
+    # 16000 ceiling silently truncated main.py mid-function, dropping the
+    # __main__ dispatcher and half the verb handlers.
+    cli_app_oracle_max_tokens: int = 32000
     # Retries on transient oracle-synth failures (SyntaxError from truncation,
     # LLM refusal, provider hiccup). 1 = no retry (original behaviour). The
     # LLM output cache is bypassed per attempt so we get a fresh sample.
@@ -382,9 +382,6 @@ class CodeInstructOptions(_BaseOptions):
     cli_app_topup_max_attempts: int = 0
     cli_app_topup_max_cost_usd: float | None = None
     cli_app_topup_max_wall_sec: int | None = None
-    # Oracle refinement: feed failing grounded tests back to the LLM to fix submission/main.py
-    # (raises oracle-pass -> survival). 0 = disabled. Generic path only.
-    cli_app_oracle_refine_max_attempts: int = 0
     # G5: enrich the pinned aws-cli 2.28.23 model's shapes (enum / error-code / example
     # values) from other aws-cli model versions. NEVER adds new ops/flags (they would fail
     # 2.28.23 reference grounding). Opt-in.

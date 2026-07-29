@@ -41,7 +41,7 @@ process_task() {
                 echo "[$variant] already scored, skipping"
                 continue
             fi
-            if harbor run -p "$task_dir" -a "$agent" -e docker -o "$out" -n 1 -y -q "${extra[@]}" 2>&1; then
+            if harbor run -p "$task_dir" -a "$agent" -e docker -o "$out" -n 1 -y -q --verifier-timeout-multiplier=4 "${extra[@]}" 2>&1; then
                 echo "[$variant] harbor exit 0"
             else
                 echo "[$variant] harbor NON-ZERO EXIT $?"

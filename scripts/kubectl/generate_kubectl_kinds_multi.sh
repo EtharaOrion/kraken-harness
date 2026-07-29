@@ -17,7 +17,7 @@
 #   OUT_ROOT             parent dir (default: ./datasets/kubectl-kinds-v1)
 #   START_AT             1..N to resume mid-batch after a failure
 #   END_AT               default 50 (whole batch)
-#   MAX_TESTS            per-task fixture cap (default 100)
+#   MAX_TESTS            per-task fixture cap (default 400, must be ≥ kinds×verbs to guarantee combo coverage)
 #   YAML_BUNDLE          override path to kubectl Cobra YAML bundle
 #   FIXTURE_DIR          override path to kubectl fixture dir
 
@@ -33,7 +33,7 @@ cd "$HARNESS_DIR"
 OUT_ROOT="${OUT_ROOT:-./datasets/kubectl-kinds-v1}"
 START_AT="${START_AT:-1}"
 END_AT="${END_AT:-50}"
-MAX_TESTS="${MAX_TESTS:-100}"
+MAX_TESTS="${MAX_TESTS:-400}"
 YAML_BUNDLE="${YAML_BUNDLE:-$HARNESS_DIR/tests/fixtures/kubectl_spec_v1_31_minimal.yaml}"
 FIXTURE_DIR="${FIXTURE_DIR:-$HARNESS_DIR/tests/fixtures/kubectl_testcases}"
 
@@ -154,10 +154,10 @@ while IFS=$'\t' read -r n slug kinds_csv verbs_csv; do
     --pipeline-opt cli_app_auto_subsets=false \
     --pipeline-opt cli_app_max_intents=100 \
     --pipeline-opt max_llm_tokens=65000 \
-    --pipeline-opt cli_app_docker_timeout_sec=1200 \
-    --pipeline-opt cli_app_translate_workers=6 \
+    --pipeline-opt cli_app_docker_timeout_sec=3600 \
+    --pipeline-opt cli_app_translate_workers=3 \
     --pipeline-opt cli_app_docker_gauntlet=false \
-    --pipeline-opt cli_app_reference_grounding=false \
+    --pipeline-opt cli_app_reference_grounding=true \
     --config "$LLM_CONFIG" \
     --out "$out" 2>&1 | tee "$out/generate.log"
 done < "$TASKS_TSV"

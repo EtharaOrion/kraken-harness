@@ -63,6 +63,7 @@ class CliSpec:
     tests_dir: str  # relative to clone root
     commands: list[CommandSpec] = field(default_factory=list)
     spec_sha256: str = ""  # canonical hash of (name, prefix, commands)
+    declared_kinds: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)

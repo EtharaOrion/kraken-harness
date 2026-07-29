@@ -72,6 +72,11 @@ class ServiceProfile:
     # --- optional compose overlay (generic sidecar backends only) -------------
     build_compose_overlay: Callable[..., str] | None = None
 
+    # --- reference-grounding labels (surface in task.toml metadata) -----------
+    reference_label: str = "aws-cli"
+    reference_version_key: str = "awscli_version"
+    reference_version_value: str = ""
+
     def validate(self) -> None:
         """Fail-fast structural check; raises ValueError naming the offending field."""
         if not self.backend_key:

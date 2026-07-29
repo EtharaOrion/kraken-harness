@@ -1,0 +1,215 @@
+metadata:
+  kubectl_version: "v1.31.0"
+  extractor_version: "0.1.0"
+  git_sha: "cccccccccccccccccccccccccccccccccccccccc"
+
+commands:
+  - name: get
+    synopsis: "Display one or many resources"
+    description: >-
+      Display one or many resources. Prints a table of the most important
+      information about the specified resources. You can filter the list
+      using a label selector and the --selector flag.
+    usage: "kubectl get [(-o|--output=)json|yaml|...] (TYPE[.VERSION][.GROUP] [NAME | -l label] | ...) [flags]"
+    example: |
+      # List all pods in ps output format
+      kubectl get pods
+
+      # List all pods in ps output format with more information
+      kubectl get pods -o wide
+    flags:
+      - name: output
+        shorthand: o
+        type: string
+        default: ""
+        usage: "Output format. One of: json|yaml|name|go-template|..."
+      - name: all-namespaces
+        shorthand: A
+        type: bool
+        default: "false"
+        usage: "If present, list the requested object(s) across all namespaces."
+      - name: selector
+        shorthand: l
+        type: string
+        default: ""
+        usage: "Selector (label query) to filter on."
+      - name: watch
+        shorthand: w
+        type: bool
+        default: "false"
+        usage: "After listing/getting the requested object, watch for changes."
+
+  - name: apply
+    synopsis: "Apply a configuration to a resource by file name or stdin"
+    description: >-
+      Apply a configuration to a resource by file name or stdin. The resource
+      name must be specified. This resource will be created if it doesn't exist yet.
+    usage: "kubectl apply (-f FILENAME | -k DIRECTORY) [flags]"
+    example: |
+      # Apply the configuration in pod.json to a pod
+      kubectl apply -f ./pod.json
+    flags:
+      - name: filename
+        shorthand: f
+        type: stringSlice
+        default: "[]"
+        usage: "The files that contain the configurations to apply."
+      - name: recursive
+        shorthand: R
+        type: bool
+        default: "false"
+        usage: "Process the directory used in -f, --filename recursively."
+      - name: force
+        type: bool
+        default: "false"
+        usage: "If true, immediately remove resources from API and bypass graceful deletion."
+
+  - name: delete
+    synopsis: "Delete resources by file names, stdin, resources and names, or by resources and label selector"
+    description: >-
+      Delete resources by file names, stdin, resources and names, or by resources
+      and label selector. JSON and YAML formats are accepted.
+    usage: "kubectl delete ([-f FILENAME] | [-k DIRECTORY] | TYPE [(NAME | -l label | --all)]) [flags]"
+    example: |
+      # Delete a pod using the type and name specified in pod.json
+      kubectl delete -f ./pod.json
+    flags:
+      - name: filename
+        shorthand: f
+        type: stringSlice
+        default: "[]"
+        usage: "containing the resource to delete."
+      - name: all
+        type: bool
+        default: "false"
+        usage: "Delete all resources, in the namespace of the specified resource types."
+      - name: force
+        type: bool
+        default: "false"
+        usage: "If true, immediately remove resources from API and bypass graceful deletion."
+      - name: grace-period
+        type: int
+        default: "-1"
+        usage: "Period of time in seconds given to the resource to terminate gracefully."
+
+  - name: create
+    synopsis: "Create a resource from a file or from stdin"
+    description: "Create a resource from a file or from stdin. JSON and YAML formats are accepted."
+    usage: "kubectl create -f FILENAME [flags]"
+    example: |
+      # Create a pod using the data in pod.json
+      kubectl create -f ./pod.json
+    flags:
+      - name: filename
+        shorthand: f
+        type: stringSlice
+        default: "[]"
+        usage: "Filename, directory, or URL to files to use to create the resource."
+      - name: dry-run
+        type: string
+        default: "none"
+        usage: "Must be \"none\", \"server\", or \"client\"."
+
+  - name: describe
+    synopsis: "Show details of a specific resource or group of resources"
+    description: >-
+      Show details of a specific resource or group of resources. Print a detailed
+      description of the selected resources, including related resources such as
+      events or controllers.
+    usage: "kubectl describe (-f FILENAME | TYPE [NAME_PREFIX | -l label] | TYPE/NAME) [flags]"
+    example: |
+      # Describe a node
+      kubectl describe nodes kubernetes-node-emt8.c.myproject.internal
+    flags:
+      - name: filename
+        shorthand: f
+        type: stringSlice
+        default: "[]"
+        usage: "Filename, directory, or URL to files containing the resource to describe."
+      - name: selector
+        shorthand: l
+        type: string
+        default: ""
+        usage: "Selector (label query) to filter on."
+
+  - name: patch
+    synopsis: "Update fields of a resource"
+    description: >-
+      Update fields of a resource using strategic merge patch, a JSON merge patch, or a JSON patch.
+      JSON and YAML formats are accepted.
+    usage: "kubectl patch (-f FILENAME | TYPE NAME) [-p PATCH|--patch-file FILE] [flags]"
+    example: |
+      # Partially update a node using a strategic merge patch, specifying the patch as JSON
+      kubectl patch node k8s-node-1 -p '{"spec":{"unschedulable":true}}'
+    flags:
+      - name: patch
+        shorthand: p
+        type: string
+        default: ""
+        usage: "The patch to be applied to the resource JSON file."
+      - name: type
+        type: string
+        default: "strategic"
+        usage: "The type of patch being provided; one of [json merge strategic]."
+
+  - name: scale
+    synopsis: "Set a new size for a deployment, replica set, replication controller, or stateful set"
+    description: >-
+      Set a new size for a deployment, replica set, replication controller, or stateful set.
+      Scale also allows users to specify one or more preconditions for the scale action.
+    usage: "kubectl scale [--resource-version=version] [--current-replicas=count] --replicas=COUNT (-f FILENAME | TYPE NAME) [flags]"
+    example: |
+      # Scale a replica set named 'foo' to 3
+      kubectl scale --replicas=3 rs/foo
+    flags:
+      - name: replicas
+        type: int
+        default: "-1"
+        usage: "The new desired number of replicas. Required."
+      - name: current-replicas
+        type: int
+        default: "-1"
+        usage: "Precondition for current size."
+      - name: resource-version
+        type: string
+        default: ""
+        usage: "Precondition for resource version."
+
+  - name: label
+    synopsis: "Update the labels on a resource"
+    description: >-
+      Update the labels on a resource. A label key and value must begin with a letter or number,
+      and may contain letters, numbers, hyphens, dots, and underscores, up to 63 characters each.
+    usage: "kubectl label [--overwrite] (-f FILENAME | TYPE NAME) KEY_1=VAL_1 ... KEY_N=VAL_N [--resource-version=version] [flags]"
+    example: |
+      # Update pod 'foo' with the label 'unhealthy' and the value 'true'
+      kubectl label pods foo unhealthy=true
+    flags:
+      - name: overwrite
+        type: bool
+        default: "false"
+        usage: "If true, allow labels to be overwritten, otherwise reject label updates."
+      - name: all
+        type: bool
+        default: "false"
+        usage: "Select all resources, in the namespace of the specified resource types."
+
+  # Included on purpose: KubectlCobraYamlSource.unsupported_verbs MUST drop this
+  # at extract_spec time so the fixture double-serves as a filter regression.
+  - name: logs
+    synopsis: "Print the logs for a container in a pod"
+    description: "Print the logs for a container in a pod or specified resource."
+    usage: "kubectl logs [-f] [-p] (POD | TYPE/NAME) [-c CONTAINER] [flags]"
+    example: |
+      # Return snapshot logs from pod nginx with only one container
+      kubectl logs nginx
+    flags:
+      - name: follow
+        shorthand: f
+        type: bool
+        default: "false"
+        usage: "Specify if the logs should be streamed."
+      - name: tail
+        type: int
+        default: "-1"
+        usage: "Lines of recent log file to display."

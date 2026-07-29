@@ -307,13 +307,6 @@ def _build_samples_payload(
         metadata["tests_shipped"] = ci["tests_shipped"]
     elif "tests_in_task" in ci:
         metadata["tests_shipped"] = ci["tests_in_task"]
-    if "discriminative" in ci:
-        metadata["discriminative"] = ci["discriminative"]
-    else:
-        rg = ci.get("reference_grounding") or {}
-        if "discriminative" in rg:
-            metadata["discriminative"] = rg["discriminative"]
-
     if "behaviour_tag_counts" in ci:
         metadata["behaviour_tag_counts"] = ci["behaviour_tag_counts"]
 

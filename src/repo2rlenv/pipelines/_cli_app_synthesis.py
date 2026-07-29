@@ -1435,54 +1435,6 @@ def _apply_static_gauntlet(
     return survivors
 
 
-def _refine_oracle_against_failures(
-    pipeline: CodeInstructPipeline,
-    options: CodeInstructOptions,
-    profile: ServiceProfile,
-    oracle_code: str,
-    failing_tests: dict[str, str],
-    oracle_output: str,
-) -> str | None:
-    """Fix submission/main.py so it also passes the real-aws-verified tests it currently
-    fails, lifting oracle-pass (the tight grounding sub-gate). Returns source or None."""
-    if not failing_tests:
-        return None
-    tests_block = "\n\n".join(
-        f"# ===== {name} =====\n{code}" for name, code in sorted(failing_tests.items())
-    )
-    user = (
-        "The reference `aws` CLI PASSES the tests below, but the current "
-        "submission/main.py FAILS them. Fix main.py so it ALSO passes these tests "
-        "without breaking behaviour it already implements. Stdlib-only (urllib); no "
-        "boto3/botocore/moto/minio. Return the COMPLETE corrected submission/main.py, "
-        "nothing else.\n\n"
-        f"===== CURRENT submission/main.py =====\n{oracle_code}\n\n"
-        f"===== TESTS IT MUST NOW PASS =====\n{tests_block}\n\n"
-        f"===== pytest output tail =====\n{oracle_output[-4000:]}\n"
-    )
-    for attempt in range(1, max(1, options.cli_app_oracle_max_attempts) + 1):
-        try:
-            resp = complete(
-                pipeline._llm,
-                system=profile.oracle_system,
-                user=user,
-                max_tokens=options.cli_app_oracle_max_tokens,
-                temperature=options.llm_temperature,
-            )
-        except Exception as exc:
-            logger.warning("oracle refinement attempt %d failed: %s", attempt, exc)
-            continue
-        pipeline._llm_cost_usd += resp.cost_usd
-        code = _strip_code_fence(resp.content)
-        try:
-            compile(code, "<oracle-refine>", "exec")
-        except SyntaxError as exc:
-            logger.warning("oracle refinement returned invalid Python: %s", exc)
-            continue
-        return code
-    return None
-
-
 def _apply_reference_grounding(
     *,
     options: CodeInstructOptions,
@@ -1496,9 +1448,8 @@ def _apply_reference_grounding(
     profile: ServiceProfile | None = None,
 ) -> tuple[dict, dict[str, str], str]:
     """Filter tests via real-aws + oracle reference. Returns (result, filtered_test_files,
-    effective_oracle_code). When cli_app_oracle_refine_max_attempts>0 (generic backends),
-    iteratively fix the oracle against tests real-aws passes but the oracle fails, accepting
-    a refinement only when grounded strictly increases.
+    effective_oracle_code). Ships tests that both the real CLI and the LLM oracle pass
+    (minus the empty stub) so Harbor's oracle-reference scoring is 1.0 by construction.
 
     ``extra_tests_aux`` carries backend helper modules (e.g. tests/_ddb_http.py)
     that the conftest imports; without them the grounding bundle can't collect.
@@ -1509,55 +1460,16 @@ def _apply_reference_grounding(
     for fname, code in test_files.items():
         tests_aux[f"tests/{fname}"] = code
 
-    def _ground(oc: str) -> dict:
-        return _run_reference_grounding(
-            dockerfile_content=dockerfile,
-            tests_aux=tests_aux,
-            test_script=test_script,
-            oracle_code=oc,
-            timeout_sec=options.cli_app_docker_timeout_sec,
-            backend=options.cli_app_backend,
-        )
-
-    reference_grounding = _ground(oracle_code)
+    reference_grounding = _run_reference_grounding(
+        dockerfile_content=dockerfile,
+        tests_aux=tests_aux,
+        test_script=test_script,
+        oracle_code=oracle_code,
+        timeout_sec=options.cli_app_docker_timeout_sec,
+        backend=options.cli_app_backend,
+    )
     if reference_grounding.get("skipped"):
         raise _TaskRejected("reference_grounding_unavailable")
-
-    refine_budget = (
-        options.cli_app_oracle_refine_max_attempts
-        if _is_generic_backend(options) and pipeline is not None and profile is not None
-        else 0
-    )
-    for _ in range(refine_budget):
-        failing = reference_grounding["reference_pass"] - reference_grounding["oracle_pass"]
-        if not failing:
-            break
-        failing_code = {f: tests_aux[f"tests/{f}"] for f in failing if f"tests/{f}" in tests_aux}
-        refined = _refine_oracle_against_failures(
-            pipeline,
-            options,
-            profile,
-            oracle_code,
-            failing_code,
-            reference_grounding.get("oracle_out", ""),
-        )
-        if refined is None:
-            break
-        candidate = _ground(refined)
-        if candidate.get("skipped"):
-            break
-        improved = len(candidate["oracle_pass"]) >= len(reference_grounding["oracle_pass"]) and len(
-            candidate["grounded_files"]
-        ) > len(reference_grounding["grounded_files"])
-        if not improved:
-            break
-        logger.info(
-            "oracle refinement: grounded %d -> %d",
-            len(reference_grounding["grounded_files"]),
-            len(candidate["grounded_files"]),
-        )
-        oracle_code = refined
-        reference_grounding = candidate
 
     grounded = reference_grounding["grounded_files"]
     logger.info(
@@ -1729,8 +1641,10 @@ def _build_cliapp_repo2env(
         repo2env["code_instruct"]["subset"] = True
     if reference_grounding is not None and not reference_grounding.get("skipped"):
         repo2env["code_instruct"]["reference_grounding"] = {
-            "reference": "aws-cli",
-            "awscli_version": PINNED_AWSCLI_VERSION,
+            "reference": profile.reference_label,
+            profile.reference_version_key: (
+                profile.reference_version_value or PINNED_AWSCLI_VERSION
+            ),
             "n_reference_pass": reference_grounding["n_reference"],
             "n_oracle_pass": reference_grounding["n_oracle"],
             "n_empty_stub_pass": reference_grounding["n_empty"],
@@ -1876,29 +1790,51 @@ def _load_kubectl_fixtures(
     if not covered_verbs:
         return None
     if max_tests is not None and len(tests) > max_tests:
-        # Stratified deterministic downsample. Bucket by (verb, behaviour-tag)
-        # derived from filename shape `test_kubectl_<verb>_<tag>_<NNNN>.py`, then
-        # keep floor(bucket_share * max_tests) from each bucket via a subset-seeded
-        # sha256 sort so reruns of the same subset land on the same tests.
         _total_in = len(tests)
         _seed = ",".join(sorted(cmd_names))
+        # Kind\u00d7verb combo-coverage floor: for each (verb, kind) where kind is
+        # in the task's declared kind_filter, seed one deterministically-picked
+        # test. This is protected from the downsample trim so no combo is
+        # silently dropped when the task requests all-kinds coverage.
+        _combo_floor: set[str] = set()
+        if kind_filter is not None:
+            _by_combo: dict[tuple[str, str], list[str]] = {}
+            for _fname in tests:
+                _entry = kind_index.get(_fname) if isinstance(kind_index, dict) else None
+                _fk = _entry.get("kinds", []) if isinstance(_entry, dict) else []
+                _fparts = _fname[:-3].split("_") if _fname.endswith(".py") else _fname.split("_")
+                _fverb = _fparts[2] if len(_fparts) > 2 else "unknown"
+                for _k in _fk:
+                    if _k in kind_filter:
+                        _by_combo.setdefault((_fverb, _k), []).append(_fname)
+            for _combo, _names in _by_combo.items():
+                _pick = sorted(_names, key=lambda n: _h.sha256(f"{_seed}:{n}".encode()).hexdigest())[0]
+                _combo_floor.add(_pick)
         _buckets: dict[tuple[str, str], list[str]] = {}
         for _fname in tests:
             _fparts = _fname[:-3].split("_") if _fname.endswith(".py") else _fname.split("_")
             _fverb = _fparts[2] if len(_fparts) > 2 else "unknown"
             _ftag = _fparts[3] if len(_fparts) > 3 else "unknown"
             _buckets.setdefault((_fverb, _ftag), []).append(_fname)
-        _selected: set[str] = set()
+        _selected: set[str] = set(_combo_floor)
         for _names in _buckets.values():
             _target = max(1, round(len(_names) / _total_in * max_tests))
             _scored = sorted(_names, key=lambda n: _h.sha256(f"{_seed}:{n}".encode()).hexdigest())
             _selected.update(_scored[:_target])
         if len(_selected) > max_tests:
+            _trimmable = _selected - _combo_floor
             _scored_all = sorted(
-                _selected, key=lambda n: _h.sha256(f"{_seed}:{n}".encode()).hexdigest()
+                _trimmable, key=lambda n: _h.sha256(f"{_seed}:{n}".encode()).hexdigest()
             )
-            _selected = set(_scored_all[:max_tests])
+            _budget = max(0, max_tests - len(_combo_floor))
+            _selected = _combo_floor | set(_scored_all[:_budget])
         tests = {n: c for n, c in tests.items() if n in _selected}
+        if _combo_floor:
+            logger.info(
+                "cli_app: kwok fixture combo-coverage: seeded %d tests for %d kind\u00d7verb pairs",
+                len(_combo_floor),
+                len(_combo_floor),
+            )
         logger.info(
             "cli_app: kwok fixture cap: sampled %d tests from %d (max_tests=%d)",
             len(tests),
@@ -2213,6 +2149,45 @@ def _build_one_task(
                 )
             if len(test_files) < floor:
                 raise _TaskRejected(f"topup_exhausted_grounded_{len(test_files)}_of_{floor}")
+    elif options.cli_app_reference_grounding and _using_fixtures:
+        # Filter shipped tests to (reference_pass ∩ oracle_pass) - empty_pass so
+        # Harbor's downstream oracle-reference scoring is 1.0 by construction.
+        grounding_conftest = profile.build_conftest(golden=False) if golden else conftest
+        _combined_fx = {**_fixture_test_files, **test_files}
+        _tests_aux_fx: dict[str, str] = {
+            "tests/conftest.py": grounding_conftest,
+            "tests/__init__.py": "",
+        }
+        if extra_tests_aux:
+            _tests_aux_fx.update(extra_tests_aux)
+        for _fname, _code in _combined_fx.items():
+            _tests_aux_fx[f"tests/{_fname}"] = _code
+        reference_grounding = _run_reference_grounding(
+            dockerfile_content=dockerfile,
+            tests_aux=_tests_aux_fx,
+            test_script=test_script,
+            oracle_code=oracle_code,
+            timeout_sec=options.cli_app_docker_timeout_sec,
+            backend=options.cli_app_backend,
+        )
+        if reference_grounding.get("skipped"):
+            logger.warning(
+                "fixture-mode grounding unavailable (%s); shipping unfiltered",
+                reference_grounding.get("reason", "unknown"),
+            )
+        else:
+            _grounded = reference_grounding["grounded_files"]
+            _fixture_test_files = {
+                f: c for f, c in _fixture_test_files.items() if f in _grounded
+            }
+            test_files = {f: c for f, c in test_files.items() if f in _grounded}
+            logger.info(
+                "fixture-mode grounding: %d ref-pass & %d oracle-pass -> %d grounded (shipping %d)",
+                len(reference_grounding["reference_pass"]),
+                len(reference_grounding["oracle_pass"]),
+                len(_grounded),
+                len(_fixture_test_files) + len(test_files),
+            )
 
     # ----- G4 alignment: the shipped (grounded) tests are the single source of
     # truth for which commands the task covers. If grounding/top-up dropped a
@@ -2297,6 +2272,8 @@ def _build_one_task(
             )
 
     # ----- instruction.md (rendered from spec, NEVER from tests) -----
+    if options.cli_app_backend == "kwok":
+        spec.declared_kinds = sorted(options.cli_app_kubectl_kinds or [])
     if is_subset:
         instruction_md = profile.build_instruction_subset(spec, cmd_specs, intents)
     else:
@@ -2329,9 +2306,18 @@ def _build_one_task(
     # ----- Gauntlet G3 (empty-stub-fails) + G4 (oracle-passes) — opt-in -----
     # Without this, tests can be non-discriminative (pass on empty stub).
     # Builds image once per Dockerfile (cached), runs pytest twice per task.
+    # Fixture-mode (e.g. kubectl kwok) ships human-authored tests written
+    # against the real CLI; those are ground-truth so the discriminativeness
+    # gate on the LLM oracle does not apply. Harbor's oracle-golden run is the
+    # correctness gate for fixture-mode tasks.
     gauntlet_g34 = None
     golden_cert = None
-    if not options.cli_app_skip_gauntlet and getattr(options, "cli_app_docker_gauntlet", False):
+    _fixture_mode = bool(getattr(options, "cli_app_kubectl_fixture_dir", None))
+    if (
+        not options.cli_app_skip_gauntlet
+        and not _fixture_mode
+        and getattr(options, "cli_app_docker_gauntlet", False)
+    ):
         if golden:
             golden_cert = _certify_golden(
                 dockerfile=dockerfile,
@@ -2418,14 +2404,25 @@ def _build_one_task(
 
     _enforce_final_test_quotas(options, test_files, test_file_tags)
 
+    is_kwok = options.cli_app_backend == "kwok"
+    cli_label = spec.command_prefix if is_kwok else f"aws {spec.command_prefix}"
+    article = "a" if is_kwok else "an"
+    _kinds = sorted(getattr(options, "cli_app_kubectl_kinds", None) or []) if is_kwok else []
     if is_subset:
-        description = (
-            f"Implement an `aws {spec.command_prefix}` CLI subset "
-            f"({', '.join(sorted(cmd_names))}) from scratch"
-        )
+        if is_kwok and _kinds:
+            description = (
+                f"Implement {article} `{cli_label}` CLI supporting {len(_kinds)} "
+                f"Kubernetes kinds ({', '.join(_kinds)}) with the "
+                f"{', '.join(sorted(cmd_names))} verbs, from scratch"
+            )
+        else:
+            description = (
+                f"Implement {article} `{cli_label}` CLI subset "
+                f"({', '.join(sorted(cmd_names))}) from scratch"
+            )
         keywords = [spec.name, "code_instruct", "cli_app", "subset", *sorted(cmd_names)]
     else:
-        description = f"Implement `aws {spec.command_prefix} {cmd_names[0]}` from scratch"
+        description = f"Implement `{cli_label} {cmd_names[0]}` from scratch"
         keywords = [spec.name, "code_instruct", "cli_app", cmd_names[0]]
 
     task = HarborTask(
@@ -2584,6 +2581,43 @@ def _sanitise_mock_aws(code: str) -> str:
     return "\n".join(out_lines)
 
 
+def _oracle_incompleteness_reason(
+    tree: ast.Module,
+    code: str,
+    cmd_specs: list[CommandSpec],
+    finish_reason: str | None,
+) -> str | None:
+    if finish_reason == "length":
+        return "response truncated (finish_reason=length)"
+    has_dispatcher = any(
+        isinstance(n, ast.FunctionDef) and n.name == "main" for n in tree.body
+    )
+    if not has_dispatcher:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.If):
+                test_src = ast.unparse(node.test)
+                if "__name__" in test_src and "__main__" in test_src:
+                    has_dispatcher = True
+                    break
+    if not has_dispatcher:
+        return "missing __main__ / def main() dispatcher"
+    fn_name_tokens = {n.name.lower() for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    str_consts = {
+        n.value.lower()
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Constant) and isinstance(n.value, str)
+    }
+    missing: list[str] = []
+    for c in cmd_specs:
+        verb = c.name.lower()
+        covered = verb in str_consts or any(verb in fn for fn in fn_name_tokens)
+        if not covered:
+            missing.append(c.name)
+    if missing:
+        return f"no dispatch entry for verb(s): {', '.join(missing)}"
+    return None
+
+
 def _synthesise_oracle(
     pipeline: CodeInstructPipeline,
     options: CodeInstructOptions,
@@ -2653,7 +2687,7 @@ def _synthesise_oracle(
         pipeline._llm_cost_usd += resp.cost_usd
         code = _strip_code_fence(resp.content)
         try:
-            compile(code, "<oracle>", "exec")
+            tree = ast.parse(code)
         except SyntaxError as exc:
             last_reason = f"invalid Python: {exc}"
             logger.warning(
@@ -2662,6 +2696,17 @@ def _synthesise_oracle(
                 attempts,
                 cmd_label,
                 exc,
+            )
+            continue
+        incomplete = _oracle_incompleteness_reason(tree, code, cmd_specs, resp.finish_reason)
+        if incomplete is not None:
+            last_reason = incomplete
+            logger.warning(
+                "oracle synthesis attempt %d/%d returned incomplete code for command=%s: %s",
+                attempt,
+                attempts,
+                cmd_label,
+                incomplete,
             )
             continue
         if attempt > 1:
@@ -5346,7 +5391,16 @@ def _build_or_reuse_docker_image(dockerfile_content: str, ctx_dir: Path) -> str 
     logger.info("docker build %s (one-time per Dockerfile content)", tag)
     try:
         subprocess.run(
-            ["docker", "build", "-q", "-t", tag, str(ctx_dir)],
+            [
+                "docker",
+                "build",
+                "--platform",
+                "linux/amd64",
+                "-q",
+                "-t",
+                tag,
+                str(ctx_dir),
+            ],
             check=True,
             capture_output=True,
             timeout=900,
@@ -5431,10 +5485,19 @@ def _sidecar_up(spec: SidecarSpec, *, probe_image: str, timeout_sec: int = 40):
         subprocess.run(["docker", "network", "rm", net], capture_output=True)
 
 
-def _sidecar_docker_args(sidecar: tuple[str, str] | None) -> list[str]:
+def _sidecar_docker_args(
+    sidecar: tuple[str, str] | None, *, backend: str = "minio"
+) -> list[str]:
     """Network + endpoint args for a gate container: isolated (``--network=none``) by
-    default, or joined to a running sidecar network with AWS_ENDPOINT_URL set."""
+    default, or joined to a running sidecar network with AWS_ENDPOINT_URL set.
+
+    kwok backend needs a default-route network so kube-apiserver's bind-address
+    auto-discovery finds an interface; the conftest's socket guard still blocks
+    public IPs so this stays isolated at the process level.
+    """
     if sidecar is None:
+        if backend == "kwok":
+            return []
         return ["--network=none"]
     net, endpoint = sidecar
     return ["--network", net, "-e", f"AWS_ENDPOINT_URL={endpoint}"]
@@ -5448,6 +5511,7 @@ def _docker_run_test_sh(
     *,
     wrapper: str | None = None,
     sidecar: tuple[str, str] | None = None,
+    backend: str = "minio",
 ) -> dict:
     """Run /workspace/tests/test.sh in the container. Returns parsed summary."""
     cmd = [
@@ -5456,7 +5520,7 @@ def _docker_run_test_sh(
         "--rm",
         "--cpus=1.0",
         "--memory=1g",
-        *_sidecar_docker_args(sidecar),
+        *_sidecar_docker_args(sidecar, backend=backend),
         "-v",
         f"{bundle_dir / 'tests'}:/workspace/tests:ro",
     ]
@@ -5545,7 +5609,7 @@ def _certify_golden(
             "--rm",
             "--cpus=1.0",
             "--memory=1g",
-            *_sidecar_docker_args(sidecar),
+            *_sidecar_docker_args(sidecar, backend=backend),
             "-v",
             f"{tests_dir}:/workspace/tests:ro",
             "-v",
@@ -5633,7 +5697,13 @@ def _run_docker_gauntlet_g3g4(
 
         # G3: empty stub (image bakes empty stub at /workspace/submission/main.py)
         g3 = _docker_run_test_sh(
-            image, bundle, timeout_sec, oracle_override_path=None, wrapper=wrapper, sidecar=sidecar
+            image,
+            bundle,
+            timeout_sec,
+            oracle_override_path=None,
+            wrapper=wrapper,
+            sidecar=sidecar,
+            backend=backend,
         )
         logger.info(
             "G3 empty stub: %d/%d passed (rate=%.2f, max=%.2f)",
@@ -5653,6 +5723,7 @@ def _run_docker_gauntlet_g3g4(
             oracle_override_path=oracle_path,
             wrapper=wrapper,
             sidecar=sidecar,
+            backend=backend,
         )
         logger.info(
             "G4 oracle: %d/%d passed (rate=%.2f, min=%.2f)",
@@ -5751,6 +5822,7 @@ def _docker_run_pertest(
     *,
     wrapper: str | None = None,
     sidecar: tuple[str, str] | None = None,
+    backend: str = "minio",
 ) -> tuple[set[str], str]:
     """Run the test bank in the container; return (passed test-file names, full output).
 
@@ -5762,7 +5834,7 @@ def _docker_run_pertest(
         "--rm",
         "--cpus=1.0",
         "--memory=1g",
-        *_sidecar_docker_args(sidecar),
+        *_sidecar_docker_args(sidecar, backend=backend),
         "-v",
         f"{bundle_dir / 'tests'}:/workspace/tests:ro",
     ]
@@ -5813,7 +5885,7 @@ def _run_reference_grounding(
     if backend == "dynamodb_local":
         base_dockerfile = dockerfile_content + _DDB_GAUNTLET_LAYERS
         wrapper = _DDB_GAUNTLET_WRAPPER
-    ref_dockerfile = base_dockerfile + _AWSCLI_INSTALL_LAYERS
+    ref_dockerfile = base_dockerfile + (_AWSCLI_INSTALL_LAYERS if backend != "kwok" else "")
     with tempfile.TemporaryDirectory(prefix="r2e-refground-ctx-") as ctx_str:
         ctx = Path(ctx_str)
         (ctx / "Dockerfile").write_text(ref_dockerfile)
@@ -5844,17 +5916,17 @@ def _run_reference_grounding(
         ref_path = bundle / "reference_main.py"
         ref_path.write_text(_REFERENCE_SHIM_KWOK if backend == "kwok" else _REFERENCE_SHIM)
         reference_pass, ref_out = _docker_run_pertest(
-            image, bundle, timeout_sec, ref_path, wrapper=wrapper, sidecar=sidecar
+            image, bundle, timeout_sec, ref_path, wrapper=wrapper, sidecar=sidecar, backend=backend
         )
 
         empty_pass, empty_out = _docker_run_pertest(
-            image, bundle, timeout_sec, None, wrapper=wrapper, sidecar=sidecar
+            image, bundle, timeout_sec, None, wrapper=wrapper, sidecar=sidecar, backend=backend
         )
 
         oracle_path = bundle / "oracle_main.py"
         oracle_path.write_text(oracle_code)
         oracle_pass, oracle_out = _docker_run_pertest(
-            image, bundle, timeout_sec, oracle_path, wrapper=wrapper, sidecar=sidecar
+            image, bundle, timeout_sec, oracle_path, wrapper=wrapper, sidecar=sidecar, backend=backend
         )
 
         grounded = (reference_pass & oracle_pass) - empty_pass
@@ -6982,15 +7054,33 @@ _KWOK_IMPLEMENTATION_CONSTRAINTS = (
     "  at a sandboxed kwok cluster. Do NOT override the apiserver endpoint,\n"
     "  credentials, or context in code.\n"
     "- Success messages go to **stdout**; errors go to **stderr**. Do NOT mix them.\n"
-    "- Exit codes are STRICT and must match real kubectl semantics:\n"
-    "  - `0` on success\n"
-    "  - `1` on API errors from the apiserver (404 `NotFound`, 409 `Conflict`,\n"
-    "    422 `Invalid`, 403 `Forbidden`, timeouts, connection failures)\n"
-    "  - `2` on cobra usage errors (unknown flag, missing required positional,\n"
-    "    malformed flag value, invalid subcommand)\n"
-    "  Tests enforce the SPECIFIC code — `returncode == 1` for apiserver\n"
-    "  errors and `returncode == 2` for usage errors. Returning the\n"
-    "  wrong non-zero code will fail verification.\n"
+    "- Exit codes are STRICT and must match real kubectl semantics. The\n"
+    "  test-enforced set is `{0, 1, 2}`; signal codes `{130, 137, 143}`\n"
+    "  are runtime-inherited and MUST NOT be produced deliberately:\n"
+    "  - `0` on success.\n"
+    "  - `1` on any apiserver-shaped API error (404 `NotFound`,\n"
+    "    409 `Conflict`, 409 `AlreadyExists`, 422 `Invalid`,\n"
+    "    401 `Unauthorized`, 403 `Forbidden`, 405 `MethodNotAllowed`,\n"
+    "    410 `Gone`, 413 `RequestEntityTooLarge`, 415\n"
+    "    `UnsupportedMediaType`, 429 `TooManyRequests`, 500\n"
+    "    `InternalError`, 503 `ServiceUnavailable`, `Timeout`,\n"
+    "    `ServerTimeout`), on TCP-level cluster-unreachable failures\n"
+    "    (DNS, connection refused, TLS mismatch, read timeout), and on\n"
+    "    kubeconfig / configuration errors (unreadable `KUBECONFIG`,\n"
+    "    missing current-context, unresolvable cluster server URL).\n"
+    "  - `2` on cobra / argparse usage errors: unknown flag, missing\n"
+    "    required positional, extra positional, malformed flag value,\n"
+    "    invalid subcommand, mutually-exclusive flag combination,\n"
+    "    invalid `-o` / `--output` format selector, invalid\n"
+    "    `--replicas` / `--port` numeric value, invalid `--patch-type`\n"
+    "    selector, missing required `--all` when no name is given,\n"
+    "    invalid label syntax that fails client-side parsing.\n"
+    "  - `130` on `SIGINT` (`Ctrl+C`); `137` on `SIGKILL` (typically\n"
+    "    OOM); `143` on `SIGTERM`. Runtime-inherited only.\n"
+    "  Tests enforce the SPECIFIC code — `returncode == 1` for\n"
+    "  apiserver / configuration errors and `returncode == 2` for\n"
+    "  usage errors. Returning the wrong non-zero code will fail\n"
+    "  verification.\n"
     "- Do NOT surface raw runtime tracebacks or internal error dumps; print a\n"
     "  brief user-facing error string that names the failure class instead\n"
     "  (for example, `NotFound (404)` or `Invalid: ...`).\n"
@@ -7052,14 +7142,36 @@ _KWOK_OUTPUT_CONTRACT = (
     "  verbatim wording — so any spec-compliant phrasing is accepted.\n"
     "- No runtime stack trace is emitted under any condition.\n\n"
     "### Exit codes\n\n"
-    "The exit code on termination is one of `{0, 1, 2}`:\n\n"
-    "- `0` — success\n"
-    "- `1` — apiserver / API error (an `ApiException` was raised: `NotFound`,\n"
-    "  `AlreadyExists`, `Invalid`, `Forbidden`, `Conflict`, `Timeout`)\n"
-    "- `2` — parameter/usage error (unknown flag, missing/extra positional,\n"
-    "  malformed value)\n\n"
-    "Tests only check `returncode != 0` on failure; any non-zero code in\n"
-    "`{1, 2}` is acceptable.\n"
+    "The test-enforced exit-code set is `{0, 1, 2}`; process signals may\n"
+    "surface as `{130, 137, 143}` and MUST NOT be produced deliberately:\n\n"
+    "- `0` — success.\n"
+    "- `1` — apiserver / API error surfaced from an `ApiException` or the\n"
+    "  underlying REST client. All of the following apiserver reasons map\n"
+    "  to exit `1`: `NotFound`, `AlreadyExists`, `Invalid`, `Forbidden`,\n"
+    "  `Unauthorized`, `Conflict`, `Timeout`, `ServerTimeout`,\n"
+    "  `TooManyRequests`, `InternalError`, `ServiceUnavailable`,\n"
+    "  `MethodNotAllowed`, `UnsupportedMediaType`, `Gone`,\n"
+    "  `RequestEntityTooLarge`. TCP-level cluster-unreachable failures\n"
+    "  (DNS, connection refused, TLS mismatch, read timeout) also exit\n"
+    "  `1`. Kubeconfig / configuration errors (unreadable `KUBECONFIG`,\n"
+    "  missing current-context, unresolvable cluster server URL) also\n"
+    "  exit `1`.\n"
+    "- `2` — cobra / argparse usage error: unknown flag, missing or extra\n"
+    "  positional argument, malformed flag value, invalid subcommand,\n"
+    "  mutually-exclusive flag combination, invalid `-o` / `--output`\n"
+    "  format selector, invalid `--replicas` / `--port` numeric value,\n"
+    "  invalid `--patch-type` selector, missing required `--all` when no\n"
+    "  name is given, invalid label syntax that fails client-side parsing.\n"
+    "- `130` — process interrupted by `SIGINT` (`Ctrl+C`); inherited from\n"
+    "  the runtime, do NOT emit deliberately.\n"
+    "- `137` — process killed by `SIGKILL` (typically OOM); inherited from\n"
+    "  the runtime, do NOT emit deliberately.\n"
+    "- `143` — process terminated by `SIGTERM`; inherited from the runtime,\n"
+    "  do NOT emit deliberately.\n\n"
+    "Tests must produce the SPECIFIC exit code for each modeled error class —\n"
+    "`returncode == 1` for apiserver / configuration errors and\n"
+    "`returncode == 2` for usage errors. Returning the wrong non-zero code\n"
+    "fails verification.\n"
 )
 
 
@@ -7081,20 +7193,31 @@ def _build_instruction_md_kwok(
     kwok = get_backend("kwok")
     flags = _extract_flags_from_intents(intents)
     verb = cmd_spec.name
-    kind_hint = spec.command_prefix
+    kinds = list(spec.declared_kinds or [])
+    kinds_csv = ", ".join(kinds) if kinds else ""
+    kinds_phrase = (
+        f"the {len(kinds)} Kubernetes kinds under test ({kinds_csv})"
+        if kinds
+        else "the resource kinds under test"
+    )
 
     parts: list[str] = []
 
-    parts.append(f"# Build `kubectl {verb}` from scratch (targeting `{kind_hint}`)\n")
+    if kinds:
+        parts.append(
+            f"# Build `kubectl {verb}` from scratch "
+            f"(covering {len(kinds)} kinds: {kinds_csv})\n"
+        )
+    else:
+        parts.append(f"# Build `kubectl {verb}` from scratch\n")
     parts.append(
         "## Application overview\n\n"
         f"You are implementing the real kubectl `{verb}` verb. Real kubectl is\n"
-        "**verb-first** — the invocation shape is `kubectl VERB [TYPE] [NAME] [flags]`\n"
-        "(see https://kubernetes.io/docs/reference/kubectl/). There is no\n"
-        "`kubectl <resource> <verb>` subcommand form; `kubectl pods apply` DOES NOT\n"
-        f"EXIST. This task's tests focus on the `{kind_hint}` resource kind, which\n"
-        "enters the CLI either via the manifest's `kind:` field (for\n"
-        "`apply`/`create -f`) or as the TYPE positional after the verb (for\n"
+        "**verb-first** — the invocation shape is `kubectl VERB [TYPE] [NAME] [flags]`.\n"
+        "There is no `kubectl <resource> <verb>` subcommand form; `kubectl pods apply` DOES NOT\n"
+        f"EXIST. This task's tests exercise {kinds_phrase}, entering the CLI\n"
+        "either via the manifest's `kind:` field (for `apply`/`create -f`) or as\n"
+        "the TYPE positional after the verb (for\n"
         "`get`/`delete`/`describe`/`patch`/`scale`/`label`).\n\n"
         "The agent is given **no source code**, only this specification. Your\n"
         "implementation is an executable at `/workspace/submission/kubectl`,\n"
@@ -7115,7 +7238,10 @@ def _build_instruction_md_kwok(
         "create -> get -> patch -> scale -> delete behaves correctly end-to-end.\n"
     )
 
-    parts.append(f"## Verb: `kubectl {verb}` (primary resource kind: `{kind_hint}`)\n")
+    if kinds:
+        parts.append(f"## Verb: `kubectl {verb}` (across {len(kinds)} kinds: {kinds_csv})\n")
+    else:
+        parts.append(f"## Verb: `kubectl {verb}`\n")
 
     parts.append("### Interface\n\nObserved argv patterns (after invoking `submission/kubectl`):\n")
     seen_shapes: set[str] = set()
@@ -7183,23 +7309,35 @@ def _build_subset_instruction_md_kwok(
     from repo2rlenv.pipelines._cli_app_backends import get_backend
 
     kwok = get_backend("kwok")
-    kind_hint = spec.command_prefix
+    kinds = list(spec.declared_kinds or [])
     names = sorted(c.name for c in cmd_specs)
     label_list = ", ".join(f"`kubectl {n}`" for n in names)
+    kinds_csv = ", ".join(kinds) if kinds else ""
+    kinds_phrase = (
+        f"the {len(kinds)} Kubernetes kinds under test ({kinds_csv})"
+        if kinds
+        else "the resource kinds under test"
+    )
 
     parts: list[str] = []
 
-    parts.append(f"# Build a `kubectl` CLI (verbs: {', '.join(names)}; targeting `{kind_hint}`)\n")
+    if kinds:
+        parts.append(
+            f"# Build a `kubectl` CLI (verbs: {', '.join(names)}; "
+            f"covering {len(kinds)} kinds: {kinds_csv})\n"
+        )
+    else:
+        parts.append(f"# Build a `kubectl` CLI (verbs: {', '.join(names)})\n")
     parts.append(
         "## Application overview\n\n"
         "You are implementing a subset of real kubectl verbs:\n"
         f"{label_list}. Real kubectl is **verb-first** — the invocation shape is\n"
-        "`kubectl VERB [TYPE] [NAME] [flags]` (see\n"
-        "https://kubernetes.io/docs/reference/kubectl/). There is no\n"
+        "`kubectl VERB [TYPE] [NAME] [flags]`. There is no\n"
         "`kubectl <resource> <verb>` subcommand form; `kubectl pods apply` DOES NOT\n"
-        f"EXIST. This task's tests focus on the `{kind_hint}` resource kind, which\n"
-        "enters the CLI either via the manifest's `kind:` field (for\n"
-        "`apply`/`create -f`) or as the TYPE positional after the verb (for\n"
+        f"EXIST. Your implementation must support every declared verb on every\n"
+        f"declared kind: this task exercises {kinds_phrase}, entering the CLI\n"
+        "either via the manifest's `kind:` field (for `apply`/`create -f`) or as\n"
+        "the TYPE positional after the verb (for\n"
         "`get`/`delete`/`describe`/`patch`/`scale`/`label`).\n\n"
         "The agent is given **no source code**, only this specification. Your\n"
         "implementation is an executable at `/workspace/submission/kubectl`,\n"
@@ -7273,9 +7411,13 @@ def _kwok_command_section_parts(
     Behavior sub-sections, mirroring the aws `_command_section_parts` shape
     but scoped to kubectl semantics.
     """
-    kind_hint = spec.command_prefix
     verb = cmd_spec.name
-    parts: list[str] = [f"### Verb: `kubectl {verb}` (primary resource kind: `{kind_hint}`)\n"]
+    kinds = list(spec.declared_kinds or [])
+    if kinds:
+        header = f"### Verb: `kubectl {verb}` (across {len(kinds)} kinds: {', '.join(kinds)})\n"
+    else:
+        header = f"### Verb: `kubectl {verb}`\n"
+    parts: list[str] = [header]
 
     shapes: list[str] = []
     seen: set[str] = set()
@@ -7390,6 +7532,9 @@ def _register_kwok_profile() -> None:
             build_dockerfile=_kwok_profile_build_dockerfile,
             build_instruction_single=_build_instruction_md_kwok,
             build_instruction_subset=_build_subset_instruction_md_kwok,
+            reference_label="kubectl-reference-shim",
+            reference_version_key="kubectl_version",
+            reference_version_value="1.31.0",
         )
     )
 

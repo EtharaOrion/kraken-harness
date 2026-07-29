@@ -226,60 +226,6 @@ def test_noskip_gate_rejects_skip_and_xfail() -> None:
         assert ok2
 
 
-def test_refine_oracle_no_failing_returns_none() -> None:
-    profile = S.resolve_profile("kinesalite")
-    assert S._refine_oracle_against_failures(_Pipe(), _opts(), profile, "OLD", {}, "") is None
-
-
-def test_refine_oracle_returns_fixed_code(monkeypatch) -> None:
-    class _Resp:
-        content = "```python\ndef main():\n    return 1\n```"
-        cost_usd = 0.001
-
-    monkeypatch.setattr(S, "complete", lambda *a, **k: _Resp())
-    profile = S.resolve_profile("kinesalite")
-    out = S._refine_oracle_against_failures(
-        _Pipe(), _opts(), profile, "OLD", {"t.py": "def test_x():\n    assert True\n"}, "stderr"
-    )
-    assert "def main" in out
-
-
-def test_reference_grounding_refine_loop_improves(monkeypatch) -> None:
-    def fake_ground(
-        *, dockerfile_content, tests_aux, test_script, oracle_code, timeout_sec, backend
-    ):
-        grounded = {"a.py", "b.py", "c.py"} if oracle_code == "REFINED" else {"a.py"}
-        return {
-            "skipped": False,
-            "image_tag": "t",
-            "grounded_files": set(grounded),
-            "reference_pass": {"a.py", "b.py", "c.py"},
-            "oracle_pass": set(grounded),
-            "empty_pass": set(),
-            "oracle_out": "",
-            "n_reference": 3,
-            "n_oracle": len(grounded),
-            "n_empty": 0,
-            "n_grounded": len(grounded),
-        }
-
-    monkeypatch.setattr(S, "_run_reference_grounding", fake_ground)
-    monkeypatch.setattr(S, "_refine_oracle_against_failures", lambda *a, **k: "REFINED")
-    profile = S.resolve_profile("kinesalite")
-    _rg, kept, oracle = S._apply_reference_grounding(
-        options=_opts(cli_app_oracle_refine_max_attempts=2),
-        dockerfile="D",
-        conftest="C",
-        test_files={"a.py": "A", "b.py": "B", "c.py": "C"},
-        test_script="T",
-        oracle_code="ORIG",
-        pipeline=_Pipe(),
-        profile=profile,
-    )
-    assert oracle == "REFINED"
-    assert set(kept) == {"a.py", "b.py", "c.py"}
-
-
 def test_both_mode_ships_golden_slice_and_reference_with_provenance(monkeypatch, tmp_path) -> None:
     _patch(monkeypatch, _Ground(cap=None))
     fake_gold_files = {

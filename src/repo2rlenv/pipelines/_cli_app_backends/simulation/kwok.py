@@ -1203,7 +1203,8 @@ CRITICAL — your implementation will be black-box tested. The companion pytest 
 
 Consequently your reference implementation MUST:
 1. Translate `kubernetes.client.exceptions.ApiException` into `sys.exit(1)` AND print a message like `f"{exc.reason} ({exc.status})"` to stderr so downstream tests can match on `NotFound`, `AlreadyExists`, `Invalid`, `Forbidden`, `Conflict`, `Timeout`. Missing-file errors (`-f nonexistent.yaml`) also exit `1` with a `NotFound`/`not found` stderr keyword.
-2. On unknown flags / malformed values: `sys.exit(2)` with an `invalid` / `unknown` / `unrecognized` substring on stderr (mirror cobra's usage-error behaviour). NEVER emit `2` for missing-file or apiserver errors — those are `1`.
+2. On unknown flags / malformed values: `sys.exit(2)` with an `invalid` / `unknown` / `unrecognized` substring on stderr (mirror cobra's usage-error behaviour). NEVER emit `2` for missing-file or apiserver errors — those are `1`. For **enum-typed flags** (e.g. `-o/--output` accepts ONLY `json|yaml|wide|name|jsonpath|jsonpath-as-json`), any other value is a malformed value → `sys.exit(2)` with `invalid output format` (or similar) on stderr. Do NOT fall back to default output for an unrecognised `--output=<value>`.
+2b. For **RBAC create verbs** — `create role|clusterrole|rolebinding|clusterrolebinding|serviceaccount` — you MUST implement the full apiserver call via the dynamic client (`RbacAuthorizationV1Api` or the DynamicClient with `apiVersion: rbac.authorization.k8s.io/v1`), NOT stub or skip them. Same for `create resourcequota`, `create priorityclass`, `create poddisruptionbudget`, `create limitrange`, `create ingress`, `create networkpolicy`. Workflow tests exercise these end-to-end; omitting them causes the workflow to fail with `unsupported kind` on stderr.
 3. Emit real-kubectl success-line shape on stdout: for create/apply/patch/scale/label/annotate/rollout use `<resource>/<name> <verb-past-tense>` (e.g. `pod/foo created`, `deployment.apps/bar scaled`); for delete use the DIFFERENT quoted shape `<resource> "<name>" deleted` (e.g. `namespace "baz" deleted`, `pod "foo" deleted`). Progress lines before the success line are allowed.
 
 Reference error-path sketch (surfaces a stderr keyword the tests can match):
@@ -1947,8 +1948,9 @@ def _reset_kwok(kwok_cluster):
     subprocess.run(
         ["kubectl", "--kubeconfig", kwok_cluster["kubeconfig"],
          "delete",
-         "pods,resourcequotas,limitranges,deployments,replicasets,statefulsets,"
-         "daemonsets,jobs,cronjobs,configmaps,secrets,persistentvolumeclaims",
+         "pods,services,resourcequotas,limitranges,deployments,replicasets,"
+         "statefulsets,daemonsets,jobs,cronjobs,configmaps,secrets,"
+         "persistentvolumeclaims,ingresses,serviceaccounts",
          "--all", "-n", "default", "--grace-period=0", "--force"],
         capture_output=True,
         timeout=30,
