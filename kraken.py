@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """kraken — the one harness. Every stage from a merged pull request to a reward.
 
-    uv run --project kraken-harness python kraken-harness/kraken.py harvest --repo networkx/networkx
-    uv run --project kraken-harness python kraken-harness/kraken.py author  --instances <id>
-    uv run --project kraken-harness python kraken-harness/kraken.py run     --bundle kraken-dataset/<uuid>
-    uv run --project kraken-harness python kraken-harness/kraken.py grade   --bundle <b> --logs <run>
-    uv run --project kraken-harness python kraken-harness/kraken.py status
+    uv run --project kraken-harness/repo2rlenv python kraken-harness/kraken.py harvest --repo networkx/networkx
+    uv run --project kraken-harness/repo2rlenv python kraken-harness/kraken.py author  --instances <id>
+    uv run --project kraken-harness/repo2rlenv python kraken-harness/kraken.py run     --bundle kraken-dataset/<uuid>
+    uv run --project kraken-harness/repo2rlenv python kraken-harness/kraken.py grade   --bundle <b> --logs <run>
+    uv run --project kraken-harness/repo2rlenv python kraken-harness/kraken.py status
 
 There is one harness and it lives here. Harvest mines pull requests, author builds the
 image and calibrates the target, run drives an agent, grade scores the rubric channel
@@ -32,7 +32,8 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+HARNESS = Path(__file__).resolve().parent
+sys.path.insert(0, str(HARNESS / "repo2rlenv" / "src"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("kraken")
@@ -94,7 +95,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     bundle = Path(args.bundle)
     if not bundle.is_absolute():
         bundle = ROOT / bundle
-    harbor = ROOT / "harbor"
+    harbor = HARNESS / "harbor"
 
     if harbor.is_dir() and not args.local:
         cmd = ["uv", "run", "--project", str(harbor), "harbor", "run",
@@ -130,8 +131,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(json.dumps({
         "corpus_shards": len(corpus), "corpus_records": records,
         "authored_bundles": len(bundles), "trajectories": len(trajs),
-        "harbor_present": (ROOT / "harbor").is_dir(),
-        "harness_present": (ROOT / "kraken-harness" / "src").is_dir(),
+        "harbor_present": (HARNESS / "harbor").is_dir(),
+        "harness_present": (HARNESS / "repo2rlenv" / "src").is_dir(),
         "pilot_present": (ROOT / "pilot" / "run_pilot.py").exists(),
         "harness_stages": ["harvest", "author", "run", "grade"],
     }, indent=2))
