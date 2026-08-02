@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """kraken — the one harness. Every stage from a merged pull request to a reward.
 
-    uv run --project harness python harness/kraken.py harvest --repo networkx/networkx
-    uv run --project harness python harness/kraken.py author  --instances <id>
-    uv run --project harness python harness/kraken.py run     --bundle kraken-dataset/<uuid>
-    uv run --project harness python harness/kraken.py grade   --bundle <b> --logs <run>
-    uv run --project harness python harness/kraken.py status
+    uv run --project kraken-harness python kraken-harness/kraken.py harvest --repo networkx/networkx
+    uv run --project kraken-harness python kraken-harness/kraken.py author  --instances <id>
+    uv run --project kraken-harness python kraken-harness/kraken.py run     --bundle kraken-dataset/<uuid>
+    uv run --project kraken-harness python kraken-harness/kraken.py grade   --bundle <b> --logs <run>
+    uv run --project kraken-harness python kraken-harness/kraken.py status
 
 There is one harness and it lives here. Harvest mines pull requests, author builds the
 image and calibrates the target, run drives an agent, grade scores the rubric channel
@@ -131,7 +131,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         "corpus_shards": len(corpus), "corpus_records": records,
         "authored_bundles": len(bundles), "trajectories": len(trajs),
         "harbor_present": (ROOT / "harbor").is_dir(),
-        "harness_present": (ROOT / "harness" / "src").is_dir(),
+        "harness_present": (ROOT / "kraken-harness" / "src").is_dir(),
         "pilot_present": (ROOT / "pilot" / "run_pilot.py").exists(),
         "harness_stages": ["harvest", "author", "run", "grade"],
     }, indent=2))
