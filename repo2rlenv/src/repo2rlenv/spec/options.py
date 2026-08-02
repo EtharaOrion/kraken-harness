@@ -545,6 +545,9 @@ class PerfRuntimeOptions(_BaseOptions):
     stability_trials: int = 3
     max_environment_repairs: int = 4
     max_void_retries: int = 4
+    # Push the instance tier here and pin its registry digest. Empty means
+    # local-only, which is reproducible here and unrunnable anywhere else.
+    registry: str = ""
 
 
 OPTIONS_REGISTRY: dict[str, type[_BaseOptions]] = {

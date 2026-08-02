@@ -27,7 +27,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -77,6 +76,7 @@ def cmd_author(args: argparse.Namespace) -> int:
         instances=args.instances or [],
         repos=args.repos or [],
         limit=args.limit or 0,
+        registry=args.registry or "",
     )
     out = ROOT / args.out
     res = PerfRuntimePipeline(gen_input=None, options=opts).run(out)
@@ -111,14 +111,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         cmd += ["-k", str(args.n_attempts)]
     if args.n_concurrent > 1:
         cmd += ["-n", str(args.n_concurrent)]
-    # BuildKit resolves a digest-pinned FROM against a registry and never against the
-    # local image store, so `kraken/x@sha256:...` becomes `docker.io/kraken/x@sha256:...`
-    # and fails to pull. PARAMETERS section 2.4 keeps images local with ECR deferred, so
-    # every bundle we author is local-only. The classic builder does resolve local
-    # digests. Drop this the day images are pushed to a real registry.
-    env = {**os.environ, "DOCKER_BUILDKIT": "0"}
     log.info("run: %s", " ".join(cmd))
-    return subprocess.run(cmd, cwd=ROOT, env=env).returncode
+    return subprocess.run(cmd, cwd=ROOT).returncode
 
 
 def cmd_grade(args: argparse.Namespace) -> int:
@@ -168,6 +162,8 @@ def main() -> int:
     a.add_argument("--instances", nargs="*", default=None)
     a.add_argument("--repos", nargs="*", default=None)
     a.add_argument("--limit", type=int, default=0)
+    a.add_argument("--registry", default="",
+                   help="push the instance image here and pin its registry digest")
     a.set_defaults(func=cmd_author)
 
     r = sub.add_parser("run", help="drive one agent rollout against one bundle")

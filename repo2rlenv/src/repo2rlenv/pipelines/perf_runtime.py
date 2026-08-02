@@ -335,6 +335,11 @@ FROM {env_tag}
 COPY ./setup_repo.sh /root/
 RUN /bin/bash /root/setup_repo.sh
 
+# Record installed dependencies for reproducibility, as the reference instance tier
+# does. Best-effort: a record whose env cannot freeze is still a valid task.
+RUN /bin/bash -c "source /opt/miniconda3/bin/activate && conda activate testbed && \
+    pip freeze > /testbed/.dep-manifest.txt" 2>/dev/null || true
+
 WORKDIR /testbed/
 """
 
@@ -734,7 +739,46 @@ class PerfRuntimePipeline:
             inspect = subprocess.run(["docker", "image", "inspect", instance_tag,
                                       "--format", "{{.Id}}"], capture_output=True, text=True)
             digest = inspect.stdout.strip()
+
+        registry = getattr(self.options, "registry", "") or ""
+        if registry:
+            pushed, error = self._push(registry, rec, instance_tag)
+            if error:
+                return None, f"registry push: {error}"
+            return pushed, None
         return f"kraken.instance.{rec['instance_id'].lower()}@{digest}", None
+
+    def _push(self, registry: str, rec: dict, local_tag: str) -> tuple:
+        """Push the instance tier and return its registry digest.
+
+        A locally built digest proves what ran here and nothing about what anyone
+        else can run. BuildKit resolves a digest-pinned FROM against a registry and
+        never against the local image store, so a local-only image is unrunnable by
+        the runtime that ships. The digest returned here is the registry manifest
+        digest, which is not the local image id and is the one that travels.
+        """
+        owner, name = rec["repo"].split("/", 1)
+        repo_path = f"{registry.rstrip('/')}/kraken/{owner}_m_{name}".lower()
+        remote = f"{repo_path}:{rec['instance_id'].lower()}"
+
+        if ".dkr.ecr." in registry:
+            region = registry.split(".dkr.ecr.")[1].split(".")[0]
+            subprocess.run(["aws", "ecr", "create-repository", "--region", region,
+                            "--repository-name", f"kraken/{owner}_m_{name}".lower()],
+                           capture_output=True, text=True)  # already-exists is fine
+
+        for args in (["docker", "tag", local_tag, remote],
+                     ["docker", "push", remote]):
+            proc = subprocess.run(args, capture_output=True, text=True)
+            if proc.returncode != 0:
+                return None, f"{' '.join(args[:2])}: {proc.stderr.strip()[:200]}"
+
+        proc = subprocess.run(
+            ["docker", "inspect", "--format", "{{index .RepoDigests 0}}", remote],
+            capture_output=True, text=True)
+        if proc.returncode != 0 or "@" not in proc.stdout:
+            return None, "pushed but no repo digest resolved"
+        return proc.stdout.strip(), None
 
     # --- grounding ------------------------------------------------------------
 
@@ -949,7 +993,21 @@ class PerfRuntimePipeline:
                                            self._test_cmd(rec, covering))
             self._calibration.setdefault(rec["instance_id"], {})["baseline"] = baseline
             if baseline.get("repaired_image"):
+                # Environment repair builds a new image on top of the instance tier,
+                # and that repaired image is what the bundle pins. Pushing the
+                # pre-repair tier would publish an image no bundle references, so the
+                # push has to happen here, after the final image is known.
                 image_ref = baseline["repaired_image"]
+                registry = getattr(self.options, "registry", "") or ""
+                if registry:
+                    # docker tag accepts name@digest directly; splitting the digest
+                    # off would leave a bare repo name that resolves to :latest.
+                    pushed, error = self._push(registry, rec, image_ref)
+                    if error:
+                        logger.warning("%s: repaired image not pushed: %s",
+                                       rec["instance_id"], error)
+                    else:
+                        image_ref = pushed
             if not baseline["clean"]:
                 logger.warning("%s rejected by the baseline gate: %s (rc=%s)",
                                rec["instance_id"], baseline["reason"], baseline["returncode"])
