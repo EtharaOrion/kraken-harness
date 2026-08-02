@@ -33,8 +33,9 @@ import urllib.request
 from itertools import combinations
 from pathlib import Path
 
-HARNESS = Path(__file__).resolve().parent
-ROOT = HARNESS.parent
+from repo2rlenv.kraken import find_root
+
+ROOT = find_root()
 PROXY = "http://localhost:8765/v1/messages"
 JUDGES = ("claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5")
 MAX_EVIDENCE = 12000
@@ -194,6 +195,18 @@ def score_criterion(crit: dict, evidence: str, rng: random.Random) -> dict:
     awards = sum(1 for v in usable if v == "award")
     return {"id": crit["id"], "result": awards * 2 > len(usable), "votes": detail,
             "agreement": agreement(votes)}
+
+
+def run(*, bundle: Path, logs: Path, seed: int = 17) -> int:
+    """Importable entry. `kraken grade` calls this rather than re-entering argparse."""
+    import sys as _sys
+    argv = _sys.argv
+    _sys.argv = ["kraken-judge", "--bundle", str(bundle), "--logs", str(logs),
+                 "--seed", str(seed)]
+    try:
+        return main()
+    finally:
+        _sys.argv = argv
 
 
 def main() -> int:

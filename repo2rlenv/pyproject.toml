@@ -44,6 +44,7 @@ dependencies = [
 ]
 
 [project.scripts]
+kraken = "repo2rlenv.kraken.cli:main"
 repo2rlenv = "repo2rlenv.cli:main"
 
 [project.urls]

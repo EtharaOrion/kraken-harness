@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """kraken — the one harness. Every stage from a merged pull request to a reward.
 
-    uv run --project kraken-harness/repo2rlenv python kraken-harness/kraken.py harvest --repo networkx/networkx
-    uv run --project kraken-harness/repo2rlenv python kraken-harness/kraken.py author  --instances <id>
-    uv run --project kraken-harness/repo2rlenv python kraken-harness/kraken.py run     --bundle kraken-dataset/<uuid>
-    uv run --project kraken-harness/repo2rlenv python kraken-harness/kraken.py grade   --bundle <b> --logs <run>
-    uv run --project kraken-harness/repo2rlenv python kraken-harness/kraken.py status
+    kraken harvest --repo networkx/networkx
+    kraken author  --instances <id>
+    kraken run     --bundle kraken-dataset/<uuid>
+    kraken grade   --bundle <b> --logs <run>
+    kraken status
 
 There is one harness and it lives here. Harvest mines pull requests, author builds the
 image and calibrates the target, run drives an agent, grade scores the rubric channel
@@ -27,13 +27,15 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-HARNESS = Path(__file__).resolve().parent
-sys.path.insert(0, str(HARNESS / "repo2rlenv" / "src"))
+from repo2rlenv.kraken import find_root, harness_dir
+
+ROOT = find_root()
+HARNESS = harness_dir(ROOT)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("kraken")
@@ -86,27 +88,37 @@ def cmd_author(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    """Drive one agent rollout against one bundle.
+    """Drive one agent rollout against one bundle, through Harbor.
 
-    Prefers Harbor when it is checked out, because Harbor is the runtime this family
-    of projects standardises on and it already handles agents, adapters and result
-    layout. Falls back to the local rollout driver otherwise.
+    Harbor is the runtime. `trinity/FORGE.md` binds the verifier entry point to its
+    `tests/test.sh`, and it already owns agents, adapters, retries and the result
+    layout. There is no second rollout path here on purpose: a fallback driver drifts
+    from the real one and then grades differently from the runtime that ships.
     """
     bundle = Path(args.bundle)
     if not bundle.is_absolute():
         bundle = ROOT / bundle
     harbor = HARNESS / "harbor"
+    if not harbor.is_dir():
+        log.error("harbor is not checked out at %s. The runtime is required; there is "
+                  "no fallback driver.", harbor)
+        return 2
 
-    if harbor.is_dir() and not args.local:
-        cmd = ["uv", "run", "--project", str(harbor), "harbor", "run",
-               "-p", str(bundle), "-a", args.agent, "-m", args.model, "--env", "docker"]
-        log.info("run: %s", " ".join(cmd))
-        return subprocess.run(cmd, cwd=ROOT).returncode
-
-    log.info("run: harbor not available or --local given, using the local rollout driver")
-    return subprocess.run(
-        [sys.executable, str(Path(__file__).resolve().parent / "kraken_rollout.py"),
-         "--bundle", str(bundle), "--out", args.out], cwd=ROOT).returncode
+    cmd = ["uv", "run", "--project", str(harbor), "harbor", "run",
+           "-p", str(bundle), "-a", args.agent, "-m", args.model,
+           "--env", "docker", "-o", str(ROOT / args.out)]
+    if args.n_attempts > 1:
+        cmd += ["-k", str(args.n_attempts)]
+    if args.n_concurrent > 1:
+        cmd += ["-n", str(args.n_concurrent)]
+    # BuildKit resolves a digest-pinned FROM against a registry and never against the
+    # local image store, so `kraken/x@sha256:...` becomes `docker.io/kraken/x@sha256:...`
+    # and fails to pull. PARAMETERS section 2.4 keeps images local with ECR deferred, so
+    # every bundle we author is local-only. The classic builder does resolve local
+    # digests. Drop this the day images are pushed to a real registry.
+    env = {**os.environ, "DOCKER_BUILDKIT": "0"}
+    log.info("run: %s", " ".join(cmd))
+    return subprocess.run(cmd, cwd=ROOT, env=env).returncode
 
 
 def cmd_grade(args: argparse.Namespace) -> int:
@@ -115,10 +127,8 @@ def cmd_grade(args: argparse.Namespace) -> int:
     The graded container has no network by design, so it writes the deterministic
     reward and leaves every rubric criterion unscored. This closes that half.
     """
-    return subprocess.run(
-        [sys.executable, str(Path(__file__).resolve().parent / "kraken_judge.py"),
-         "--bundle", args.bundle, "--logs", args.logs],
-        cwd=ROOT).returncode
+    from repo2rlenv.kraken import judge
+    return judge.run(bundle=Path(args.bundle), logs=Path(args.logs), root=ROOT)
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -165,7 +175,10 @@ def main() -> int:
     r.add_argument("--agent", default="claude-code")
     r.add_argument("--model", default="claude-opus-4-8")
     r.add_argument("--out", default="trajectories")
-    r.add_argument("--local", action="store_true", help="force the local driver over Harbor")
+    r.add_argument("-k", "--n-attempts", type=int, default=1,
+                   help="rollouts per task, passed to Harbor")
+    r.add_argument("-n", "--n-concurrent", type=int, default=1,
+                   help="concurrent rollouts, passed to Harbor")
     r.set_defaults(func=cmd_run)
 
     g = sub.add_parser("grade", help="score the rubric channel and recompose the reward")
