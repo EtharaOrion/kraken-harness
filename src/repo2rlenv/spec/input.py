@@ -16,6 +16,7 @@ class PipelineName(StrEnum):
     PR_RUNTIME = "pr_runtime"  # PR mining w/ sandbox verification (was: pr_mining)
     COMMIT_RUNTIME = "commit_runtime"  # commit-level mining w/ sandbox (was: commit_mining)
     CVE_PATCHES = "cve_patches"  # CVE patches as training data (was: cve_mining)
+    PERF_RUNTIME = "perf_runtime"  # corpus-driven performance optimization tasks
     # Synthesized by LLM
     CODE_INSTRUCT = "code_instruct"  # OSS-Instruct-style (was: oss_instruct)
     MUTATION_BUGS = "mutation_bugs"  # synthetic bug injection (was: mutation)

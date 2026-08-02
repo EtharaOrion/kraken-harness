@@ -6,11 +6,13 @@ from repo2rlenv.pipelines.commit_runtime import CommitRuntimePipeline
 from repo2rlenv.pipelines.cve_patches import CVEPatchesPipeline
 from repo2rlenv.pipelines.equivalence_tests import EquivalenceTestsPipeline
 from repo2rlenv.pipelines.mutation_bugs import MutationBugsPipeline
+from repo2rlenv.pipelines.perf_runtime import PerfRuntimePipeline
 from repo2rlenv.pipelines.pr_diff import PRDiffPipeline
 from repo2rlenv.pipelines.pr_runtime import PRRuntimePipeline
 from repo2rlenv.pipelines.refactor_synthesis import RefactorSynthesisPipeline
 
 PIPELINES: dict[str, type[Pipeline]] = {
+    "perf_runtime": PerfRuntimePipeline,
     "pr_diff": PRDiffPipeline,
     "pr_runtime": PRRuntimePipeline,
     "commit_runtime": CommitRuntimePipeline,

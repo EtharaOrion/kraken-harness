@@ -522,7 +522,33 @@ class EquivalenceTestsOptions(_BaseOptions):
     skip_validation: bool = False
 
 
+class PerfRuntimeOptions(_BaseOptions):
+    """Corpus-driven performance optimization tasks.
+
+    The harvest stage is solved upstream, so this pipeline reads records rather than
+    scraping. Each record carries the base commit, the reference optimization, the
+    covering tests, the timed workload, and the measured expert speedup.
+    """
+
+    corpus: str = "harvest"           # directory of *.jsonl, or a single file
+    repos: list[str] = []             # restrict to these repos; empty means all
+    instances: list[str] = []         # restrict to these instance ids; empty means all
+    limit: int = 0                    # 0 means every admissible record
+    skip_image_build: bool = False    # emit bundles without building images
+    build_timeout_sec: int = 3600
+    skip_calibration: bool = False    # emit without measuring the oracle first
+    calibration_timeout_sec: int = 1800
+    # A task ships only when the oracle gain exceeds this multiple of its own
+    # measurement noise, so the target is separable from the host rather than
+    # merely larger than it.
+    discrimination_margin: float = 2.0
+    stability_trials: int = 3
+    max_environment_repairs: int = 4
+    max_void_retries: int = 4
+
+
 OPTIONS_REGISTRY: dict[str, type[_BaseOptions]] = {
+    "perf_runtime": PerfRuntimeOptions,
     "pr_runtime": PRRuntimeOptions,
     "pr_diff": PRDiffOptions,
     "commit_runtime": CommitRuntimeOptions,
