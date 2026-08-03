@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -90,27 +91,29 @@ def cmd_author(args: argparse.Namespace) -> int:
 def cmd_run(args: argparse.Namespace) -> int:
     """Drive one agent rollout against one bundle, through Harbor.
 
-    Harbor is the runtime. `trinity/FORGE.md` binds the verifier entry point to its
-    `tests/test.sh`, and it already owns agents, adapters, retries and the result
-    layout. There is no second rollout path here on purpose: a fallback driver drifts
-    from the real one and then grades differently from the runtime that ships.
+    Harbor is a pinned git dependency of this package, not a vendored copy. The pin
+    lives in pyproject under [tool.uv.sources], so `harbor` on this venv's PATH is
+    the fork trajectory runs are reproducible against, independent of any ambient
+    harbor installation. Vendoring a second copy would let the two drift.
     """
     bundle = Path(args.bundle)
     if not bundle.is_absolute():
         bundle = ROOT / bundle
-    harbor = HARNESS / "harbor"
-    if not harbor.is_dir():
-        log.error("harbor is not checked out at %s. The runtime is required; there is "
-                  "no fallback driver.", harbor)
+
+    if not shutil.which("harbor"):
+        log.error("harbor is not on PATH. It is a pinned dependency of this package: "
+                  "run `uv sync` in kraken-harness, or invoke through "
+                  "`uv run --project kraken-harness kraken run`.")
         return 2
 
-    cmd = ["uv", "run", "--project", str(harbor), "harbor", "run",
-           "-p", str(bundle), "-a", args.agent, "-m", args.model,
+    cmd = ["harbor", "run", "-p", str(bundle), "-a", args.agent, "-m", args.model,
            "--env", "docker", "-o", str(ROOT / args.out)]
     if args.n_attempts > 1:
         cmd += ["-k", str(args.n_attempts)]
     if args.n_concurrent > 1:
         cmd += ["-n", str(args.n_concurrent)]
+    for kv in args.agent_env or []:
+        cmd += ["--agent-env", kv]
     log.info("run: %s", " ".join(cmd))
     return subprocess.run(cmd, cwd=ROOT).returncode
 
@@ -135,8 +138,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(json.dumps({
         "corpus_shards": len(corpus), "corpus_records": records,
         "authored_bundles": len(bundles), "trajectories": len(trajs),
-        "harbor_present": (HARNESS / "harbor").is_dir(),
-        "harness_present": (HARNESS / "repo2rlenv" / "src").is_dir(),
+        "harbor_on_path": bool(shutil.which("harbor")),
+        "harness_present": (HARNESS / "src" / "repo2rlenv").is_dir(),
         "pilot_present": (ROOT / "pilot" / "run_pilot.py").exists(),
         "harness_stages": ["harvest", "author", "run", "grade"],
     }, indent=2))
@@ -175,6 +178,8 @@ def main() -> int:
                    help="rollouts per task, passed to Harbor")
     r.add_argument("-n", "--n-concurrent", type=int, default=1,
                    help="concurrent rollouts, passed to Harbor")
+    r.add_argument("--agent-env", action="append", default=[],
+                   help="KEY=VALUE passed to the agent, repeatable, e.g. ANTHROPIC_BASE_URL=http://host.docker.internal:8765")
     r.set_defaults(func=cmd_run)
 
     g = sub.add_parser("grade", help="score the rubric channel and recompose the reward")

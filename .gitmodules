@@ -1,5 +1,0 @@
-[submodule "harbor"]
-	path = harbor
-	url = https://github.com/Ethara-Ai/harbor.git
-	branch = main
-	update = merge
