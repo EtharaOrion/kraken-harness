@@ -33,9 +33,6 @@ import urllib.request
 from itertools import combinations
 from pathlib import Path
 
-from repo2rlenv.kraken import find_root
-
-ROOT = find_root()
 PROXY = "http://localhost:8765/v1/messages"
 JUDGES = ("claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5")
 MAX_EVIDENCE = 12000

@@ -49,6 +49,39 @@ def test_the_module_imports_without_a_kraken_tree(monkeypatch):
     assert callable(cli.main)
 
 
+def test_no_kraken_module_resolves_the_root_while_being_imported(monkeypatch):
+    """Import must not depend on where the tree is, for every module in the package.
+
+    cli, judge and validate each resolved the root at module scope. On a developer
+    machine the harness sits inside the kraken tree, so the upward walk from the
+    source file finds a root and every one of them imports fine. CI checks the
+    harness out on its own, where the same import aborts collection outright.
+
+    Making find_root refuse catches that wherever the source happens to live, which
+    a test that merely unsets KRAKEN_ROOT cannot do.
+    """
+    import importlib
+
+    import repo2rlenv.kraken as package
+
+    def refuse(*_a, **_k):
+        raise AssertionError("the knowledge root was resolved at import time")
+
+    monkeypatch.setattr(package, "find_root", refuse)
+    modules = ("cli", "judge", "validate")
+    for name in modules:
+        monkeypatch.delitem(sys.modules, f"repo2rlenv.kraken.{name}", raising=False)
+    try:
+        for name in modules:
+            importlib.import_module(f"repo2rlenv.kraken.{name}")
+    finally:
+        # Re-import under the real find_root so later tests get working modules.
+        monkeypatch.undo()
+        for name in modules:
+            sys.modules.pop(f"repo2rlenv.kraken.{name}", None)
+            importlib.import_module(f"repo2rlenv.kraken.{name}")
+
+
 def test_a_command_still_demands_a_root(monkeypatch, tmp_path):
     monkeypatch.setenv("KRAKEN_ROOT", str(tmp_path / "not-a-tree"))
     with pytest.raises(SystemExit):
