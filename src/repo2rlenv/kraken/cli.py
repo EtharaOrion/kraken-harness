@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -46,8 +47,14 @@ def cmd_harvest(args: argparse.Namespace) -> int:
 
     spec = None
     if args.model:
-        from repo2rlenv.spec.options import LLMSpec  # type: ignore
-        spec = LLMSpec(model=args.model)
+        # LLMSpec lives in spec.input and wants provider and model separately, not a
+        # single LiteLLM-style string. Accept "provider/model" and split it.
+        from repo2rlenv.spec.input import LLMSpec
+        provider, _, model = args.model.partition("/")
+        if not model:
+            provider, model = "anthropic", provider
+        spec = LLMSpec(provider=provider, model=model,
+                       endpoint=os.environ.get("ANTHROPIC_BASE_URL") or None)
 
     total = {"written": 0, "complete": 0, "incomplete": 0}
     for repo in args.repo:

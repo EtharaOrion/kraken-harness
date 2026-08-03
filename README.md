@@ -37,8 +37,8 @@ uv run --project kraken-harness python kraken-harness/kraken.py <stage>
 only and the repository may never self-produce trusted difficulty proof, so keeping the
 pilot outside is what makes its externality structural rather than promised.
 
-`references/swefficiency` is the published implementation this delivery conforms to. It
-is vendored at the knowledge root, off the build path, and nothing here imports it.
+The three-tier image recipe is modelled on SWE-fficiency (arXiv 2511.06090). Nothing
+here imports it; the conformance is in the recipe, not in a dependency.
 
 ---
 
