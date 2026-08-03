@@ -241,7 +241,15 @@ def truth_md(g: dict, criteria: list) -> str:
 
 
 def test_outputs_py(g: dict) -> str:
+    """Graded assertions: the covering suite, then each held-out test file on its own.
+
+    The held-out files are the tests the upstream author wrote to prove the change.
+    Applying them at grade time and never running them left the most task-specific
+    evidence in the bundle unscored, while assertions named by a count re-ran the
+    same command and could not fail independently.
+    """
     asserts = g["correctness"]["behaviour_assertions"]
+    held_out = (g["correctness"].get("held_out_tests") or {})
     body = [
         '"""Held-out deterministic assertions. Applied at grade time, never committed to history.',
         "",
@@ -251,15 +259,23 @@ def test_outputs_py(g: dict) -> str:
         "",
         "import json",
         "import subprocess",
+        "import sys",
         "from pathlib import Path",
         "",
         "TARGETS = json.loads(Path('/tests/targets.json').read_text())",
+        f"REPO = '{g['repo_path']}'",
         "",
         "",
         "def _run_covering():",
-        "    proc = subprocess.run(TARGETS['test_cmd'], shell=True, capture_output=True, text=True,",
-        f"                          cwd='{g['repo_path']}')",
-        "    return proc",
+        "    return subprocess.run(TARGETS['test_cmd'], shell=True, capture_output=True,",
+        "                          text=True, cwd=REPO)",
+        "",
+        "",
+        "def _run_file(path):",
+        '    """Run one held-out test file and nothing else."""',
+        "    return subprocess.run([sys.executable, '-m', 'pytest', path, '-q', '--no-header',",
+        "                           '-p', 'no:cacheprovider'],",
+        "                          capture_output=True, text=True, cwd=REPO)",
         "",
         "",
         "def test_covering_tests_pass():",
@@ -269,14 +285,21 @@ def test_outputs_py(g: dict) -> str:
         "",
     ]
     for name in asserts:
-        body += [
-            "",
-            f"def {name}():",
-            '    """Behaviour assertion derived from the covering set."""',
-            "    proc = _run_covering()",
-            "    assert proc.returncode == 0",
-            "",
-        ]
+        path = held_out.get(name)
+        body += ["", f"def {name}():"]
+        if path:
+            body += [
+                f'    """Held-out test file from the upstream change: {path}"""',
+                f"    proc = _run_file({path!r})",
+                "    assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-2000:]",
+            ]
+        else:
+            body += [
+                '    """No held-out test file resolved; falls back to the covering suite."""',
+                "    proc = _run_covering()",
+                "    assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-2000:]",
+            ]
+        body.append("")
     return "\n".join(body)
 
 

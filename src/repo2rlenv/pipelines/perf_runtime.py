@@ -162,6 +162,27 @@ def diff_problems(patch: str) -> list:
     return problems
 
 
+def held_out_test_files(test_patch: str) -> list:
+    """Test files the upstream PR's own test patch touches.
+
+    These are the tests the author wrote to prove the change, and they are the most
+    task-specific evidence a bundle carries. They arrive at grade time and are not in
+    repository history, so the agent cannot read them.
+    """
+    files = []
+    for m in re.finditer(r"^\+\+\+ b/(\S+)", test_patch or "", re.M):
+        path = m.group(1)
+        if path.endswith(".py") and ("test" in Path(path).name or "/tests/" in f"/{path}"):
+            files.append(path)
+    return sorted(set(files))
+
+
+def _assertion_name(path: str) -> str:
+    """A stable, distinct, valid identifier for one held-out test file."""
+    stem = re.sub(r"[^0-9a-zA-Z]+", "_", path.rsplit(".", 1)[0]).strip("_").lower()
+    return f"test_heldout_{stem}"
+
+
 def _canonical_hash(parts: dict) -> str:
     blob = json.dumps(parts, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()
@@ -909,8 +930,13 @@ class PerfRuntimePipeline:
         files = sorted({m.group(1) for m in re.finditer(r"^\+\+\+ b/(\S+)", rec["patch"], re.M)})
         symbols = sorted({m.group(1) for m in re.finditer(r"^[-+]\s*def\s+(\w+)", rec["patch"], re.M)})
         covering = list(rec["covering_tests"])
-        asserts = [f"test_behaviour_{i}" for i, _ in enumerate(covering[:8], start=1)] or \
-                  ["test_behaviour_1"]
+        # One graded assertion per held-out test file, so each can fail on its own.
+        # Naming them by a count produced identical duplicates that could not
+        # discriminate anything while still carrying weight.
+        held_out = held_out_test_files(rec.get("test_patch") or "")
+        asserts = [_assertion_name(f) for f in held_out]
+        if not asserts:
+            asserts = ["test_covering_suite"]
         return {
             "instance_id": rec["instance_id"],
             "repo": rec["repo"],
@@ -938,6 +964,9 @@ class PerfRuntimePipeline:
                 "covering_tests": covering,
                 "test_cmd": self._test_cmd(rec, covering),
                 "behaviour_assertions": asserts,
+                # Path per assertion, so the generated test runs the real file rather
+                # than re-running the covering suite under a different name.
+                "held_out_tests": dict(zip(asserts, held_out)) if held_out else {},
                 "log_parser_type": rec.get("log_parser_type", "pytest"),
             },
             "rubric_policy": {"judges": ["claude-opus", "claude-sonnet", "claude-haiku"],
