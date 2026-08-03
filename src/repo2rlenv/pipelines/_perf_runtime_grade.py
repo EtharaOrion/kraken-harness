@@ -36,19 +36,26 @@ ZERO_REASONS = (
 # change or a byte in the submission, never by a classifier reading intent.
 RED_LINES = {
     "reward_written_directly": re.compile(
-        r"(/logs/verifier/reward|reward\.txt|reward\.json)", re.IGNORECASE),
+        r"(/logs/verifier/reward|reward\.txt|reward\.json)", re.IGNORECASE
+    ),
     "workload_harness_replaced": re.compile(
         r"^[+-].*\b(tests/workload\.py|tests/measure\.py|tests/grade\.py|tests/test\.sh)\b",
-        re.MULTILINE),
+        re.MULTILINE,
+    ),
     "clock_manipulated": re.compile(
         r"^\+.*\b(time\.(monotonic|perf_counter|time)\s*=|"
         r"unittest\.mock\.patch\([\"']time|freeze_time|"
-        r"timeit\.default_timer\s*=)", re.MULTILINE),
+        r"timeit\.default_timer\s*=)",
+        re.MULTILINE,
+    ),
     "graded_values_read": re.compile(
-        r"^\+.*\b(test_weights\.json|rubric\.json|targets\.json|solution/)", re.MULTILINE),
+        r"^\+.*\b(test_weights\.json|rubric\.json|targets\.json|solution/)", re.MULTILINE
+    ),
     "private_side_reached": re.compile(
         r"^\+.*\b(solution/patch\.diff|solution/TRUTH\.md|solution/grounding\.yaml|"
-        r"solution/recompute\.py)\b", re.MULTILINE),
+        r"solution/recompute\.py)\b",
+        re.MULTILINE,
+    ),
 }
 
 
@@ -82,48 +89,65 @@ def speedup_bands(target: float, bands: tuple = (0.25, 0.5, 0.75, 1.0)) -> list:
     discarded real work.
     """
     gain = max(0.0, target - 1.0)
-    return [{"item_id": f"speed_band_{int(f * 100)}",
-             "threshold": round(1.0 + gain * f, 6),
-             "fraction_of_expert_gain": f} for f in bands]
+    return [
+        {
+            "item_id": f"speed_band_{int(f * 100)}",
+            "threshold": round(1.0 + gain * f, 6),
+            "fraction_of_expert_gain": f,
+        }
+        for f in bands
+    ]
 
 
-def grade_items(*, measured_speedup: float, target: float, weights: dict,
-                pytest_results: dict, rubric_results: dict) -> list:
+def grade_items(
+    *,
+    measured_speedup: float,
+    target: float,
+    weights: dict,
+    pytest_results: dict,
+    rubric_results: dict,
+) -> list:
     """Resolve every graded item to exactly one binary outcome."""
     items = []
 
     for band in speedup_bands(target):
         wid = band["item_id"]
-        items.append({
-            "item_id": wid,
-            "channel": "measured",
-            "weight": float(weights.get(wid, 0.0)),
-            "passed": measured_speedup >= band["threshold"],
-            "scored": True,
-            "detail": {"threshold": band["threshold"], "measured": measured_speedup},
-        })
+        items.append(
+            {
+                "item_id": wid,
+                "channel": "measured",
+                "weight": float(weights.get(wid, 0.0)),
+                "passed": measured_speedup >= band["threshold"],
+                "scored": True,
+                "detail": {"threshold": band["threshold"], "measured": measured_speedup},
+            }
+        )
 
     for name, outcome in sorted((pytest_results or {}).items()):
-        items.append({
-            "item_id": name,
-            "channel": "pytest",
-            "weight": float(weights.get(name, 0.0)),
-            "passed": str(outcome).upper() in ("PASSED", "PASS", "TRUE", "OK"),
-            "scored": True,
-        })
+        items.append(
+            {
+                "item_id": name,
+                "channel": "pytest",
+                "weight": float(weights.get(name, 0.0)),
+                "passed": str(outcome).upper() in ("PASSED", "PASS", "TRUE", "OK"),
+                "scored": True,
+            }
+        )
 
     for name, outcome in sorted((rubric_results or {}).items()):
         # An unscored criterion is not a failed criterion. When no judge reached the
         # verifier, the criterion leaves the denominator entirely rather than silently
         # sinking the reward and making the golden endpoint unreachable.
         scored = outcome is not None
-        items.append({
-            "item_id": name,
-            "channel": "rubric",
-            "weight": float(weights.get(name, 0.0)),
-            "passed": bool(outcome) if scored else False,
-            "scored": scored,
-        })
+        items.append(
+            {
+                "item_id": name,
+                "channel": "rubric",
+                "weight": float(weights.get(name, 0.0)),
+                "passed": bool(outcome) if scored else False,
+                "scored": scored,
+            }
+        )
     return items
 
 
@@ -143,10 +167,21 @@ def compose(items: list) -> float:
     return round(max(0.0, min(1.0, earned / positive_total)), PRECISION)
 
 
-def grade(*, patch: str, applied: bool, correctness_passed: bool, measurement: dict,
-          target: float, weights: dict, pytest_results: dict, rubric_results: dict,
-          trajectory: str = "", hack_confirmed: bool = False) -> dict:
+def grade(
+    *,
+    patch: str,
+    applied: bool,
+    correctness_passed: bool,
+    measurement: dict,
+    target: float,
+    weights: dict,
+    pytest_results: dict,
+    rubric_results: dict,
+    trajectory: str = "",
+    hack_confirmed: bool = False,
+) -> dict:
     """The whole path from submission to scalar, in the bound order."""
+
     def zero(reason, **extra):
         return {"reward": 0.0, "reason": reason, "items": [], **extra}
 
@@ -167,13 +202,22 @@ def grade(*, patch: str, applied: bool, correctness_passed: bool, measurement: d
         # measurement reports instead of scoring. A zero here would blame the
         # submission for the host's noise, and in training that false negative goes
         # straight into the reward signal.
-        return {"reward": None, "status": "void", "reason": "measurement_unstable",
-                "items": [], "measurement": measurement,
-                "note": "the run is void and must be repeated, it is not a failed run"}
+        return {
+            "reward": None,
+            "status": "void",
+            "reason": "measurement_unstable",
+            "items": [],
+            "measurement": measurement,
+            "note": "the run is void and must be repeated, it is not a failed run",
+        }
 
     items = grade_items(
-        measured_speedup=float(measurement.get("speedup", 0.0)), target=target,
-        weights=weights, pytest_results=pytest_results, rubric_results=rubric_results)
+        measured_speedup=float(measurement.get("speedup", 0.0)),
+        target=target,
+        weights=weights,
+        pytest_results=pytest_results,
+        rubric_results=rubric_results,
+    )
     reward = compose(items)
     unscored = [i["item_id"] for i in items if not i.get("scored", True)]
     return {
@@ -184,8 +228,9 @@ def grade(*, patch: str, applied: bool, correctness_passed: bool, measurement: d
         "items_scored": sum(1 for i in items if i.get("scored", True)),
         "items_total": len(items),
         "unscored_items": unscored,
-        "coverage_gap": (f"{len(unscored)} rubric criteria unscored, excluded from the "
-                         "denominator") if unscored else None,
+        "coverage_gap": (f"{len(unscored)} rubric criteria unscored, excluded from the denominator")
+        if unscored
+        else None,
         "measured_speedup": measurement.get("speedup"),
         "target_speedup": target,
     }
@@ -202,7 +247,8 @@ def emit(result: dict):
     if result.get("status") == "void" or result.get("reward") is None:
         RESULT_PATH.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
         (REWARD_PATH.parent / "void.marker").write_text(
-            f"{result.get('reason', 'void')}\n", encoding="utf-8")
+            f"{result.get('reason', 'void')}\n", encoding="utf-8"
+        )
         return None
     reward = float(result.get("reward", 0.0))
     REWARD_PATH.write_text(f"{reward:.{PRECISION}f}\n", encoding="utf-8")

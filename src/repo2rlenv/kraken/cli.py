@@ -22,6 +22,7 @@ Two things sit outside on purpose, and neither is a second harness:
 Stages stay separate because harvest loads the network while author needs a quiet
 host. One button would run measurement under load and hide which stage failed.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -50,11 +51,13 @@ def cmd_harvest(args: argparse.Namespace) -> int:
         # LLMSpec lives in spec.input and wants provider and model separately, not a
         # single LiteLLM-style string. Accept "provider/model" and split it.
         from repo2rlenv.spec.input import LLMSpec
+
         provider, _, model = args.model.partition("/")
         if not model:
             provider, model = "anthropic", provider
-        spec = LLMSpec(provider=provider, model=model,
-                       endpoint=os.environ.get("ANTHROPIC_BASE_URL") or None)
+        spec = LLMSpec(
+            provider=provider, model=model, endpoint=os.environ.get("ANTHROPIC_BASE_URL") or None
+        )
 
     total = {"written": 0, "complete": 0, "incomplete": 0}
     for repo in args.repo:
@@ -70,8 +73,10 @@ def cmd_harvest(args: argparse.Namespace) -> int:
 
     print(json.dumps({"stage": "harvest", **total, "corpus": args.out}, indent=2))
     if total["incomplete"]:
-        print(f"\n{total['incomplete']} record(s) are incomplete and will be rejected by the\n"
-              f"emitter until enriched. Pass --model to synthesize the missing workload.")
+        print(
+            f"\n{total['incomplete']} record(s) are incomplete and will be rejected by the\n"
+            f"emitter until enriched. Pass --model to synthesize the missing workload."
+        )
     return 0
 
 
@@ -88,10 +93,20 @@ def cmd_author(args: argparse.Namespace) -> int:
     )
     out = ROOT / args.out
     res = PerfRuntimePipeline(gen_input=None, options=opts).run(out)
-    print(json.dumps({"stage": "author", "candidates": res.candidates,
-                      "emitted": res.emitted, "skipped": res.skipped,
-                      "skip_reasons": res.skip_reasons, "out": str(out)},
-                     indent=2, default=str))
+    print(
+        json.dumps(
+            {
+                "stage": "author",
+                "candidates": res.candidates,
+                "emitted": res.emitted,
+                "skipped": res.skipped,
+                "skip_reasons": res.skip_reasons,
+                "out": str(out),
+            },
+            indent=2,
+            default=str,
+        )
+    )
     return 0
 
 
@@ -108,13 +123,27 @@ def cmd_run(args: argparse.Namespace) -> int:
         bundle = ROOT / bundle
 
     if not shutil.which("harbor"):
-        log.error("harbor is not on PATH. It is a pinned dependency of this package: "
-                  "run `uv sync` in kraken-harness, or invoke through "
-                  "`uv run --project kraken-harness kraken run`.")
+        log.error(
+            "harbor is not on PATH. It is a pinned dependency of this package: "
+            "run `uv sync` in kraken-harness, or invoke through "
+            "`uv run --project kraken-harness kraken run`."
+        )
         return 2
 
-    cmd = ["harbor", "run", "-p", str(bundle), "-a", args.agent, "-m", args.model,
-           "--env", "docker", "-o", str(ROOT / args.out)]
+    cmd = [
+        "harbor",
+        "run",
+        "-p",
+        str(bundle),
+        "-a",
+        args.agent,
+        "-m",
+        args.model,
+        "--env",
+        "docker",
+        "-o",
+        str(ROOT / args.out),
+    ]
     if args.n_attempts > 1:
         cmd += ["-k", str(args.n_attempts)]
     if args.n_concurrent > 1:
@@ -132,38 +161,60 @@ def cmd_grade(args: argparse.Namespace) -> int:
     reward and leaves every rubric criterion unscored. This closes that half.
     """
     from repo2rlenv.kraken import judge
+
     return judge.run(bundle=Path(args.bundle), logs=Path(args.logs), root=ROOT)
 
 
 def cmd_status(args: argparse.Namespace) -> int:
     corpus = sorted((ROOT / "harvest").glob("*.jsonl"))
     records = sum(1 for f in corpus for ln in f.read_text().splitlines() if ln.strip())
-    bundles = [p for p in (ROOT / "kraken-dataset").iterdir()
-               if p.is_dir() and (p / "task.toml").exists()] if (ROOT / "kraken-dataset").is_dir() else []
-    trajs = [p for p in (ROOT / "trajectories").iterdir() if p.is_dir()] \
-        if (ROOT / "trajectories").is_dir() else []
-    print(json.dumps({
-        "corpus_shards": len(corpus), "corpus_records": records,
-        "authored_bundles": len(bundles), "trajectories": len(trajs),
-        "harbor_on_path": bool(shutil.which("harbor")),
-        "harness_present": (HARNESS / "src" / "repo2rlenv").is_dir(),
-        "pilot_present": (ROOT / "pilot" / "run_pilot.py").exists(),
-        "harness_stages": ["harvest", "author", "run", "grade"],
-    }, indent=2))
+    bundles = (
+        [
+            p
+            for p in (ROOT / "kraken-dataset").iterdir()
+            if p.is_dir() and (p / "task.toml").exists()
+        ]
+        if (ROOT / "kraken-dataset").is_dir()
+        else []
+    )
+    trajs = (
+        [p for p in (ROOT / "trajectories").iterdir() if p.is_dir()]
+        if (ROOT / "trajectories").is_dir()
+        else []
+    )
+    print(
+        json.dumps(
+            {
+                "corpus_shards": len(corpus),
+                "corpus_records": records,
+                "authored_bundles": len(bundles),
+                "trajectories": len(trajs),
+                "harbor_on_path": bool(shutil.which("harbor")),
+                "harness_present": (HARNESS / "src" / "repo2rlenv").is_dir(),
+                "pilot_present": (ROOT / "pilot" / "run_pilot.py").exists(),
+                "harness_stages": ["harvest", "author", "run", "grade"],
+            },
+            indent=2,
+        )
+    )
     return 0
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(prog="kraken", description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        prog="kraken", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     h = sub.add_parser("harvest", help="mine merged PRs into candidate corpus records")
     h.add_argument("--repo", action="append", required=True, help="owner/name, repeatable")
     h.add_argument("--limit", type=int, default=25, help="candidates per repo")
     h.add_argument("--out", default="harvest")
-    h.add_argument("--model", default=None,
-                   help="LiteLLM model for workload synthesis; omit to leave workloads empty")
+    h.add_argument(
+        "--model",
+        default=None,
+        help="LiteLLM model for workload synthesis; omit to leave workloads empty",
+    )
     h.set_defaults(func=cmd_harvest)
 
     a = sub.add_parser("author", help="emit graded bundles from corpus records")
@@ -172,8 +223,9 @@ def main() -> int:
     a.add_argument("--instances", nargs="*", default=None)
     a.add_argument("--repos", nargs="*", default=None)
     a.add_argument("--limit", type=int, default=0)
-    a.add_argument("--registry", default="",
-                   help="push the instance image here and pin its registry digest")
+    a.add_argument(
+        "--registry", default="", help="push the instance image here and pin its registry digest"
+    )
     a.set_defaults(func=cmd_author)
 
     r = sub.add_parser("run", help="drive one agent rollout against one bundle")
@@ -181,12 +233,18 @@ def main() -> int:
     r.add_argument("--agent", default="claude-code")
     r.add_argument("--model", default="claude-opus-4-8")
     r.add_argument("--out", default="trajectories")
-    r.add_argument("-k", "--n-attempts", type=int, default=1,
-                   help="rollouts per task, passed to Harbor")
-    r.add_argument("-n", "--n-concurrent", type=int, default=1,
-                   help="concurrent rollouts, passed to Harbor")
-    r.add_argument("--agent-env", action="append", default=[],
-                   help="KEY=VALUE passed to the agent, repeatable, e.g. ANTHROPIC_BASE_URL=http://host.docker.internal:8765")
+    r.add_argument(
+        "-k", "--n-attempts", type=int, default=1, help="rollouts per task, passed to Harbor"
+    )
+    r.add_argument(
+        "-n", "--n-concurrent", type=int, default=1, help="concurrent rollouts, passed to Harbor"
+    )
+    r.add_argument(
+        "--agent-env",
+        action="append",
+        default=[],
+        help="KEY=VALUE passed to the agent, repeatable, e.g. ANTHROPIC_BASE_URL=http://host.docker.internal:8765",
+    )
     r.set_defaults(func=cmd_run)
 
     g = sub.add_parser("grade", help="score the rubric channel and recompose the reward")

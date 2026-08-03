@@ -50,18 +50,35 @@ HARBOR_SCHEMA_VERSION = "1.0"
 REWARD_CONTRACT_PATH = "/logs/verifier/reward.txt"
 REPO_PATH = "/testbed"
 
-REQUIRED_FIELDS = ("instance_id", "repo", "base_commit", "patch", "problem_statement",
-                   "covering_tests", "workload", "speedup", "python_version",
-                   "install_cmd", "test_cmd", "created_at")
+REQUIRED_FIELDS = (
+    "instance_id",
+    "repo",
+    "base_commit",
+    "patch",
+    "problem_statement",
+    "covering_tests",
+    "workload",
+    "speedup",
+    "python_version",
+    "install_cmd",
+    "test_cmd",
+    "created_at",
+)
 
 _ASSET_DIR = Path(__file__).parent
 _HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 # Import names that differ from their distribution name. Only used to translate a
 # ModuleNotFoundError into something pip can install.
-MODULE_ALIASES = {"yaml": "pyyaml", "attr": "attrs", "dateutil": "python-dateutil",
-                  "PIL": "pillow", "cv2": "opencv-python", "sklearn": "scikit-learn",
-                  "dirty_equals": "dirty-equals"}
+MODULE_ALIASES = {
+    "yaml": "pyyaml",
+    "attr": "attrs",
+    "dateutil": "python-dateutil",
+    "PIL": "pillow",
+    "cv2": "opencv-python",
+    "sklearn": "scikit-learn",
+    "dirty_equals": "dirty-equals",
+}
 _PR_URL = re.compile(r"https?://\S*?(?:github\.com|/pull/|/issues/)\S*")
 _PR_REF = re.compile(r"(?i)\b(pull request|PR)\s*#?\d+\b|#\d{3,}")
 
@@ -76,9 +93,14 @@ def host_load() -> dict:
         cpus = os.cpu_count() or 1
     except (OSError, AttributeError):
         return {"available": False}
-    return {"available": True, "cpus": cpus, "load1": round(one, 2),
-            "per_cpu": round(one / cpus, 3), "load5": round(five, 2),
-            "load15": round(fifteen, 2)}
+    return {
+        "available": True,
+        "cpus": cpus,
+        "load1": round(one, 2),
+        "per_cpu": round(one / cpus, 3),
+        "load5": round(five, 2),
+        "load15": round(fifteen, 2),
+    }
 
 
 def wait_for_quiet(threshold: float = 0.35, timeout: int = 600, poll: int = 10) -> dict:
@@ -95,13 +117,16 @@ def wait_for_quiet(threshold: float = 0.35, timeout: int = 600, poll: int = 10) 
     while waited < timeout:
         load = host_load()
         if not load.get("available") or load["per_cpu"] <= threshold:
-            return {"quiet": True, "waited_seconds": waited, "load": load,
-                    "threshold": threshold}
+            return {"quiet": True, "waited_seconds": waited, "load": load, "threshold": threshold}
         time.sleep(poll)
         waited += poll
-    return {"quiet": False, "waited_seconds": waited, "load": host_load(),
-            "threshold": threshold,
-            "note": "host never settled below the threshold; measurements taken under load"}
+    return {
+        "quiet": False,
+        "waited_seconds": waited,
+        "load": host_load(),
+        "threshold": threshold,
+        "note": "host never settled below the threshold; measurements taken under load",
+    }
 
 
 # Every in-container command must activate the conda testbed env explicitly. Docker
@@ -156,9 +181,16 @@ def diff_problems(patch: str) -> list:
                 new += 1
             i += 1
         if old != want_old or new != want_new:
-            problems.append({"hunk": index, "header": m.group(0),
-                             "declared_old": want_old, "counted_old": old,
-                             "declared_new": want_new, "counted_new": new})
+            problems.append(
+                {
+                    "hunk": index,
+                    "header": m.group(0),
+                    "declared_old": want_old,
+                    "counted_old": old,
+                    "declared_new": want_new,
+                    "counted_new": new,
+                }
+            )
     return problems
 
 
@@ -208,7 +240,7 @@ def _decontaminate(text: str) -> str:
 # very detector it exists to satisfy makes every future audit report a false positive.
 NEUTRAL_WORKLOAD_DOC = (
     '"""Timed workload. The grader runs this script verbatim against the tree as\n'
-    'submitted and against the baseline. It states what is measured, and nothing\n'
+    "submitted and against the baseline. It states what is measured, and nothing\n"
     'about how the measured code should be written."""'
 )
 
@@ -258,8 +290,11 @@ def _sanitize_workload(source: str) -> str:
     stripped = "".join(lines)
     doc = ast.parse(stripped)
     first = doc.body[0] if doc.body else None
-    if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
-            and isinstance(first.value.value, str)):
+    if (
+        isinstance(first, ast.Expr)
+        and isinstance(first.value, ast.Constant)
+        and isinstance(first.value.value, str)
+    ):
         out = stripped.splitlines(keepends=True)
         start, end = first.lineno - 1, first.end_lineno
         span = end - start
@@ -276,7 +311,8 @@ def _sanitize_workload(source: str) -> str:
     # docstrings normalized away, so a mismatch means the strip broke something.
     try:
         if ast.dump(_strip_docstrings(ast.parse(stripped))) != ast.dump(
-                _strip_docstrings(original)):
+            _strip_docstrings(original)
+        ):
             return source
     except SyntaxError:
         return source
@@ -288,15 +324,17 @@ def _strip_docstrings(tree):
     import ast
 
     for node in ast.walk(tree):
-        if not isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef,
-                                 ast.ClassDef)):
+        if not isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
         body = getattr(node, "body", None)
         if not body:
             continue
         first = body[0]
-        if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
-                and isinstance(first.value.value, str)):
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
             first.value.value = ""
     return tree
 
@@ -778,17 +816,24 @@ class PerfRuntimePipeline:
                 rec = json.loads(line)
                 missing = [f for f in REQUIRED_FIELDS if not rec.get(f)]
                 if missing:
-                    skipped[f"missing:{','.join(missing)}"] = skipped.get(
-                        f"missing:{','.join(missing)}", 0) + 1
+                    skipped[f"missing:{','.join(missing)}"] = (
+                        skipped.get(f"missing:{','.join(missing)}", 0) + 1
+                    )
                     continue
                 bad_patch = diff_problems(rec["patch"])
                 if bad_patch:
-                    logger.error("%s: reference patch is malformed and cannot apply: %s",
-                                 rec["instance_id"], bad_patch[:2])
-                    skipped["malformed_reference_patch"] = skipped.get(
-                        "malformed_reference_patch", 0) + 1
+                    logger.error(
+                        "%s: reference patch is malformed and cannot apply: %s",
+                        rec["instance_id"],
+                        bad_patch[:2],
+                    )
+                    skipped["malformed_reference_patch"] = (
+                        skipped.get("malformed_reference_patch", 0) + 1
+                    )
                     self._rejected[rec["instance_id"]] = {
-                        "reason": "malformed_reference_patch", "detail": bad_patch}
+                        "reason": "malformed_reference_patch",
+                        "detail": bad_patch,
+                    }
                     continue
                 if rec.get("test_patch"):
                     bad_tests = diff_problems(rec["test_patch"])
@@ -796,8 +841,11 @@ class PerfRuntimePipeline:
                         # Dropping it is the honest move. Applying it with a swallowed
                         # error would silently grade against in-tree tests while the
                         # bundle claimed a held-out set.
-                        logger.warning("%s: held-out test patch is malformed and is dropped: %s",
-                                       rec["instance_id"], bad_tests[:1])
+                        logger.warning(
+                            "%s: held-out test patch is malformed and is dropped: %s",
+                            rec["instance_id"],
+                            bad_tests[:1],
+                        )
                         rec = dict(rec, test_patch="", test_patch_malformed=bad_tests)
                         self._rejected.setdefault(rec["instance_id"], {})
                         self._rejected[rec["instance_id"]]["test_patch_dropped"] = bad_tests
@@ -816,18 +864,21 @@ class PerfRuntimePipeline:
 
     def setup_scripts(self, rec: dict) -> dict:
         """The two scripts the env and instance tiers run, built from the record."""
-        extra = (rec.get("env_extra") or [])
-        repo_extra = (rec.get("repo_extra") or [])
+        extra = rec.get("env_extra") or []
+        repo_extra = rec.get("repo_extra") or []
         return {
             "setup_env.sh": SETUP_ENV_SH.format(
                 python_version=rec["python_version"],
                 pip_packages=" ".join(rec.get("pip_packages") or []),
-                env_extra=(f"pip install {' '.join(extra)}" if extra else "# (none)")),
+                env_extra=(f"pip install {' '.join(extra)}" if extra else "# (none)"),
+            ),
             "setup_repo.sh": SETUP_REPO_SH.format(
-                repo=rec["repo"], base_commit=rec["base_commit"],
+                repo=rec["repo"],
+                base_commit=rec["base_commit"],
                 pre_install="\n".join(rec.get("pre_install_cmds") or []) or "# (none)",
                 install_cmd=rec["install_cmd"],
-                repo_extra=(f"pip install {' '.join(repo_extra)}" if repo_extra else "# (none)")),
+                repo_extra=(f"pip install {' '.join(repo_extra)}" if repo_extra else "# (none)"),
+            ),
         }
 
     def dockerfile(self, rec: dict) -> str:
@@ -845,8 +896,10 @@ class PerfRuntimePipeline:
             (context / name).write_text(body, encoding="utf-8")
         proc = subprocess.run(
             ["docker", "build", "-q", "-t", tag, "-f", str(context / "Dockerfile"), str(context)],
-            capture_output=True, text=True,
-            timeout=getattr(self.options, "build_timeout_sec", 3600))
+            capture_output=True,
+            text=True,
+            timeout=getattr(self.options, "build_timeout_sec", 3600),
+        )
         if proc.returncode != 0:
             return None, proc.stderr[-1500:]
         return proc.stdout.strip(), None
@@ -867,20 +920,30 @@ class PerfRuntimePipeline:
             self._base_built = True
 
         env_tag = self._env_tag(rec)
-        _, error = self._build(env_tag, ENV_DOCKERFILE.format(base_tag=base_tag),
-                               build_dir / "env", {"setup_env.sh": scripts["setup_env.sh"]})
+        _, error = self._build(
+            env_tag,
+            ENV_DOCKERFILE.format(base_tag=base_tag),
+            build_dir / "env",
+            {"setup_env.sh": scripts["setup_env.sh"]},
+        )
         if error:
             return None, f"env tier: {error}"
 
         instance_tag = f"kraken.instance.{rec['instance_id'].lower()}:latest"
         digest, error = self._build(
-            instance_tag, INSTANCE_DOCKERFILE.format(env_tag=env_tag),
-            build_dir / "instance", {"setup_repo.sh": scripts["setup_repo.sh"]})
+            instance_tag,
+            INSTANCE_DOCKERFILE.format(env_tag=env_tag),
+            build_dir / "instance",
+            {"setup_repo.sh": scripts["setup_repo.sh"]},
+        )
         if error:
             return None, f"instance tier: {error}"
         if not digest.startswith("sha256:"):
-            inspect = subprocess.run(["docker", "image", "inspect", instance_tag,
-                                      "--format", "{{.Id}}"], capture_output=True, text=True)
+            inspect = subprocess.run(
+                ["docker", "image", "inspect", instance_tag, "--format", "{{.Id}}"],
+                capture_output=True,
+                text=True,
+            )
             digest = inspect.stdout.strip()
 
         registry = getattr(self.options, "registry", "") or ""
@@ -906,19 +969,30 @@ class PerfRuntimePipeline:
 
         if ".dkr.ecr." in registry:
             region = registry.split(".dkr.ecr.")[1].split(".")[0]
-            subprocess.run(["aws", "ecr", "create-repository", "--region", region,
-                            "--repository-name", f"kraken/{owner}_m_{name}".lower()],
-                           capture_output=True, text=True)  # already-exists is fine
+            subprocess.run(
+                [
+                    "aws",
+                    "ecr",
+                    "create-repository",
+                    "--region",
+                    region,
+                    "--repository-name",
+                    f"kraken/{owner}_m_{name}".lower(),
+                ],
+                capture_output=True,
+                text=True,
+            )  # already-exists is fine
 
-        for args in (["docker", "tag", local_tag, remote],
-                     ["docker", "push", remote]):
+        for args in (["docker", "tag", local_tag, remote], ["docker", "push", remote]):
             proc = subprocess.run(args, capture_output=True, text=True)
             if proc.returncode != 0:
                 return None, f"{' '.join(args[:2])}: {proc.stderr.strip()[:200]}"
 
         proc = subprocess.run(
             ["docker", "inspect", "--format", "{{index .RepoDigests 0}}", remote],
-            capture_output=True, text=True)
+            capture_output=True,
+            text=True,
+        )
         if proc.returncode != 0 or "@" not in proc.stdout:
             return None, "pushed but no repo digest resolved"
         return proc.stdout.strip(), None
@@ -928,7 +1002,9 @@ class PerfRuntimePipeline:
     def grounding(self, rec: dict, image_ref: str | None) -> dict:
         """The single derivation source. Everything private is derived from this."""
         files = sorted({m.group(1) for m in re.finditer(r"^\+\+\+ b/(\S+)", rec["patch"], re.M)})
-        symbols = sorted({m.group(1) for m in re.finditer(r"^[-+]\s*def\s+(\w+)", rec["patch"], re.M)})
+        symbols = sorted(
+            {m.group(1) for m in re.finditer(r"^[-+]\s*def\s+(\w+)", rec["patch"], re.M)}
+        )
         covering = list(rec["covering_tests"])
         # One graded assertion per held-out test file, so each can fail on its own.
         # Naming them by a count produced identical duplicates that could not
@@ -958,19 +1034,26 @@ class PerfRuntimePipeline:
                     "measurement discipline applied per requirements/PARAMETERS.md section 9",
                 ],
             },
-            "reference": {"files_touched": files, "symbols": symbols,
-                          "patch_bytes": len(rec["patch"])},
+            "reference": {
+                "files_touched": files,
+                "symbols": symbols,
+                "patch_bytes": len(rec["patch"]),
+            },
             "correctness": {
                 "covering_tests": covering,
                 "test_cmd": self._test_cmd(rec, covering),
                 "behaviour_assertions": asserts,
                 # Path per assertion, so the generated test runs the real file rather
                 # than re-running the covering suite under a different name.
-                "held_out_tests": dict(zip(asserts, held_out)) if held_out else {},
+                # strict: asserts is built one-to-one from held_out above, so a length
+                # mismatch is a bug rather than something to truncate silently.
+                "held_out_tests": dict(zip(asserts, held_out, strict=True)) if held_out else {},
                 "log_parser_type": rec.get("log_parser_type", "pytest"),
             },
-            "rubric_policy": {"judges": ["claude-opus", "claude-sonnet", "claude-haiku"],
-                              "aggregation": "per-criterion majority vote"},
+            "rubric_policy": {
+                "judges": ["claude-opus", "claude-sonnet", "claude-haiku"],
+                "aggregation": "per-criterion majority vote",
+            },
             "truth": self._truth(rec, files, symbols),
         }
 
@@ -995,37 +1078,57 @@ class PerfRuntimePipeline:
         sym = symbols[0] if symbols else "the hot function"
         return {
             "steps": [
-                {"action": "Profile the workload and localize the dominant cost.",
-                 "state": f"The hot path is identified as `{sym}` in `{hot}`.",
-                 "checker": "completion_hotpath_touched"},
-                {"action": "Read the surrounding code and identify the invariant it maintains.",
-                 "state": "The behaviour that must be preserved is known and stated.",
-                 "checker": "instruction_behavior_preserved_claim"},
-                {"action": "Apply the algorithmic or data-structural change that removes the cost.",
-                 "state": "The tree differs from base only inside the implementation.",
-                 "checker": "completion_algorithmic_change"},
-                {"action": "Run the covering tests.",
-                 "state": "Every covering test is green on the patched tree.",
-                 "checker": "test_covering_tests_pass"},
-                {"action": "Re-time the workload under the measurement discipline.",
-                 "state": f"The measured ratio reaches the {round(float(rec['speedup']), 4)}x target.",
-                 "checker": "speed_band_100"},
+                {
+                    "action": "Profile the workload and localize the dominant cost.",
+                    "state": f"The hot path is identified as `{sym}` in `{hot}`.",
+                    "checker": "completion_hotpath_touched",
+                },
+                {
+                    "action": "Read the surrounding code and identify the invariant it maintains.",
+                    "state": "The behaviour that must be preserved is known and stated.",
+                    "checker": "instruction_behavior_preserved_claim",
+                },
+                {
+                    "action": "Apply the algorithmic or data-structural change that removes the cost.",
+                    "state": "The tree differs from base only inside the implementation.",
+                    "checker": "completion_algorithmic_change",
+                },
+                {
+                    "action": "Run the covering tests.",
+                    "state": "Every covering test is green on the patched tree.",
+                    "checker": "test_covering_tests_pass",
+                },
+                {
+                    "action": "Re-time the workload under the measurement discipline.",
+                    "state": f"The measured ratio reaches the {round(float(rec['speedup']), 4)}x target.",
+                    "checker": "speed_band_100",
+                },
             ],
             "rejected_routes": [
-                {"route": "Special-case the workload input and return a precomputed result.",
-                 "why": "The general path is unchanged, so the covering tests that exercise other "
-                        "inputs fail, and the safety criterion triggers its penalty."},
-                {"route": "Edit or weaken the covering tests so the gate passes.",
-                 "why": "The tests arrive at grade time from outside the tree, so an edit inside "
-                        "the repository never reaches the graded set."},
-                {"route": "Patch the clock or the timing harness to report a smaller elapsed value.",
-                 "why": "Clock manipulation is a declared red line and forces zero before any "
-                        "item is scored."},
-                {"route": "Stop at the first passing patch with a shallow gain.",
-                 "why": "Correctness alone earns no speed band. The bands price how much of the "
-                        "expert gain was actually recovered."},
-                {"route": "Write the reward file directly.",
-                 "why": "A declared red line, detected as a state change rather than as intent."},
+                {
+                    "route": "Special-case the workload input and return a precomputed result.",
+                    "why": "The general path is unchanged, so the covering tests that exercise other "
+                    "inputs fail, and the safety criterion triggers its penalty.",
+                },
+                {
+                    "route": "Edit or weaken the covering tests so the gate passes.",
+                    "why": "The tests arrive at grade time from outside the tree, so an edit inside "
+                    "the repository never reaches the graded set.",
+                },
+                {
+                    "route": "Patch the clock or the timing harness to report a smaller elapsed value.",
+                    "why": "Clock manipulation is a declared red line and forces zero before any "
+                    "item is scored.",
+                },
+                {
+                    "route": "Stop at the first passing patch with a shallow gain.",
+                    "why": "Correctness alone earns no speed band. The bands price how much of the "
+                    "expert gain was actually recovered.",
+                },
+                {
+                    "route": "Write the reward file directly.",
+                    "why": "A declared red line, detected as a state change rather than as intent.",
+                },
             ],
         }
 
@@ -1044,7 +1147,8 @@ class PerfRuntimePipeline:
             image_ref = "local/kraken-unbuilt@sha256:" + "0" * 64
         else:
             image_ref, build_error = self.build_image(
-                rec, self.dockerfile(rec), out_dir / ".build" / rec["instance_id"])
+                rec, self.dockerfile(rec), out_dir / ".build" / rec["instance_id"]
+            )
             if build_error:
                 logger.warning("image build failed for %s: %s", rec["instance_id"], build_error)
                 self._skips["image_build_failed"] = self._skips.get("image_build_failed", 0) + 1
@@ -1052,24 +1156,31 @@ class PerfRuntimePipeline:
 
         grounding = self.grounding(rec, image_ref)
         instruction = INSTRUCTION.format(
-            statement=_decontaminate(rec["problem_statement"]), repo_path=REPO_PATH)
+            statement=_decontaminate(rec["problem_statement"]), repo_path=REPO_PATH
+        )
 
-        content_hash = _canonical_hash({
-            "instruction": instruction,
-            "patch": rec["patch"],
-            "workload": rec["workload"],
-            "grounding": grounding,
-            "schema": HARBOR_SCHEMA_VERSION,
-        })
+        content_hash = _canonical_hash(
+            {
+                "instruction": instruction,
+                "patch": rec["patch"],
+                "workload": rec["workload"],
+                "grounding": grounding,
+                "schema": HARBOR_SCHEMA_VERSION,
+            }
+        )
         task_uuid = _task_uuid(content_hash)
 
         # A bundle without a resolved digest would have to rebuild at rollout, which
         # is a pipeline failure rather than a slow path, so it is refused here.
         if not image_ref:
-            self._skips["image_digest_unresolved"] = self._skips.get(
-                "image_digest_unresolved", 0) + 1
-            logger.error("%s: no image digest resolved, refusing to emit a bundle that "
-                         "would rebuild at rollout", rec["instance_id"])
+            self._skips["image_digest_unresolved"] = (
+                self._skips.get("image_digest_unresolved", 0) + 1
+            )
+            logger.error(
+                "%s: no image digest resolved, refusing to emit a bundle that "
+                "would rebuild at rollout",
+                rec["instance_id"],
+            )
             return None
         # The recipe takes no image argument now. The image the target was measured
         # against is still recorded in task.toml, because a rebuilt environment
@@ -1081,7 +1192,8 @@ class PerfRuntimePipeline:
         if bad:
             raise ValueError(
                 "bundle Dockerfile carries unresolved format braces, which docker "
-                f"rejects as a bad substitution: {bad[0].strip()[:80]}")
+                f"rejects as a bad substitution: {bad[0].strip()[:80]}"
+            )
         dockerfile = BUNDLE_DOCKERFILE
 
         aux = {
@@ -1090,8 +1202,7 @@ class PerfRuntimePipeline:
             "tests/grade.py": _asset("_perf_runtime_grade.py"),
             "tests/verify.py": VERIFY_PY.format(repo_path=REPO_PATH),
             "environment/test_patch.diff": rec.get("test_patch") or "",
-            **{f"environment/{name}": body
-               for name, body in self.setup_scripts(rec).items()},
+            **{f"environment/{name}": body for name, body in self.setup_scripts(rec).items()},
             "solution/grounding.yaml": json.dumps(grounding, indent=2, sort_keys=True) + "\n",
             "solution/recompute.py": _asset("_perf_runtime_recompute.py"),
         }
@@ -1127,8 +1238,9 @@ class PerfRuntimePipeline:
         task_dir = write_harbor_task(task, out_dir)
 
         # Derive every private artifact from the single source, in one pass.
-        proc = subprocess.run(["python3", str(task_dir / "solution" / "recompute.py")],
-                              capture_output=True, text=True)
+        proc = subprocess.run(
+            ["python3", str(task_dir / "solution" / "recompute.py")], capture_output=True, text=True
+        )
         if proc.returncode != 0:
             logger.error("recompute failed for %s: %s", rec["instance_id"], proc.stderr[-800:])
             self._skips["recompute_failed"] = self._skips.get("recompute_failed", 0) + 1
@@ -1136,8 +1248,9 @@ class PerfRuntimePipeline:
         (task_dir / "solution" / "patch.diff").write_text(rec["patch"], encoding="utf-8")
         return _Emitted(task_dir=task_dir, uuid=task_uuid, instance_id=rec["instance_id"])
 
-    def emit_calibrated(self, rec: dict, out_dir: Path,
-                        image_ref: str | None = None) -> _Emitted | None:
+    def emit_calibrated(
+        self, rec: dict, out_dir: Path, image_ref: str | None = None
+    ) -> _Emitted | None:
         """Emit provisionally, measure the oracle, then bind the target it reached.
 
         A task whose oracle gain cannot be separated from its own measurement noise is
@@ -1151,8 +1264,7 @@ class PerfRuntimePipeline:
 
         if image_ref:
             covering = list(rec["covering_tests"])
-            baseline = self.baseline_clean(rec, image_ref, covering,
-                                           self._test_cmd(rec, covering))
+            baseline = self.baseline_clean(rec, image_ref, covering, self._test_cmd(rec, covering))
             self._calibration.setdefault(rec["instance_id"], {})["baseline"] = baseline
             if baseline.get("repaired_image"):
                 # Environment repair builds a new image on top of the instance tier,
@@ -1166,13 +1278,18 @@ class PerfRuntimePipeline:
                     # off would leave a bare repo name that resolves to :latest.
                     pushed, error = self._push(registry, rec, image_ref)
                     if error:
-                        logger.warning("%s: repaired image not pushed: %s",
-                                       rec["instance_id"], error)
+                        logger.warning(
+                            "%s: repaired image not pushed: %s", rec["instance_id"], error
+                        )
                     else:
                         image_ref = pushed
             if not baseline["clean"]:
-                logger.warning("%s rejected by the baseline gate: %s (rc=%s)",
-                               rec["instance_id"], baseline["reason"], baseline["returncode"])
+                logger.warning(
+                    "%s rejected by the baseline gate: %s (rc=%s)",
+                    rec["instance_id"],
+                    baseline["reason"],
+                    baseline["returncode"],
+                )
                 key = f"baseline_not_clean:{baseline['reason']}"
                 self._skips[key] = self._skips.get(key, 0) + 1
                 return None
@@ -1182,16 +1299,22 @@ class PerfRuntimePipeline:
             if provisional is None:
                 return None
             image_ref = json.loads(
-                (provisional.task_dir / "solution" / "grounding.yaml").read_text())["image_ref"]
+                (provisional.task_dir / "solution" / "grounding.yaml").read_text()
+            )["image_ref"]
             cal = self.calibrate(provisional.task_dir, image_ref)
 
         self._calibration.setdefault(rec["instance_id"], {}).update(cal)
         if not cal["ok"]:
-            logger.warning("%s rejected by the measurability screen: %s (measured %.4fx, "
-                           "gain %.4f, noise cv %.4f, required gain %.4f)",
-                           rec["instance_id"], cal["reason"], cal.get("measured_speedup", 0.0),
-                           cal.get("gain", 0.0), cal.get("noise_cv", 0.0),
-                           cal.get("required_gain", 0.0))
+            logger.warning(
+                "%s rejected by the measurability screen: %s (measured %.4fx, "
+                "gain %.4f, noise cv %.4f, required gain %.4f)",
+                rec["instance_id"],
+                cal["reason"],
+                cal.get("measured_speedup", 0.0),
+                cal.get("gain", 0.0),
+                cal.get("noise_cv", 0.0),
+                cal.get("required_gain", 0.0),
+            )
             key = f"unmeasurable:{cal['reason']}"
             self._skips[key] = self._skips.get(key, 0) + 1
             return None
@@ -1207,19 +1330,26 @@ class PerfRuntimePipeline:
                 "noise_cv": cal["noise_cv"],
                 "discrimination_margin": cal["discrimination_margin"],
                 "note": "The bound target is what the reference optimization reached in the "
-                        "graded container under the bound discipline. The corpus value was "
-                        "measured on the harvest host and is retained for comparison only.",
+                "graded container under the bound discipline. The corpus value was "
+                "measured on the harvest host and is retained for comparison only.",
             }
-            grounding_path.write_text(json.dumps(grounding, indent=2, sort_keys=True) + "\n",
-                                      encoding="utf-8")
-            subprocess.run(["python3", str(emitted.task_dir / "solution" / "recompute.py")],
-                           capture_output=True, text=True)
+            grounding_path.write_text(
+                json.dumps(grounding, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            subprocess.run(
+                ["python3", str(emitted.task_dir / "solution" / "recompute.py")],
+                capture_output=True,
+                text=True,
+            )
 
             gate = self.verify_endpoints(emitted.task_dir, image_ref)
             self._calibration[rec["instance_id"]]["endpoints"] = gate
             if not gate["ok"]:
-                logger.warning("%s rejected by the endpoint gate: %s",
-                               rec["instance_id"], "; ".join(gate["reasons"]))
+                logger.warning(
+                    "%s rejected by the endpoint gate: %s",
+                    rec["instance_id"],
+                    "; ".join(gate["reasons"]),
+                )
                 key = "endpoint_gate_failed"
                 self._skips[key] = self._skips.get(key, 0) + 1
                 shutil.rmtree(emitted.task_dir, ignore_errors=True)
@@ -1227,7 +1357,6 @@ class PerfRuntimePipeline:
         return emitted
 
     # --- oracle calibration ---------------------------------------------------
-
 
     def repair_environment(self, base_tag: str, tail: str, tag: str) -> tuple:
         """Install exactly the modules the baseline run named as missing, then retry.
@@ -1258,16 +1387,21 @@ class PerfRuntimePipeline:
         # FROM must name a local tag, never a repo@sha256: reference. BuildKit resolves
         # a digest reference through a registry, so a locally built image addressed by
         # digest fails to resolve even though `docker run` accepts it happily.
-        dockerfile = (f"FROM {base_tag}\n"
-                      f'RUN /bin/bash -c "{CONDA_ACTIVATE} && '
-                      f'pip install {" ".join(packages)}"\n')
+        dockerfile = (
+            f"FROM {base_tag}\n"
+            f'RUN /bin/bash -c "{CONDA_ACTIVATE} && '
+            f'pip install {" ".join(packages)}"\n'
+        )
         import tempfile
 
         with tempfile.TemporaryDirectory() as ctx:
             Path(ctx, "Dockerfile").write_text(dockerfile, encoding="utf-8")
             proc = subprocess.run(
                 ["docker", "build", "-q", "-t", tag, "-f", str(Path(ctx, "Dockerfile")), ctx],
-                capture_output=True, text=True, timeout=1800)
+                capture_output=True,
+                text=True,
+                timeout=1800,
+            )
         if proc.returncode != 0:
             logger.warning("environment repair build failed: %s", proc.stderr[-400:])
             return None, packages
@@ -1284,35 +1418,49 @@ class PerfRuntimePipeline:
         """
         proc = subprocess.run(
             ["docker", "run", "--rm", image_ref, "bash", "-c", in_testbed(test_cmd)],
-            capture_output=True, text=True,
-            timeout=getattr(self.options, "calibration_timeout_sec", 1800))
+            capture_output=True,
+            text=True,
+            timeout=getattr(self.options, "calibration_timeout_sec", 1800),
+        )
         full = proc.stdout + proc.stderr
         tail = full[-1200:]
-        collection_error = ("ModuleNotFoundError" in full or "ImportError" in full
-                            or "ERROR collecting" in full)
+        collection_error = (
+            "ModuleNotFoundError" in full or "ImportError" in full or "ERROR collecting" in full
+        )
         repairs, attempts = [], 0
         max_repairs = getattr(self.options, "max_environment_repairs", 4)
         while proc.returncode != 0 and collection_error and attempts < max_repairs:
             attempts += 1
             tag = f"kraken/{rec['instance_id'].lower()}:repair{attempts}"
-            base_tag = (f"kraken.instance.{rec['instance_id'].lower()}:latest" if attempts == 1
-                        else f"kraken/{rec['instance_id'].lower()}:repair{attempts - 1}")
+            base_tag = (
+                f"kraken.instance.{rec['instance_id'].lower()}:latest"
+                if attempts == 1
+                else f"kraken/{rec['instance_id'].lower()}:repair{attempts - 1}"
+            )
             repaired_ref, packages = self.repair_environment(base_tag, full, tag)
             if not repaired_ref:
                 break
             repairs.append({"attempt": attempts, "installed": packages, "image": repaired_ref})
-            logger.info("%s: installed %s to complete the environment",
-                        rec["instance_id"], ", ".join(packages))
+            logger.info(
+                "%s: installed %s to complete the environment",
+                rec["instance_id"],
+                ", ".join(packages),
+            )
             image_ref = repaired_ref
             proc = subprocess.run(
                 ["docker", "run", "--rm", image_ref, "bash", "-c", in_testbed(test_cmd)],
-                capture_output=True, text=True,
-                timeout=getattr(self.options, "calibration_timeout_sec", 1800))
+                capture_output=True,
+                text=True,
+                timeout=getattr(self.options, "calibration_timeout_sec", 1800),
+            )
             full = proc.stdout + proc.stderr
             tail = full[-1200:]
-            collection_error = ("ModuleNotFoundError" in full or "ImportError" in full
-                                or "ERROR collecting" in full
-                                or "unrecognized arguments" in full)
+            collection_error = (
+                "ModuleNotFoundError" in full
+                or "ImportError" in full
+                or "ERROR collecting" in full
+                or "unrecognized arguments" in full
+            )
 
         return {
             "clean": proc.returncode == 0,
@@ -1322,8 +1470,9 @@ class PerfRuntimePipeline:
             "environment_defect": collection_error,
             "repairs": repairs,
             "repaired_image": image_ref if repairs else None,
-            "reason": None if proc.returncode == 0 else (
-                "environment_incomplete" if collection_error else "baseline_tests_fail"),
+            "reason": None
+            if proc.returncode == 0
+            else ("environment_incomplete" if collection_error else "baseline_tests_fail"),
             "tail": tail,
         }
 
@@ -1337,14 +1486,26 @@ class PerfRuntimePipeline:
         trials = getattr(self.options, "stability_trials", 3)
         runs = [self._calibrate_once(bundle, image_ref) for _ in range(trials)]
         good = [r for r in runs if r.get("ok")]
-        attempts = [{"measured_speedup": r.get("measured_speedup"), "gain": r.get("gain"),
-                     "noise_cv": r.get("noise_cv"), "ok": r.get("ok"),
-                     "reason": r.get("reason")} for r in runs]
+        attempts = [
+            {
+                "measured_speedup": r.get("measured_speedup"),
+                "gain": r.get("gain"),
+                "noise_cv": r.get("noise_cv"),
+                "ok": r.get("ok"),
+                "reason": r.get("reason"),
+            }
+            for r in runs
+        ]
 
         if len(good) * 2 <= trials:
             reasons = sorted({r.get("reason") or "unknown" for r in runs if not r.get("ok")})
-            return {"ok": False, "reason": f"unstable_across_trials:{','.join(reasons)}",
-                    "trials": trials, "stable_runs": len(good), "attempts": attempts}
+            return {
+                "ok": False,
+                "reason": f"unstable_across_trials:{','.join(reasons)}",
+                "trials": trials,
+                "stable_runs": len(good),
+                "attempts": attempts,
+            }
 
         import statistics as _st
 
@@ -1362,7 +1523,10 @@ class PerfRuntimePipeline:
         # is its worst observed run less one noise width.
         measured = min(samples) * (1.0 - worst_noise)
         return {
-            "ok": True, "reason": None, "trials": trials, "stable_runs": len(good),
+            "ok": True,
+            "reason": None,
+            "trials": trials,
+            "stable_runs": len(good),
             "measured_speedup": measured,
             "target_basis": "min observed oracle speedup less one noise width",
             "observed_samples": samples,
@@ -1399,9 +1563,12 @@ class PerfRuntimePipeline:
                 continue
             golden.append(run)
         if len(golden) < trials:
-            return {"ok": False, "reasons": [f"could_not_obtain_{trials}_measurable_runs:"
-                                             f"{voids}_voids"], "voids": voids,
-                    "golden_rewards": [r.get("reward") for r in golden]}
+            return {
+                "ok": False,
+                "reasons": [f"could_not_obtain_{trials}_measurable_runs:{voids}_voids"],
+                "voids": voids,
+                "golden_rewards": [r.get("reward") for r in golden],
+            }
         empty = self._run_bundle(bundle, image_ref, "bash /tests/test.sh")
 
         rewards = [r.get("reward") for r in golden]
@@ -1417,27 +1584,50 @@ class PerfRuntimePipeline:
         if not floor:
             reasons.append(f"empty_endpoint_wrong:{empty.get('reward')}:{empty.get('reason')}")
 
-        return {"ok": not reasons, "reasons": reasons, "voids": voids,
-                "golden_rewards": rewards,
-                "empty_reward": empty.get("reward"), "empty_reason": empty.get("reason"),
-                "golden_speedups": [r.get("measured_speedup") for r in golden]}
+        return {
+            "ok": not reasons,
+            "reasons": reasons,
+            "voids": voids,
+            "golden_rewards": rewards,
+            "empty_reward": empty.get("reward"),
+            "empty_reason": empty.get("reason"),
+            "golden_speedups": [r.get("measured_speedup") for r in golden],
+        }
 
     def _run_bundle(self, bundle: Path, image_ref: str, command: str) -> dict:
         import tempfile
 
         with tempfile.TemporaryDirectory() as logs:
             proc = subprocess.run(
-                ["docker", "run", "--rm",
-                 "-v", f"{bundle / 'tests'}:/tests:ro",
-                 "-v", f"{bundle / 'solution'}:/solution:ro",
-                 "-v", f"{bundle / 'environment'}:/environment:ro",
-                 "-v", f"{logs}:/logs", image_ref, "bash", "-c", command],
-                capture_output=True, text=True,
-                timeout=getattr(self.options, "calibration_timeout_sec", 1800))
+                [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "-v",
+                    f"{bundle / 'tests'}:/tests:ro",
+                    "-v",
+                    f"{bundle / 'solution'}:/solution:ro",
+                    "-v",
+                    f"{bundle / 'environment'}:/environment:ro",
+                    "-v",
+                    f"{logs}:/logs",
+                    image_ref,
+                    "bash",
+                    "-c",
+                    command,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=getattr(self.options, "calibration_timeout_sec", 1800),
+            )
             result_path = Path(logs) / "verifier" / "result.json"
             if not result_path.exists():
-                logger.error("bundle run produced no result: rc=%s stderr=%s stdout=%s",
-                             proc.returncode, proc.stderr[-600:], proc.stdout[-300:])
+                logger.error(
+                    "bundle run produced no result: rc=%s stderr=%s stdout=%s",
+                    proc.returncode,
+                    proc.stderr[-600:],
+                    proc.stdout[-300:],
+                )
                 return {"reward": None, "reason": "no_result"}
             return json.loads(result_path.read_text())
 
@@ -1453,22 +1643,44 @@ class PerfRuntimePipeline:
 
         with tempfile.TemporaryDirectory() as logs:
             proc = subprocess.run(
-                ["docker", "run", "--rm",
-                 "-v", f"{bundle / 'tests'}:/tests:ro",
-                 "-v", f"{bundle / 'solution'}:/solution:ro",
-                 "-v", f"{bundle / 'environment'}:/environment:ro",
-                 "-v", f"{logs}:/logs", image_ref, "bash", "/solution/solve.sh"],
-                capture_output=True, text=True,
-                timeout=getattr(self.options, "calibration_timeout_sec", 1800))
+                [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "-v",
+                    f"{bundle / 'tests'}:/tests:ro",
+                    "-v",
+                    f"{bundle / 'solution'}:/solution:ro",
+                    "-v",
+                    f"{bundle / 'environment'}:/environment:ro",
+                    "-v",
+                    f"{logs}:/logs",
+                    image_ref,
+                    "bash",
+                    "/solution/solve.sh",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=getattr(self.options, "calibration_timeout_sec", 1800),
+            )
             result_path = Path(logs) / "verifier" / "result.json"
             if not result_path.exists():
-                return {"ok": False, "reason": "oracle_produced_no_result",
-                        "stderr": proc.stderr[-800:]}
+                return {
+                    "ok": False,
+                    "reason": "oracle_produced_no_result",
+                    "stderr": proc.stderr[-800:],
+                }
             result = json.loads(result_path.read_text())
-            base = json.loads((Path(logs) / "verifier" / "baseline.out").read_text()) \
-                if (Path(logs) / "verifier" / "baseline.out").exists() else {}
-            opt = json.loads((Path(logs) / "verifier" / "optimized.out").read_text()) \
-                if (Path(logs) / "verifier" / "optimized.out").exists() else {}
+            base = (
+                json.loads((Path(logs) / "verifier" / "baseline.out").read_text())
+                if (Path(logs) / "verifier" / "baseline.out").exists()
+                else {}
+            )
+            opt = (
+                json.loads((Path(logs) / "verifier" / "optimized.out").read_text())
+                if (Path(logs) / "verifier" / "optimized.out").exists()
+                else {}
+            )
 
         if result.get("reason"):
             return {"ok": False, "reason": f"oracle_capped:{result['reason']}"}
@@ -1504,7 +1716,8 @@ class PerfRuntimePipeline:
             for index, rec in enumerate(records, start=1):
                 logger.info("building image %d/%d for %s", index, len(records), rec["instance_id"])
                 image_ref, error = self.build_image(
-                    rec, self.dockerfile(rec), out_dir / ".build" / rec["instance_id"])
+                    rec, self.dockerfile(rec), out_dir / ".build" / rec["instance_id"]
+                )
                 if error:
                     logger.error("image build failed for %s: %s", rec["instance_id"], error)
                     self._skips["image_build_failed"] = self._skips.get("image_build_failed", 0) + 1
@@ -1514,8 +1727,12 @@ class PerfRuntimePipeline:
         # The barrier. Everything after this point is measurement.
         quiet = wait_for_quiet() if prebuilt else {"quiet": True, "skipped": "no builds ran"}
         self._quiescence = quiet
-        logger.info("quiescence: %s after %ss, load %s", quiet.get("quiet"),
-                    quiet.get("waited_seconds"), (quiet.get("load") or {}).get("per_cpu"))
+        logger.info(
+            "quiescence: %s after %ss, load %s",
+            quiet.get("quiet"),
+            quiet.get("waited_seconds"),
+            (quiet.get("load") or {}).get("per_cpu"),
+        )
 
         # Stage 2: calibrate, gate, and emit, one instance at a time on a quiet host.
         emitted = []
@@ -1536,5 +1753,9 @@ class PerfRuntimePipeline:
         }
         (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         return PipelineResult(
-            candidates=len(records), emitted=len(emitted),
-            skipped=sum(self._skips.values()), out_dir=out_dir, skip_reasons=self._skips)
+            candidates=len(records),
+            emitted=len(emitted),
+            skipped=sum(self._skips.values()),
+            out_dir=out_dir,
+            skip_reasons=self._skips,
+        )

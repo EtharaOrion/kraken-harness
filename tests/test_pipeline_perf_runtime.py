@@ -45,6 +45,7 @@ diff --git a/x.py b/x.py
 
 # --- registration -------------------------------------------------------------
 
+
 def test_pipeline_is_registered():
     assert PIPELINES["perf_runtime"] is PerfRuntimePipeline
     assert OPTIONS_REGISTRY["perf_runtime"] is PerfRuntimeOptions
@@ -56,6 +57,7 @@ def test_declares_no_bootstrap():
 
 
 # --- diff validation ----------------------------------------------------------
+
 
 def test_well_formed_patch_accepted():
     assert diff_problems(WELL_FORMED) == []
@@ -81,10 +83,11 @@ def test_empty_patch_rejected():
 
 # --- timing parser ------------------------------------------------------------
 
+
 @pytest.mark.parametrize(
     ("stdout", "expected"),
     [
-        ("Mean: 0.026431\nStd Dev: 0.000812", 0.026431),   # the corpus convention
+        ("Mean: 0.026431\nStd Dev: 0.000812", 0.026431),  # the corpus convention
         ('{"elapsed": 1.5}', 1.5),
         ("Median: 2.25\nStd Dev: 9.9", 2.25),
         ("ran\n0.9931", 0.9931),
@@ -101,6 +104,7 @@ def test_parse_timing_refuses_to_guess():
 
 # --- reward composition -------------------------------------------------------
 
+
 @pytest.fixture()
 def grade_module():
     sys.path.insert(0, str(ASSETS))
@@ -112,17 +116,31 @@ def grade_module():
 
 
 def _weights():
-    return {"speed_band_25": 6.0, "speed_band_50": 8.0, "speed_band_75": 10.0,
-            "speed_band_100": 14.0, "test_behaviour_1": 5.0, "rub_ok": 2.0, "rub_pen": -6.0}
+    return {
+        "speed_band_25": 6.0,
+        "speed_band_50": 8.0,
+        "speed_band_75": 10.0,
+        "speed_band_100": 14.0,
+        "test_behaviour_1": 5.0,
+        "rub_ok": 2.0,
+        "rub_pen": -6.0,
+    }
 
 
-def _grade(G, speedup, *, target=2.0, correctness=True, patch="+ real\n", stable=True,
-           rubric=None, **kw):
-    return G.grade(patch=patch, applied=True, correctness_passed=correctness,
-                   measurement={"speedup": speedup, "stable": stable}, target=target,
-                   weights=_weights(),
-                   pytest_results={"test_behaviour_1": "PASSED" if correctness else "FAILED"},
-                   rubric_results=rubric if rubric is not None else {}, **kw)
+def _grade(
+    G, speedup, *, target=2.0, correctness=True, patch="+ real\n", stable=True, rubric=None, **kw
+):
+    return G.grade(
+        patch=patch,
+        applied=True,
+        correctness_passed=correctness,
+        measurement={"speedup": speedup, "stable": stable},
+        target=target,
+        weights=_weights(),
+        pytest_results={"test_behaviour_1": "PASSED" if correctness else "FAILED"},
+        rubric_results=rubric if rubric is not None else {},
+        **kw,
+    )
 
 
 def test_golden_endpoint_is_exactly_one(grade_module):
@@ -131,9 +149,15 @@ def test_golden_endpoint_is_exactly_one(grade_module):
 
 def test_empty_endpoint_is_exactly_zero(grade_module):
     result = grade_module.grade(
-        patch="", applied=True, correctness_passed=True,
-        measurement={"speedup": 2.0, "stable": True}, target=2.0, weights=_weights(),
-        pytest_results={}, rubric_results={})
+        patch="",
+        applied=True,
+        correctness_passed=True,
+        measurement={"speedup": 2.0, "stable": True},
+        target=2.0,
+        weights=_weights(),
+        pytest_results={},
+        rubric_results={},
+    )
     assert result["reward"] == 0.0
     assert result["reason"] == "empty_or_noop_patch"
 
@@ -203,10 +227,15 @@ def test_penalty_criterion_cancels_earned_points(grade_module):
 
 def test_reward_never_falls_below_zero(grade_module):
     result = grade_module.grade(
-        patch="+ x\n", applied=True, correctness_passed=True,
-        measurement={"speedup": 1.0, "stable": True}, target=2.0,
+        patch="+ x\n",
+        applied=True,
+        correctness_passed=True,
+        measurement={"speedup": 1.0, "stable": True},
+        target=2.0,
         weights={"rub_pen": -100.0, "speed_band_25": 1.0},
-        pytest_results={}, rubric_results={"rub_pen": True})
+        pytest_results={},
+        rubric_results={"rub_pen": True},
+    )
     assert result["reward"] == 0.0
 
 
@@ -217,30 +246,45 @@ def test_grading_is_deterministic(grade_module):
 
 # --- recompute determinism ----------------------------------------------------
 
+
 def test_recompute_regenerates_byte_identically(tmp_path):
     """The generated truth, fixtures, weights, and oracle must not drift on re-run."""
     bundle = tmp_path / "b"
     (bundle / "solution").mkdir(parents=True)
     (bundle / "tests").mkdir()
     grounding = {
-        "instance_id": "demo-1", "repo": "demo/repo", "base_commit": "abc123",
-        "repo_path": "/testbed", "workload_path": "/tests/workload.py",
-        "target_speedup": 1.5, "image_ref": "demo@sha256:" + "a" * 64,
+        "instance_id": "demo-1",
+        "repo": "demo/repo",
+        "base_commit": "abc123",
+        "repo_path": "/testbed",
+        "workload_path": "/tests/workload.py",
+        "target_speedup": 1.5,
+        "image_ref": "demo@sha256:" + "a" * 64,
         "provenance": {"origin": "derived", "provenance_date": "2025-01-01"},
         "reference": {"files_touched": ["pkg/mod.py"], "symbols": ["hot"], "patch_bytes": 10},
-        "correctness": {"covering_tests": ["tests/test_a.py"], "test_cmd": "pytest tests/test_a.py",
-                        "behaviour_assertions": ["test_behaviour_1"], "log_parser_type": "pytest"},
+        "correctness": {
+            "covering_tests": ["tests/test_a.py"],
+            "test_cmd": "pytest tests/test_a.py",
+            "behaviour_assertions": ["test_behaviour_1"],
+            "log_parser_type": "pytest",
+        },
         "rubric_policy": {"judges": ["a", "b", "c"], "aggregation": "per-criterion majority vote"},
-        "truth": {"steps": [{"action": "a", "state": "s", "checker": "c"}],
-                  "rejected_routes": [{"route": "r", "why": "w"}]},
+        "truth": {
+            "steps": [{"action": "a", "state": "s", "checker": "c"}],
+            "rejected_routes": [{"route": "r", "why": "w"}],
+        },
     }
     (bundle / "solution" / "grounding.yaml").write_text(json.dumps(grounding), encoding="utf-8")
     (bundle / "solution" / "recompute.py").write_text(
-        (ASSETS / "_perf_runtime_recompute.py").read_text(encoding="utf-8"), encoding="utf-8")
+        (ASSETS / "_perf_runtime_recompute.py").read_text(encoding="utf-8"), encoding="utf-8"
+    )
 
     def run():
-        proc = subprocess.run([sys.executable, str(bundle / "solution" / "recompute.py")],
-                              capture_output=True, text=True)
+        proc = subprocess.run(
+            [sys.executable, str(bundle / "solution" / "recompute.py")],
+            capture_output=True,
+            text=True,
+        )
         assert proc.returncode == 0, proc.stderr
         return {p.name: p.read_bytes() for p in sorted(bundle.rglob("*")) if p.is_file()}
 

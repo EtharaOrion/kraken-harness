@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import re
-import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,7 +42,7 @@ def check_patch(patch: str) -> list:
             line = lines[i]
             if HUNK.match(line) or line.startswith("diff --git"):
                 break
-            if line.startswith("\\"):          # "\ No newline at end of file"
+            if line.startswith("\\"):  # "\ No newline at end of file"
                 i += 1
                 continue
             if line.startswith("-"):
@@ -55,11 +54,16 @@ def check_patch(patch: str) -> list:
                 new += 1
             i += 1
         if old != want_old or new != want_new:
-            problems.append({
-                "hunk": hunk_index, "header": m.group(0),
-                "declared_old": want_old, "counted_old": old,
-                "declared_new": want_new, "counted_new": new,
-            })
+            problems.append(
+                {
+                    "hunk": hunk_index,
+                    "header": m.group(0),
+                    "declared_old": want_old,
+                    "counted_old": old,
+                    "declared_new": want_new,
+                    "counted_new": new,
+                }
+            )
     if not patch.strip():
         problems.append({"reason": "empty_patch"})
     return problems
@@ -74,27 +78,33 @@ def main() -> int:
             rec = json.loads(line)
             problems = check_patch(rec["patch"])
             test_problems = check_patch(rec["test_patch"]) if rec.get("test_patch") else []
-            rows.append({
-                "instance_id": rec["instance_id"],
-                "repo": rec["repo"],
-                "corpus_speedup": rec["speedup"],
-                "patch_ok": not problems,
-                "patch_problems": problems,
-                "test_patch_ok": not test_problems,
-                "test_patch_problems": test_problems,
-            })
+            rows.append(
+                {
+                    "instance_id": rec["instance_id"],
+                    "repo": rec["repo"],
+                    "corpus_speedup": rec["speedup"],
+                    "patch_ok": not problems,
+                    "patch_problems": problems,
+                    "test_patch_ok": not test_problems,
+                    "test_patch_problems": test_problems,
+                }
+            )
             if problems or test_problems:
                 bad += 1
 
     out = ROOT / "harvest" / "validation.json"
-    out.write_text(json.dumps({"records": len(rows), "malformed": bad, "instances": rows},
-                              indent=2), encoding="utf-8")
+    out.write_text(
+        json.dumps({"records": len(rows), "malformed": bad, "instances": rows}, indent=2),
+        encoding="utf-8",
+    )
     print(f"records {len(rows)}  malformed {bad}\n")
     for row in rows:
         if row["patch_ok"] and row["test_patch_ok"]:
             continue
-        print(f"  {row['instance_id']:34} patch_ok={row['patch_ok']} "
-              f"test_patch_ok={row['test_patch_ok']}")
+        print(
+            f"  {row['instance_id']:34} patch_ok={row['patch_ok']} "
+            f"test_patch_ok={row['test_patch_ok']}"
+        )
         for p in row["patch_problems"] + row["test_patch_problems"]:
             print(f"      {p}")
     return 0

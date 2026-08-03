@@ -124,9 +124,14 @@ def parse_timing(stdout: str) -> float:
     raise RuntimeError("workload emitted no parsable timing on stdout")
 
 
-def time_condition(workload: Path, cwd: Path, *, trials: int = FLAKINESS_TRIALS,
-                   warmup: int = WARMUP_INVOCATIONS,
-                   timeout: int = WINDOW_CEILING_SECONDS) -> dict:
+def time_condition(
+    workload: Path,
+    cwd: Path,
+    *,
+    trials: int = FLAKINESS_TRIALS,
+    warmup: int = WARMUP_INVOCATIONS,
+    timeout: int = WINDOW_CEILING_SECONDS,
+) -> dict:
     """Time one condition under the full discipline and report its stability."""
     for _ in range(warmup):
         try:
@@ -155,8 +160,9 @@ def time_condition(workload: Path, cwd: Path, *, trials: int = FLAKINESS_TRIALS,
     }
 
 
-def measure_speedup(workload: Path, repo: Path, *, baseline_ref: str,
-                    trials: int = FLAKINESS_TRIALS) -> dict:
+def measure_speedup(
+    workload: Path, repo: Path, *, baseline_ref: str, trials: int = FLAKINESS_TRIALS
+) -> dict:
     """Time the optimized tree, reset to base, time the baseline, and ratio them.
 
     Order matters: both conditions run on the same container, back to back, with the
@@ -166,14 +172,20 @@ def measure_speedup(workload: Path, repo: Path, *, baseline_ref: str,
 
     with tempfile.TemporaryDirectory() as stash:
         patch = Path(stash) / "submission.diff"
-        subprocess.run(["git", "-C", str(repo), "diff", baseline_ref],
-                       stdout=patch.open("w"), text=True, check=False)
-        subprocess.run(["git", "-C", str(repo), "checkout", "--", "."], check=False,
-                       capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "diff", baseline_ref],
+            stdout=patch.open("w"),
+            text=True,
+            check=False,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "checkout", "--", "."], check=False, capture_output=True
+        )
         baseline = time_condition(workload, repo, trials=trials)
         if patch.stat().st_size:
-            subprocess.run(["git", "-C", str(repo), "apply", str(patch)], check=False,
-                           capture_output=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "apply", str(patch)], check=False, capture_output=True
+            )
 
     ratio = (baseline["value"] / optimized["value"]) if optimized["value"] > 0 else 0.0
     stable = optimized["stable"] and baseline["stable"]

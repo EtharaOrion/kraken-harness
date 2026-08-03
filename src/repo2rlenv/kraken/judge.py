@@ -62,14 +62,18 @@ Rules:
 
 
 def call_judge(model: str, prompt: str, timeout: int = 120) -> str | None:
-    body = json.dumps({
-        "model": model,
-        "max_tokens": 400,
-        "messages": [{"role": "user", "content": prompt}],
-    }).encode("utf-8")
+    body = json.dumps(
+        {
+            "model": model,
+            "max_tokens": 400,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+    ).encode("utf-8")
     req = urllib.request.Request(
-        PROXY, data=body,
-        headers={"content-type": "application/json", "anthropic-version": "2023-06-01"})
+        PROXY,
+        data=body,
+        headers={"content-type": "application/json", "anthropic-version": "2023-06-01"},
+    )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             payload = json.loads(resp.read())
@@ -87,7 +91,7 @@ def parse_verdict(text: str | None, evidence: str) -> dict | None:
     if start < 0 or end <= start:
         return None
     try:
-        doc = json.loads(text[start:end + 1])
+        doc = json.loads(text[start : end + 1])
     except json.JSONDecodeError:
         return None
     verdict = str(doc.get("verdict", "")).strip().lower()
@@ -98,8 +102,12 @@ def parse_verdict(text: str | None, evidence: str) -> dict | None:
     if verdict == "award" and not cited:
         # An award with no verifiable citation does not count. A withhold needs no
         # citation, because it asserts an absence rather than a fact in the bytes.
-        return {"verdict": None, "citation": citation, "cited": False,
-                "reason": "award_without_verifiable_citation"}
+        return {
+            "verdict": None,
+            "citation": citation,
+            "cited": False,
+            "reason": "award_without_verifiable_citation",
+        }
     return {"verdict": verdict, "citation": citation, "cited": cited}
 
 
@@ -116,7 +124,7 @@ def _normalize_for_citation(text: str) -> str:
     Unescape the JSON forms and flatten runs of whitespace, so grounding still means the
     words are really there while formatting stops deciding the vote.
     """
-    for escaped, plain in (("\\r\\n", " "), ("\\n", " "), ("\\t", " "), ("\\\"", '"')):
+    for escaped, plain in (("\\r\\n", " "), ("\\n", " "), ("\\t", " "), ('\\"', '"')):
         text = text.replace(escaped, plain)
     return " ".join(text.split())
 
@@ -136,10 +144,13 @@ def agreement(votes: list) -> dict:
     pairs = list(combinations(usable, 2))
     raw = sum(1 for a, b in pairs if a == b) / len(pairs)
     p_award = sum(1 for v in usable if v == "award") / len(usable)
-    chance = p_award ** 2 + (1 - p_award) ** 2
+    chance = p_award**2 + (1 - p_award) ** 2
     kappa = (raw - chance) / (1 - chance) if chance < 1 else None
-    return {"pairs": len(pairs), "raw": round(raw, 4),
-            "chance_corrected": None if kappa is None else round(kappa, 4)}
+    return {
+        "pairs": len(pairs),
+        "raw": round(raw, 4),
+        "chance_corrected": None if kappa is None else round(kappa, 4),
+    }
 
 
 def evidence_window(evidence: str, budget: int = MAX_EVIDENCE) -> str:
@@ -169,8 +180,12 @@ def evidence_window(evidence: str, budget: int = MAX_EVIDENCE) -> str:
 def score_criterion(crit: dict, evidence: str, rng: random.Random) -> dict:
     kind = crit.get("check", "final_answer")
     if not evidence.strip():
-        return {"id": crit["id"], "result": None, "reason": f"no_{kind}_evidence_recorded",
-                "votes": []}
+        return {
+            "id": crit["id"],
+            "result": None,
+            "reason": f"no_{kind}_evidence_recorded",
+            "votes": [],
+        }
 
     shown = evidence_window(evidence)
     votes, detail = [], []
@@ -178,31 +193,50 @@ def score_criterion(crit: dict, evidence: str, rng: random.Random) -> dict:
         # Position randomization: the two options are presented in a random order per
         # judge, so a judge that simply prefers whatever comes first is visible.
         first, second = ("award", "withhold") if rng.random() < 0.5 else ("withhold", "award")
-        prompt = PROMPT.format(description=crit["description"], evidence_kind=kind,
-                               evidence=shown, first=first, second=second)
+        prompt = PROMPT.format(
+            description=crit["description"],
+            evidence_kind=kind,
+            evidence=shown,
+            first=first,
+            second=second,
+        )
         # Verify the citation against what the judge was actually shown, not against the
         # full evidence. Checking the full text would accept a citation drawn from the
         # elided middle, which the judge could not have read and therefore did not cite.
         parsed = parse_verdict(call_judge(model, prompt), shown)
-        detail.append({"judge": model, "order": [first, second],
-                       **(parsed or {"verdict": None, "reason": "unparsable_or_unreachable"})})
+        detail.append(
+            {
+                "judge": model,
+                "order": [first, second],
+                **(parsed or {"verdict": None, "reason": "unparsable_or_unreachable"}),
+            }
+        )
         votes.append((parsed or {}).get("verdict"))
 
     usable = [v for v in votes if v in ("award", "withhold")]
     if len(usable) < 2:
-        return {"id": crit["id"], "result": None, "reason": "fewer_than_two_valid_verdicts",
-                "votes": detail, "agreement": agreement(votes)}
+        return {
+            "id": crit["id"],
+            "result": None,
+            "reason": "fewer_than_two_valid_verdicts",
+            "votes": detail,
+            "agreement": agreement(votes),
+        }
     awards = sum(1 for v in usable if v == "award")
-    return {"id": crit["id"], "result": awards * 2 > len(usable), "votes": detail,
-            "agreement": agreement(votes)}
+    return {
+        "id": crit["id"],
+        "result": awards * 2 > len(usable),
+        "votes": detail,
+        "agreement": agreement(votes),
+    }
 
 
 def run(*, bundle: Path, logs: Path, seed: int = 17) -> int:
     """Importable entry. `kraken grade` calls this rather than re-entering argparse."""
     import sys as _sys
+
     argv = _sys.argv
-    _sys.argv = ["kraken-judge", "--bundle", str(bundle), "--logs", str(logs),
-                 "--seed", str(seed)]
+    _sys.argv = ["kraken-judge", "--bundle", str(bundle), "--logs", str(logs), "--seed", str(seed)]
     try:
         return main()
     finally:
@@ -227,7 +261,11 @@ def main() -> int:
         print(f"run capped at 0.0 by {result['reason']}; the rubric channel is not consulted")
         return 0
 
-    patch = (verifier / "agent_patch.diff").read_text() if (verifier / "agent_patch.diff").exists() else ""
+    patch = (
+        (verifier / "agent_patch.diff").read_text()
+        if (verifier / "agent_patch.diff").exists()
+        else ""
+    )
     trajectory = ""
     for candidate in ("trajectory.json", "trajectory.txt", "agent/trajectory.json"):
         p = logs / candidate
@@ -245,20 +283,31 @@ def main() -> int:
     unscored = [row["id"] for row in scored if row["result"] is None]
 
     sys.path.insert(0, str(bundle / "tests"))
-    import grade as G  # noqa: E402
+    import grade as G
 
     recomposed = G.grade(
-        patch=patch, applied=True, correctness_passed=True,
+        patch=patch,
+        applied=True,
+        correctness_passed=True,
         measurement={"speedup": result.get("measured_speedup"), "stable": True},
-        target=targets["target_speedup"], weights=weights,
-        pytest_results={i["item_id"]: ("PASSED" if i["passed"] else "FAILED")
-                        for i in result.get("items", []) if i.get("channel") == "pytest"},
-        rubric_results=rubric_results)
+        target=targets["target_speedup"],
+        weights=weights,
+        pytest_results={
+            i["item_id"]: ("PASSED" if i["passed"] else "FAILED")
+            for i in result.get("items", [])
+            if i.get("channel") == "pytest"
+        },
+        rubric_results=rubric_results,
+    )
 
-    agreements = [row["agreement"]["raw"] for row in scored
-                  if row.get("agreement", {}).get("raw") is not None]
-    corrected = [row["agreement"]["chance_corrected"] for row in scored
-                 if row.get("agreement", {}).get("chance_corrected") is not None]
+    agreements = [
+        row["agreement"]["raw"] for row in scored if row.get("agreement", {}).get("raw") is not None
+    ]
+    corrected = [
+        row["agreement"]["chance_corrected"]
+        for row in scored
+        if row.get("agreement", {}).get("chance_corrected") is not None
+    ]
     report = {
         "judges": list(JUDGES),
         "aggregation": "per-criterion majority vote over valid cited verdicts",
@@ -267,9 +316,11 @@ def main() -> int:
         "unscored": unscored,
         "inter_rater_agreement": {
             "raw_mean": round(sum(agreements) / len(agreements), 4) if agreements else None,
-            "chance_corrected_mean": round(sum(corrected) / len(corrected), 4) if corrected else None,
+            "chance_corrected_mean": round(sum(corrected) / len(corrected), 4)
+            if corrected
+            else None,
             "note": "Raw agreement overstates reliability. The chance-corrected figure is the "
-                    "one to read (arXiv 2606.19544).",
+            "one to read (arXiv 2606.19544).",
         },
         "criteria": scored,
         "reward_before_rubric": result.get("reward"),
@@ -278,13 +329,18 @@ def main() -> int:
     (verifier / "rubric_results.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     (verifier / "reward.txt").write_text(f"{recomposed['reward']:.4f}\n", encoding="utf-8")
     recomposed["rubric_phase"] = "two_phase_judge_pass"
-    (verifier / "result.json").write_text(json.dumps(recomposed, indent=2, default=str),
-                                          encoding="utf-8")
+    (verifier / "result.json").write_text(
+        json.dumps(recomposed, indent=2, default=str), encoding="utf-8"
+    )
 
-    print(f"criteria {report['criteria_scored']}/{report['criteria_total']} scored, "
-          f"unscored {len(unscored)}")
-    print(f"agreement raw {report['inter_rater_agreement']['raw_mean']} "
-          f"chance-corrected {report['inter_rater_agreement']['chance_corrected_mean']}")
+    print(
+        f"criteria {report['criteria_scored']}/{report['criteria_total']} scored, "
+        f"unscored {len(unscored)}"
+    )
+    print(
+        f"agreement raw {report['inter_rater_agreement']['raw_mean']} "
+        f"chance-corrected {report['inter_rater_agreement']['chance_corrected_mean']}"
+    )
     print(f"reward {report['reward_before_rubric']} -> {report['reward_after_rubric']}")
     return 0
 

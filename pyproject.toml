@@ -116,7 +116,11 @@ exclude_lines = [
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-extend-exclude = ["references", "envs", "envs-*", "datasets", "plans"]
+# tests/fixtures holds generated artifacts that are copied verbatim into emitted
+# tasks. Their header says "Auto-generated"; linting them as project source
+# reformats data and the reformatting never reaches the generator that made it.
+extend-exclude = ["references", "envs", "envs-*", "datasets", "plans",
+                  "tests/fixtures"]
 
 [tool.ruff.lint]
 # A practical-not-pedantic preset for a research repo:

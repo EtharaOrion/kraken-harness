@@ -530,13 +530,13 @@ class PerfRuntimeOptions(_BaseOptions):
     covering tests, the timed workload, and the measured expert speedup.
     """
 
-    corpus: str = "harvest"           # directory of *.jsonl, or a single file
-    repos: list[str] = []             # restrict to these repos; empty means all
-    instances: list[str] = []         # restrict to these instance ids; empty means all
-    limit: int = 0                    # 0 means every admissible record
-    skip_image_build: bool = False    # emit bundles without building images
+    corpus: str = "harvest"  # directory of *.jsonl, or a single file
+    repos: list[str] = []  # restrict to these repos; empty means all
+    instances: list[str] = []  # restrict to these instance ids; empty means all
+    limit: int = 0  # 0 means every admissible record
+    skip_image_build: bool = False  # emit bundles without building images
     build_timeout_sec: int = 3600
-    skip_calibration: bool = False    # emit without measuring the oracle first
+    skip_calibration: bool = False  # emit without measuring the oracle first
     calibration_timeout_sec: int = 1800
     # A task ships only when the oracle gain exceeds this multiple of its own
     # measurement noise, so the target is separable from the host rather than

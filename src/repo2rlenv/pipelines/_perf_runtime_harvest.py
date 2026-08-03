@@ -24,6 +24,7 @@ A record that reaches the emitter incomplete is rejected by REQUIRED_FIELDS with
 field named. That is the intended behaviour: this stage produces candidates, and
 admission stays with the measurement gates.
 """
+
 from __future__ import annotations
 
 import json
@@ -57,9 +58,10 @@ TEST_PATH = re.compile(r"(^|/)(tests?|testing)/|(^|/)test_[^/]+\.py$|_test\.py$"
 @dataclass
 class Candidate:
     """One mined PR, before enrichment."""
+
     record: dict
-    reasons: list[str]          # why it was kept
-    missing: list[str]          # fields a scrape cannot fill
+    reasons: list[str]  # why it was kept
+    missing: list[str]  # fields a scrape cannot fill
 
 
 def is_perf_candidate(pr: PullRequestSummary) -> tuple[bool, list[str]]:
@@ -116,12 +118,19 @@ def clone_at(repo: str, sha: str, dest: Path, *, depth: int = 1) -> Path | None:
     url = f"https://github.com/{repo}.git"
     try:
         subprocess.run(["git", "init", "-q"], cwd=dest, check=True, capture_output=True)
-        subprocess.run(["git", "remote", "add", "origin", url], cwd=dest,
-                       check=True, capture_output=True)
-        subprocess.run(["git", "fetch", "-q", "--depth", str(depth), "origin", sha],
-                       cwd=dest, check=True, capture_output=True, timeout=300)
-        subprocess.run(["git", "checkout", "-q", "FETCH_HEAD"], cwd=dest,
-                       check=True, capture_output=True)
+        subprocess.run(
+            ["git", "remote", "add", "origin", url], cwd=dest, check=True, capture_output=True
+        )
+        subprocess.run(
+            ["git", "fetch", "-q", "--depth", str(depth), "origin", sha],
+            cwd=dest,
+            check=True,
+            capture_output=True,
+            timeout=300,
+        )
+        subprocess.run(
+            ["git", "checkout", "-q", "FETCH_HEAD"], cwd=dest, check=True, capture_output=True
+        )
         return dest
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         log.warning("clone failed for %s@%s: %s", repo, sha[:12], exc)
@@ -170,12 +179,14 @@ def synthesize_workload(repo: str, surface: str, entrypoints: list[str], spec) -
             spec,
             system=WORKLOAD_SYSTEM,
             user=WORKLOAD_PROMPT.format(
-                repo=repo, surface=surface[:4000],
-                entrypoints="\n".join(f"- {e}" for e in entrypoints[:40]) or "- (none detected)"),
+                repo=repo,
+                surface=surface[:4000],
+                entrypoints="\n".join(f"- {e}" for e in entrypoints[:40]) or "- (none detected)",
+            ),
             max_tokens=2048,
             temperature=0.2,
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log.warning("workload synthesis failed for %s: %s", repo, exc)
         return None
 
@@ -201,13 +212,18 @@ def _surface(repo_dir: Path, changed: list[str], limit: int = 3) -> tuple[str, l
         cls = re.findall(r"^class ([A-Z]\w*)", text, re.M)
         entry += [f"{rel}::{s}" for s in sigs if not s.startswith("_")][:12]
         entry += [f"{rel}::{c}" for c in cls][:8]
-        parts.append(f"# {rel}\n" + "\n".join(f"class {c}" for c in cls[:8])
-                     + "\n" + "\n".join(f"def {s}(...)" for s in sigs[:20]))
+        parts.append(
+            f"# {rel}\n"
+            + "\n".join(f"class {c}" for c in cls[:8])
+            + "\n"
+            + "\n".join(f"def {s}(...)" for s in sigs[:20])
+        )
     return "\n\n".join(parts), entry
 
 
-def harvest_repo(repo: str, *, limit: int = 25, llm_spec=None,
-                 workdir: Path | None = None) -> list[Candidate]:
+def harvest_repo(
+    repo: str, *, limit: int = 25, llm_spec=None, workdir: Path | None = None
+) -> list[Candidate]:
     """Mine one repository into candidate records, newest merged PR first."""
     owner, name = repo.split("/", 1)
     log.info("harvest: listing merged PRs for %s", repo)
@@ -225,7 +241,7 @@ def harvest_repo(repo: str, *, limit: int = 25, llm_spec=None,
         tests = covering_tests(pr)
         try:
             patch = fetch_pr_diff(owner, name, pr.number)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             log.warning("diff fetch failed for %s#%s: %s", repo, pr.number, exc)
             continue
 
@@ -255,8 +271,12 @@ def harvest_repo(repo: str, *, limit: int = 25, llm_spec=None,
 
         missing = [k for k in ("covering_tests", "test_cmd", "workload") if not rec.get(k)]
         out.append(Candidate(record=rec, reasons=cues, missing=missing))
-        log.info("harvest: %s kept (cues=%s, missing=%s)",
-                 rec["instance_id"], ",".join(cues[:3]), ",".join(missing) or "none")
+        log.info(
+            "harvest: %s kept (cues=%s, missing=%s)",
+            rec["instance_id"],
+            ",".join(cues[:3]),
+            ",".join(missing) or "none",
+        )
     return out
 
 

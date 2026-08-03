@@ -1774,7 +1774,9 @@ def _load_kubectl_fixtures(
             used_verbs = set(_cli_verb_re.findall(body)) | set(_bin_verb_re.findall(body))
             if used_verbs and used_verbs.issubset(subset):
                 tests[f.name] = body
-                _kinds_for_pairs = [k for k in file_kinds if kind_filter is None or k in kind_filter] or ["_"]
+                _kinds_for_pairs = [
+                    k for k in file_kinds if kind_filter is None or k in kind_filter
+                ] or ["_"]
                 for k in _kinds_for_pairs:
                     for v in used_verbs:
                         covered_pairs.add((v, k))
@@ -1784,7 +1786,9 @@ def _load_kubectl_fixtures(
         if verb in cmd_names:
             tests[f.name] = f.read_text(encoding="utf-8")
             covered_verbs.add(verb)
-            _kinds_for_pairs = [k for k in file_kinds if kind_filter is None or k in kind_filter] or ["_"]
+            _kinds_for_pairs = [
+                k for k in file_kinds if kind_filter is None or k in kind_filter
+            ] or ["_"]
             for k in _kinds_for_pairs:
                 covered_pairs.add((verb, k))
     if not covered_verbs:
@@ -1808,7 +1812,9 @@ def _load_kubectl_fixtures(
                     if _k in kind_filter:
                         _by_combo.setdefault((_fverb, _k), []).append(_fname)
             for _combo, _names in _by_combo.items():
-                _pick = sorted(_names, key=lambda n: _h.sha256(f"{_seed}:{n}".encode()).hexdigest())[0]
+                _pick = sorted(
+                    _names, key=lambda n: _h.sha256(f"{_seed}:{n}".encode()).hexdigest()
+                )[0]
                 _combo_floor.add(_pick)
         _buckets: dict[tuple[str, str], list[str]] = {}
         for _fname in tests:
@@ -2177,9 +2183,7 @@ def _build_one_task(
             )
         else:
             _grounded = reference_grounding["grounded_files"]
-            _fixture_test_files = {
-                f: c for f, c in _fixture_test_files.items() if f in _grounded
-            }
+            _fixture_test_files = {f: c for f, c in _fixture_test_files.items() if f in _grounded}
             test_files = {f: c for f, c in test_files.items() if f in _grounded}
             logger.info(
                 "fixture-mode grounding: %d ref-pass & %d oracle-pass -> %d grounded (shipping %d)",
@@ -2589,9 +2593,7 @@ def _oracle_incompleteness_reason(
 ) -> str | None:
     if finish_reason == "length":
         return "response truncated (finish_reason=length)"
-    has_dispatcher = any(
-        isinstance(n, ast.FunctionDef) and n.name == "main" for n in tree.body
-    )
+    has_dispatcher = any(isinstance(n, ast.FunctionDef) and n.name == "main" for n in tree.body)
     if not has_dispatcher:
         for node in ast.walk(tree):
             if isinstance(node, ast.If):
@@ -5485,9 +5487,7 @@ def _sidecar_up(spec: SidecarSpec, *, probe_image: str, timeout_sec: int = 40):
         subprocess.run(["docker", "network", "rm", net], capture_output=True)
 
 
-def _sidecar_docker_args(
-    sidecar: tuple[str, str] | None, *, backend: str = "minio"
-) -> list[str]:
+def _sidecar_docker_args(sidecar: tuple[str, str] | None, *, backend: str = "minio") -> list[str]:
     """Network + endpoint args for a gate container: isolated (``--network=none``) by
     default, or joined to a running sidecar network with AWS_ENDPOINT_URL set.
 
@@ -5926,7 +5926,13 @@ def _run_reference_grounding(
         oracle_path = bundle / "oracle_main.py"
         oracle_path.write_text(oracle_code)
         oracle_pass, oracle_out = _docker_run_pertest(
-            image, bundle, timeout_sec, oracle_path, wrapper=wrapper, sidecar=sidecar, backend=backend
+            image,
+            bundle,
+            timeout_sec,
+            oracle_path,
+            wrapper=wrapper,
+            sidecar=sidecar,
+            backend=backend,
         )
 
         grounded = (reference_pass & oracle_pass) - empty_pass
@@ -7205,8 +7211,7 @@ def _build_instruction_md_kwok(
 
     if kinds:
         parts.append(
-            f"# Build `kubectl {verb}` from scratch "
-            f"(covering {len(kinds)} kinds: {kinds_csv})\n"
+            f"# Build `kubectl {verb}` from scratch (covering {len(kinds)} kinds: {kinds_csv})\n"
         )
     else:
         parts.append(f"# Build `kubectl {verb}` from scratch\n")

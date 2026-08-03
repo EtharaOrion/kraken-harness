@@ -8,6 +8,7 @@ counting parent directories. This package sits five levels below the harness and
 harness has already moved three times; a hard-coded depth is a bug waiting for the
 fourth move. `find_root` looks for the markers that define a kraken tree instead.
 """
+
 from __future__ import annotations
 
 import os
@@ -31,8 +32,10 @@ def find_root(start: Path | None = None) -> Path:
         p = Path(env).expanduser().resolve()
         if _is_root(p):
             return p
-        raise SystemExit(f"KRAKEN_ROOT={env} does not look like a kraken tree "
-                         f"(expected {', '.join(ROOT_MARKERS)})")
+        raise SystemExit(
+            f"KRAKEN_ROOT={env} does not look like a kraken tree "
+            f"(expected {', '.join(ROOT_MARKERS)})"
+        )
 
     for origin in (start or Path.cwd(), Path(__file__).resolve()):
         for candidate in (origin, *origin.parents):
@@ -41,7 +44,8 @@ def find_root(start: Path | None = None) -> Path:
 
     raise SystemExit(
         "cannot locate the kraken knowledge root. Run from inside the tree, or set "
-        "KRAKEN_ROOT to the directory holding requirements/, seed/, memory/ and audit/.")
+        "KRAKEN_ROOT to the directory holding requirements/, seed/, memory/ and audit/."
+    )
 
 
 def _is_root(p: Path) -> bool:
