@@ -12,9 +12,9 @@ from __future__ import annotations
 
 import json
 import re
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+from repo2rlenv.kraken import find_root
+
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
@@ -70,8 +70,13 @@ def check_patch(patch: str) -> list:
 
 
 def main() -> int:
+    # The corpus lives at the knowledge root, not under the installed package. Resolve
+    # it by marker rather than by counting parents up from this file: the harness has
+    # moved before, and a stale relative depth here globs an empty directory and reports
+    # a clean corpus of zero records, which reads exactly like success.
+    root = find_root()
     rows, bad = [], 0
-    for path in sorted((ROOT / "harvest").glob("*.jsonl")):
+    for path in sorted((root / "harvest").glob("*.jsonl")):
         for line in path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
@@ -92,7 +97,7 @@ def main() -> int:
             if problems or test_problems:
                 bad += 1
 
-    out = ROOT / "harvest" / "validation.json"
+    out = root / "harvest" / "validation.json"
     out.write_text(
         json.dumps({"records": len(rows), "malformed": bad, "instances": rows}, indent=2),
         encoding="utf-8",

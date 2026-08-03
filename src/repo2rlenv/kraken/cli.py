@@ -36,11 +36,19 @@ from pathlib import Path
 
 from repo2rlenv.kraken import find_root, harness_dir
 
-ROOT = find_root()
-HARNESS = harness_dir(ROOT)
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("kraken")
+
+
+def _root() -> Path:
+    """Resolve the knowledge root when a command runs, not when this module loads.
+
+    Resolving at import time makes `import repo2rlenv.kraken.cli` raise SystemExit
+    anywhere outside a kraken tree. This module ships inside an installable package,
+    so that includes a standalone checkout of the harness and every CI job that
+    collects it. Every command needs the root; nothing needs it merely to be imported.
+    """
+    return find_root()
 
 
 def cmd_harvest(args: argparse.Namespace) -> int:
@@ -59,13 +67,14 @@ def cmd_harvest(args: argparse.Namespace) -> int:
             provider=provider, model=model, endpoint=os.environ.get("ANTHROPIC_BASE_URL") or None
         )
 
+    root = _root()
     total = {"written": 0, "complete": 0, "incomplete": 0}
     for repo in args.repo:
         cands = harvest_repo(repo, limit=args.limit, llm_spec=spec)
         if not cands:
             log.info("harvest: %s produced no performance candidates", repo)
             continue
-        shard = ROOT / args.out / (repo.replace("/", "__") + ".jsonl")
+        shard = root / args.out / (repo.replace("/", "__") + ".jsonl")
         rep = write_jsonl(cands, shard)
         log.info("harvest: %s -> %s", repo, json.dumps(rep))
         for k in total:
@@ -84,14 +93,15 @@ def cmd_author(args: argparse.Namespace) -> int:
     from repo2rlenv.pipelines.perf_runtime import PerfRuntimePipeline
     from repo2rlenv.spec.options import PerfRuntimeOptions
 
+    root = _root()
     opts = PerfRuntimeOptions(
-        corpus=str(ROOT / args.corpus),
+        corpus=str(root / args.corpus),
         instances=args.instances or [],
         repos=args.repos or [],
         limit=args.limit or 0,
         registry=args.registry or "",
     )
-    out = ROOT / args.out
+    out = root / args.out
     res = PerfRuntimePipeline(gen_input=None, options=opts).run(out)
     print(
         json.dumps(
@@ -118,9 +128,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     the fork trajectory runs are reproducible against, independent of any ambient
     harbor installation. Vendoring a second copy would let the two drift.
     """
+    root = _root()
     bundle = Path(args.bundle)
     if not bundle.is_absolute():
-        bundle = ROOT / bundle
+        bundle = root / bundle
 
     if not shutil.which("harbor"):
         log.error(
@@ -142,7 +153,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         "--env",
         "docker",
         "-o",
-        str(ROOT / args.out),
+        str(root / args.out),
     ]
     if args.n_attempts > 1:
         cmd += ["-k", str(args.n_attempts)]
@@ -151,7 +162,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     for kv in args.agent_env or []:
         cmd += ["--agent-env", kv]
     log.info("run: %s", " ".join(cmd))
-    return subprocess.run(cmd, cwd=ROOT).returncode
+    return subprocess.run(cmd, cwd=root).returncode
 
 
 def cmd_grade(args: argparse.Namespace) -> int:
@@ -162,24 +173,25 @@ def cmd_grade(args: argparse.Namespace) -> int:
     """
     from repo2rlenv.kraken import judge
 
-    return judge.run(bundle=Path(args.bundle), logs=Path(args.logs), root=ROOT)
+    return judge.run(bundle=Path(args.bundle), logs=Path(args.logs))
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    corpus = sorted((ROOT / "harvest").glob("*.jsonl"))
+    root = _root()
+    corpus = sorted((root / "harvest").glob("*.jsonl"))
     records = sum(1 for f in corpus for ln in f.read_text().splitlines() if ln.strip())
     bundles = (
         [
             p
-            for p in (ROOT / "kraken-dataset").iterdir()
+            for p in (root / "kraken-dataset").iterdir()
             if p.is_dir() and (p / "task.toml").exists()
         ]
-        if (ROOT / "kraken-dataset").is_dir()
+        if (root / "kraken-dataset").is_dir()
         else []
     )
     trajs = (
-        [p for p in (ROOT / "trajectories").iterdir() if p.is_dir()]
-        if (ROOT / "trajectories").is_dir()
+        [p for p in (root / "trajectories").iterdir() if p.is_dir()]
+        if (root / "trajectories").is_dir()
         else []
     )
     print(
@@ -190,8 +202,8 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "authored_bundles": len(bundles),
                 "trajectories": len(trajs),
                 "harbor_on_path": bool(shutil.which("harbor")),
-                "harness_present": (HARNESS / "src" / "repo2rlenv").is_dir(),
-                "pilot_present": (ROOT / "pilot" / "run_pilot.py").exists(),
+                "harness_present": (harness_dir(root) / "src" / "repo2rlenv").is_dir(),
+                "pilot_present": (root / "pilot" / "run_pilot.py").exists(),
                 "harness_stages": ["harvest", "author", "run", "grade"],
             },
             indent=2,
