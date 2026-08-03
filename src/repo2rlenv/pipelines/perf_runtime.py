@@ -556,7 +556,13 @@ python /tests/verify.py
 rc=$?
 
 if [ -f /logs/verifier/void.marker ]; then
-    # The run could not be measured. It is repeated, never scored.
+    # The run could not be measured, so it is repeated and never scored. Harbor
+    # requires a reward file from every trial regardless, and raises
+    # RewardFileNotFoundError without one, which turns a clean void into a crashed
+    # trial. Report the void as a metric instead: kraken_void marks it, and
+    # result.json keeps status "void" so the pilot excludes it from the estimator.
+    # Anything averaging the bare reward must filter on kraken_void first.
+    printf '{"reward": 0.0, "kraken_void": 1.0}\\n' > /logs/verifier/reward.json
     exit 75
 fi
 
