@@ -1,3 +1,155 @@
+<!-- Rendered by `python -m kraken_harness.readme` from the harness code. Edit the code, not this page. -->
+
+# kraken-harness
+
+The benchmark extension an external runner uses to run inference and evaluation over the Kraken parent's resident bundles. It vendors the SWE-fficiency harness, whose own README closes this page, and adds the `kraken_harness` package. Every trial runs through the pinned Harbor release, every rollout is scored by the bundle's own tests, and the extension carries no grading logic of its own.
+
+## Entry points
+
+| command | target |
+| --- | --- |
+| `swefficiency` | `swefficiency.cli:main` |
+| `kraken-infer` | `kraken_harness.cli:infer_main` |
+| `kraken-eval` | `kraken_harness.cli:eval_main` |
+
+### `kraken-infer`
+
+```text
+usage: kraken-infer [-h] [--root ROOT] [--benchmark BENCHMARK] --work-dir WORK_DIR
+                    [--dry-run] --agent-config AGENT_CONFIG [--lane LANE]
+                    [--instance INSTANCE] [--rollouts ROLLOUTS]
+
+Run the agent under test on resident bundles through the pinned Harbor release with
+verification off. Each trial directory is a rollout log for kraken-eval.
+
+options:
+  -h, --help            show this help message and exit
+  --root ROOT           the parent project root that holds the lane roots and
+                        harbor.lock (default: .)
+  --benchmark BENCHMARK
+                        the benchmark directory to run (default: kraken)
+  --work-dir WORK_DIR   a directory outside --root for workspaces, trial layers and
+                        records
+  --dry-run             prepare and validate everything, print the Harbor commands, and
+                        run none
+  --agent-config AGENT_CONFIG
+                        a JSON or TOML file holding one agent table: the agent under
+                        test and its model
+  --lane LANE           a lane to read; repeatable (default: the benchmark's resident
+                        lanes)
+  --instance INSTANCE   a bundle uuid to run; repeatable (default: every resident
+                        bundle)
+  --rollouts ROLLOUTS   rollouts per instance (default: the benchmark's rollouts)
+```
+
+### `kraken-eval`
+
+```text
+usage: kraken-eval [-h] [--root ROOT] [--benchmark BENCHMARK] --work-dir WORK_DIR
+                   [--dry-run]
+
+Score each rollout kraken-infer recorded in --work-dir by regrading its trial through
+the pinned Harbor release with the bundle's own tests.
+
+options:
+  -h, --help            show this help message and exit
+  --root ROOT           the parent project root that holds the lane roots and
+                        harbor.lock (default: .)
+  --benchmark BENCHMARK
+                        the benchmark directory to run (default: kraken)
+  --work-dir WORK_DIR   a directory outside --root for workspaces, trial layers and
+                        records
+  --dry-run             prepare and validate everything, print the Harbor commands, and
+                        run none
+```
+
+## Shared evaluation interface
+
+The shared evaluation interface and the orchestration every benchmark inherits.
+
+| duty | what it does |
+| --- | --- |
+| `prepare_instances` | Find the instances to run among the resident bundles under the lane roots. |
+| `prepare_workspace` | Build the per-instance sandboxed workspace Harbor runs the agent in. |
+| `evaluate_instance` | Return the Harbor command that scores one rollout with the bundle's own tests. |
+
+| inherited loop | what it does |
+| --- | --- |
+| `run_inference` | Run the agent under test on each instance through Harbor with verification off. |
+| `run_evaluation` | Score every recorded rollout by regrading its trial through Harbor. |
+
+## Benchmarks
+
+### `kraken`
+
+Harbor-format performance-optimization tasks resident in the Kraken parent, scored by each bundle's own tests.
+
+| default | value |
+| --- | --- |
+| directory | `kraken_harness/benchmarks/kraken/` |
+| Harbor release | `0.24.0` at `b53b8134e1241686dca7759af188f987ecc48e8b` |
+| resident lanes | `samples`, `delivery` |
+| rollouts per instance | 4 |
+
+## Workspace layout
+
+Which bundle bytes an inference workspace carries, by Harbor layout class.
+
+| carried | paths |
+| --- | --- |
+| agent-visible files | `instruction.md`, `trajectory.json` |
+| agent-visible trees | `environment/` |
+| config files | `task.toml`, `README.md` |
+| per step under `steps/<s>/` | `instruction.md`, `trajectory.json`, `setup.sh`, `workdir/` |
+
+## Pinned environment
+
+Python `>=3.12,<3.13`. `uv.lock` pins every transitive dependency.
+
+| dependency | where |
+| --- | --- |
+| `beautifulsoup4==4.14.3` | runtime |
+| `chardet==5.2.0` | runtime |
+| `datasets==4.5.0` | runtime |
+| `docker==7.1.0` | runtime |
+| `fastcore==1.12.5` | runtime |
+| `ghapi==1.0.10` | runtime |
+| `GitPython==3.1.46` | runtime |
+| `harbor==0.24.0` | runtime |
+| `pandas==3.0.0` | runtime |
+| `pre-commit==4.5.1` | runtime |
+| `python-dotenv==1.2.1` | runtime |
+| `requests==2.32.5` | runtime |
+| `rich==14.3.1` | runtime |
+| `tqdm==4.67.1` | runtime |
+| `unidiff==0.7.5` | runtime |
+| `jedi==0.19.2` | extra `inference` |
+| `jinja2==3.1.6` | extra `inference` |
+| `pytest==9.1.1` | group `dev` |
+| `setuptools==84.2.1` | build |
+
+## Running it
+
+FORGE never runs this extension against a solver. An author-side run is a `.seed/probe.yaml` record through the `rig` door, never difficulty evidence, and every measured rollout comes from the out-of-band Phase evidence runner.
+
+```sh
+uv sync --frozen
+uv run --frozen kraken-infer --root <parent> --work-dir <dir outside the parent> --agent-config agent.toml
+uv run --frozen kraken-eval --root <parent> --work-dir <the same dir>
+uv run --frozen python -m kraken_harness.readme --check
+```
+
+`agent.toml` holds the agent under test and its model, outside the harness code:
+
+```toml
+[agent]
+name = "<a Harbor agent name>"
+model_name = "<provider/model>"
+```
+
+## Upstream SWE-fficiency documentation
+
+The vendored harness's own README, kept verbatim at `docs/upstream/swefficiency-README.md`, follows.
 
 <div align="center">
   <img src="docs/assets/logos/swefficiency_banner_main.png" alt="SWE-fficiency Logo" width="500"/>

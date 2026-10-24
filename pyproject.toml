@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=42"]
+requires = ["setuptools==84.2.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,45 +7,51 @@ name = "swefficiency"
 version = "1.0.0"
 description = "The official SWE-fficiency package - a benchmark for evaluating LMs on automated performance engineering"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.12,<3.13"
 license = {text = "Apache-2.0"}
 authors = [
     {name = "SWEfficiency Team", email = "swefficiencyperf@gmail.com"}
 ]
 keywords = ["nlp", "benchmark", "code", "performance", "optimization"]
 classifiers = [
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3 :: Only",
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "beautifulsoup4",
-    "chardet",
-    "datasets",
-    "docker",
-    "fastcore",
-    "ghapi",
-    "GitPython",
-    "pandas",
-    "pre-commit",
-    "python-dotenv",
-    "requests",
-    "rich",
-    "tqdm",
-    "unidiff",
+    "beautifulsoup4==4.14.3",
+    "chardet==5.2.0",
+    "datasets==4.5.0",
+    "docker==7.1.0",
+    "fastcore==1.12.5",
+    "ghapi==1.0.10",
+    "GitPython==3.1.46",
+    "harbor==0.24.0",
+    "pandas==3.0.0",
+    "pre-commit==4.5.1",
+    "python-dotenv==1.2.1",
+    "requests==2.32.5",
+    "rich==14.3.1",
+    "tqdm==4.67.1",
+    "unidiff==0.7.5",
 ]
 
 [project.optional-dependencies]
 inference = [
-    "jedi",
-    "jinja2",
+    "jedi==0.19.2",
+    "jinja2==3.1.6",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==9.1.1",
 ]
 
 [project.scripts]
 swefficiency = "swefficiency.cli:main"
+kraken-infer = "kraken_harness.cli:infer_main"
+kraken-eval = "kraken_harness.cli:eval_main"
 
 [project.urls]
 Homepage = "https://swefficiency.com"
@@ -55,4 +61,7 @@ Documentation = "https://github.com/swefficiency/swefficiency"
 Paper = "https://arxiv.org/abs/2511.06090"
 
 [tool.setuptools.packages.find]
-include = ["swefficiency*"]
+include = ["swefficiency*", "kraken_harness*"]
+
+[tool.setuptools.package-data]
+"kraken_harness.benchmarks.kraken" = ["benchmark.toml"]
