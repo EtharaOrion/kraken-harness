@@ -87,7 +87,7 @@ Harbor-format performance-optimization tasks resident in the Kraken parent, scor
 | default | value |
 | --- | --- |
 | directory | `kraken_harness/benchmarks/kraken/` |
-| Harbor release | `0.24.0` at `b53b8134e1241686dca7759af188f987ecc48e8b` |
+| Harbor release | `0.25.0` at `fdba28fc411e47e8765420a1a063b4918fce3def` |
 | resident lanes | `samples`, `delivery` |
 | rollouts per instance | 4 |
 
@@ -115,7 +115,7 @@ Python `>=3.12,<3.13`. `uv.lock` pins every transitive dependency.
 | `fastcore==1.12.5` | runtime |
 | `ghapi==1.0.10` | runtime |
 | `GitPython==3.1.46` | runtime |
-| `harbor==0.24.0` | runtime |
+| `harbor==0.25.0` | runtime |
 | `pandas==3.0.0` | runtime |
 | `pre-commit==4.5.1` | runtime |
 | `python-dotenv==1.2.1` | runtime |

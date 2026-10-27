@@ -6,8 +6,8 @@ name = "kraken"
 description = "Harbor-format performance-optimization tasks resident in the Kraken parent, scored by each bundle's own tests."
 
 [harbor]
-release = "0.24.0"
-commit = "b53b8134e1241686dca7759af188f987ecc48e8b"
+release = "0.25.0"
+commit = "fdba28fc411e47e8765420a1a063b4918fce3def"
 
 [lanes]
 resident = ["samples", "delivery"]

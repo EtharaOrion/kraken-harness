@@ -27,7 +27,7 @@ dependencies = [
     "fastcore==1.12.5",
     "ghapi==1.0.10",
     "GitPython==3.1.46",
-    "harbor==0.24.0",
+    "harbor==0.25.0",
     "pandas==3.0.0",
     "pre-commit==4.5.1",
     "python-dotenv==1.2.1",
